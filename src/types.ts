@@ -37,6 +37,23 @@ export interface ResponseCapture {
   timedOut: boolean;
 }
 
+export type BotSessionResetStatus = "RESET_CONFIRMED" | "RESET_FAILED";
+
+export interface BotSessionResetAttempt {
+  command: string;
+  expectedConfirmation: string;
+  status: BotSessionResetStatus;
+  startedAt: Date;
+  sentAt?: Date;
+  completedAt: Date;
+  responseMessages: WhatsAppMessage[];
+  firstResponseMs?: number;
+  totalResponseMs?: number;
+  error?: string;
+  evidencePath?: string;
+  diagnosticsPath?: string;
+}
+
 export interface TestCase {
   testId: string;
   category: string;

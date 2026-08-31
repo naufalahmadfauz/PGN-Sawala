@@ -8,7 +8,9 @@
     "whatsapp:login": "xvfb-run -a tsx scripts/whatsapp-login.ts",
     "whatsapp:verify": "xvfb-run -a tsx scripts/whatsapp-verify.ts",
     "test:single": "xvfb-run -a tsx scripts/test-single.ts",
-    "test:pgn": "xvfb-run -a tsx src/runner.ts"
+    "test:pgn": "xvfb-run -a tsx src/pgn-runner.ts",
+    "test:pgn:validate": "tsx scripts/validate-pgn-workbook.ts",
+    "test:session-reset": "tsx --test scripts/session-reset.test.ts"
   },
   "repository": {
     "type": "git",

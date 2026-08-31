@@ -7,26 +7,59 @@ This harness drives the consumer WhatsApp Web UI with Playwright. Messages follo
 - `npm run whatsapp:login` launches headed Playwright Chromium under Xvfb, writes only a validated QR to `artifacts/whatsapp-login.png`, and waits for login.
 - `npm run whatsapp:verify` verifies that `.whatsapp-profile/` opens without another QR scan.
 - `npm run test:single` sends `Halo`, captures all new incoming messages after an approximately 1.8-second idle window, and writes `reports/PGN_Single_Test_Result.xlsx`.
-- `npm run test:pgn` runs `data/PGN_Test_Cases.xlsx` sequentially and writes `reports/PGN_Test_Results.xlsx`.
-- `npm run data:template` creates a starter test-case workbook without overwriting an existing one.
+- `npm run test:pgn:validate` validates the real PGN workbook without opening WhatsApp or sending messages.
+- `npm run test:pgn` executes the real PGN workbook and progressively saves the executed copy.
+- `npm run test:session-reset` tests reset confirmation and failure handling without opening WhatsApp.
+- `npm run data:template` creates a starter legacy test-case workbook without overwriting an existing one.
 - `npm run check` runs the TypeScript compiler.
 
 ## Configuration
 
-Local settings belong in `.env`; the supported keys and defaults are listed in `.env.example`. Configure either `PGN_WHATSAPP_PHONE` (international digits, without `+`) or `PGN_WHATSAPP_CHAT`. A phone number is preferred when both are present because the direct WhatsApp chat URL avoids ambiguous chat-name matches.
+Local settings belong in `.env`; supported keys and defaults are listed in `.env.example`. Configure either `PGN_WHATSAPP_PHONE` (international digits, without `+`) or `PGN_WHATSAPP_CHAT`. A phone number is preferred when both are present because the direct WhatsApp chat URL avoids ambiguous chat-name matches. The harness verifies the open conversation header against that target and confirms each outgoing WhatsApp message before collecting a response.
 
-The harness verifies the open conversation header against that configured target before sending. It also confirms that WhatsApp rendered each new outgoing message before waiting for a reply.
+The authenticated profile is fixed at `.whatsapp-profile/`. Data files are restricted to `data/`, and generated reports are restricted to `reports/`. The profile, `.env`, QR images, evidence, diagnostics, and executed workbooks are gitignored. Treat the profile as an authenticated secret and do not share or commit it.
 
-The persistent profile is fixed at `.whatsapp-profile/`; data files are restricted to `data/`, and generated reports are restricted to `reports/`. The profile, `.env`, QR image, screenshots, diagnostics, and generated XLSX reports are gitignored. Treat the profile as an authenticated secret and do not share or commit it.
+## Real PGN Workbook
 
-## Input And Results
+The source workbook is:
 
-The input workbook must use a `Test Cases` worksheet and these required columns:
+`data/PGN AI Assistant - Knowledge Base Testing Report - User Inputs.xlsx`
 
-| Test ID | Category | User Input | Expected Behaviour |
-| --- | --- | --- | --- |
-| POS-001 | Greeting | Halo | Bot should greet the user |
+The source is never overwritten. The first execution copies it to:
 
-`Scenario ID` is accepted as optional metadata for future grouped multi-turn scenarios. Tests currently run in workbook order in one real WhatsApp conversation. The authenticated history shows that `reset` has received `Session deleted` from this bot, but the harness does not assume that this guarantees a complete backend reset and does not invoke it automatically. The reset contract should be confirmed with PGN before independent cases are isolated automatically.
+`reports/PGN AI Assistant - Knowledge Base Testing Report - Executed.xlsx`
 
-The report contains `Results` and `Transcript` worksheets. `CAPTURED` means a response was captured, not that its expected behaviour was automatically judged. Failures save screenshots and diagnostics under `artifacts/debug/`.
+Later runs resume from that executed copy. Existing Bot Response cells are skipped by default. Existing expected responses, semantic statuses, notes, references, styles, dimensions, merged cells, and completed evidence are preserved. The runner does not generate User Input or assign Passed or Failed.
+
+`Test Case Knowledge Base` reads User Input from column H and writes Bot Response, response time, and test date to I-K. A blank Test Case ID row with a populated Turn continues the preceding scenario.
+
+`Negative Case` reads input from column E and writes results to H-J. Explicit `Turn 1:`, `Turn 2:`, and later markers inside one cell execute sequentially in the same scenario context. Their responses and timings are combined with turn labels.
+
+The executed copy adds `Execution Transcript` with per-turn user and bot messages, timestamps, first-response timing, total timing, technical status, and evidence paths. The workbook is atomically replaced after every attempted scenario.
+
+## Filters And Resume
+
+```bash
+npm run test:pgn -- --limit 5
+npm run test:pgn -- --sheet kb
+npm run test:pgn -- --sheet negative
+npm run test:pgn -- --test PGN-KB-031
+npm run test:pgn -- --rerun PGN-KB-003
+npm run test:pgn -- --test PGN-KB-031 --rerun PGN-NEG-018
+```
+
+`--rerun` without an ID reruns the selected set. `--rerun ID` selects and reruns that scenario. Without rerun, completed scenarios are skipped. A partially completed multi-turn scenario is skipped because continuing it later would not guarantee the original turn context.
+
+## Session Isolation
+
+Independent scenarios are isolated with the deployed Conversation Builder debug command `reset`. Before every runnable scenario, including the first remaining scenario after resume, the runner snapshots WhatsApp, sends `reset`, and waits only for a new incoming response containing `Session deleted`. `PGN_RESET_COMMAND`, `PGN_RESET_CONFIRMATION`, and `PGN_RESET_TIMEOUT_MS` configure this contract and default to `reset`, `Session deleted`, and 30000 ms.
+
+The reset occurs outside the scenario turn loop. Multi-turn scenarios therefore retain context across every turn, and the next reset is attempted only after the completed scenario has been written and atomically saved. A single explicitly selected test is also reset before execution; a final reset is not required when no scenario remains.
+
+Reset traffic never enters User Input, Bot Response, expected handling, or semantic Status cells. It is recorded in `Execution Transcript` as `CONTROL_USER`, `CONTROL_BOT`, and, on failure, `CONTROL_SYSTEM`.
+
+If the expected confirmation is not captured before the reset timeout, the runner saves a reset-failure screenshot and diagnostics, records the failed control attempt, saves the executed workbook, aborts all remaining scenarios, and exits non-zero. This fail-safe prevents results from being collected under uncertain bot context.
+
+Isolation depends on the deployed bot continuing to allow the Conversation Builder reset/debug command. LivePerson recommends disabling debug commands in production, so this deployment capability must remain enabled for the QA harness.
+
+`CAPTURED`, `TIMEOUT`, `SEND_ERROR`, and `CHAT_ERROR` are technical states only. They are written to the transcript and technical failures are appended to Notes without replacing existing notes. They never produce a semantic Passed or Failed decision.

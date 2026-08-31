@@ -18,10 +18,15 @@ export interface AppConfig {
   loginScreenshotPath: string;
   dataFilePath: string;
   reportFilePath: string;
+  pgnSourceWorkbookPath: string;
+  pgnExecutedWorkbookPath: string;
   loginTimeoutMs: number;
   authTimeoutMs: number;
   responseTimeoutMs: number;
   responseIdleMs: number;
+  resetCommand: string;
+  resetConfirmation: string;
+  resetTimeoutMs: number;
   betweenTestsMs: number;
   headless: boolean;
   browserChannel?: string;
@@ -58,6 +63,10 @@ function booleanFromEnvironment(name: string, fallback: boolean): boolean {
     return false;
   }
   throw new Error(`${name} must be true, false, 1, or 0`);
+}
+
+function textFromEnvironment(name: string, fallback: string): string {
+  return process.env[name]?.trim() || fallback;
 }
 
 function resolveInsideDirectory(
@@ -119,6 +128,20 @@ export function loadConfig(): AppConfig {
       "reports/PGN_Test_Results.xlsx",
     "PGN_TEST_REPORT_FILE",
   );
+  const pgnSourceWorkbookPath = resolveInsideDirectory(
+    projectRoot,
+    "data",
+    process.env.PGN_SOURCE_WORKBOOK?.trim() ||
+      "data/PGN AI Assistant - Knowledge Base Testing Report - User Inputs.xlsx",
+    "PGN_SOURCE_WORKBOOK",
+  );
+  const pgnExecutedWorkbookPath = resolveInsideDirectory(
+    projectRoot,
+    "reports",
+    process.env.PGN_EXECUTED_WORKBOOK?.trim() ||
+      "reports/PGN AI Assistant - Knowledge Base Testing Report - Executed.xlsx",
+    "PGN_EXECUTED_WORKBOOK",
+  );
   const responseTimeoutMs = integerFromEnvironment(
     "WHATSAPP_RESPONSE_TIMEOUT_MS",
     30_000,
@@ -145,6 +168,8 @@ export function loadConfig(): AppConfig {
     loginScreenshotPath: path.join(artifactsDir, "whatsapp-login.png"),
     dataFilePath,
     reportFilePath,
+    pgnSourceWorkbookPath,
+    pgnExecutedWorkbookPath,
     loginTimeoutMs: integerFromEnvironment(
       "WHATSAPP_LOGIN_TIMEOUT_MS",
       15 * 60_000,
@@ -157,6 +182,16 @@ export function loadConfig(): AppConfig {
     ),
     responseTimeoutMs,
     responseIdleMs,
+    resetCommand: textFromEnvironment("PGN_RESET_COMMAND", "reset"),
+    resetConfirmation: textFromEnvironment(
+      "PGN_RESET_CONFIRMATION",
+      "Session deleted",
+    ),
+    resetTimeoutMs: integerFromEnvironment(
+      "PGN_RESET_TIMEOUT_MS",
+      30_000,
+      1_000,
+    ),
     betweenTestsMs: integerFromEnvironment(
       "WHATSAPP_BETWEEN_TESTS_MS",
       3_000,
