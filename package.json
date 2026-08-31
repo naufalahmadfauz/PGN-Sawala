@@ -1,0 +1,40 @@
+{
+  "name": "pgn-sawala",
+  "version": "1.0.0",
+  "description": "Real-channel WhatsApp Web test harness for the PGN chatbot",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "data:template": "tsx scripts/create-test-template.ts",
+    "whatsapp:login": "xvfb-run -a tsx scripts/whatsapp-login.ts",
+    "whatsapp:verify": "xvfb-run -a tsx scripts/whatsapp-verify.ts",
+    "test:single": "xvfb-run -a tsx scripts/test-single.ts",
+    "test:pgn": "xvfb-run -a tsx src/runner.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/naufalahmadfauz/PGN-Sawala.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/naufalahmadfauz/PGN-Sawala/issues"
+  },
+  "homepage": "https://github.com/naufalahmadfauz/PGN-Sawala#readme",
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@types/node": "^26.4.0",
+    "playwright": "^1.62.1",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "exceljs": "^4.4.0",
+    "tmux": "^1.0.0"
+  },
+  "overrides": {
+    "uuid": "11.1.1"
+  }
+}

@@ -1,0 +1,18 @@
+# Playwright
+node_modules/
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
+
+# WhatsApp authentication and test evidence
+/.whatsapp-profile/
+/artifacts/
+
+# Local configuration and generated reports
+.env
+.env.*
+!.env.example
+/reports/*.xlsx
+/reports/**/*.xlsx
