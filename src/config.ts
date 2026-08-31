@@ -27,6 +27,7 @@ export interface AppConfig {
   resetCommand: string;
   resetConfirmation: string;
   resetTimeoutMs: number;
+  postResetQuietMs: number;
   betweenTestsMs: number;
   headless: boolean;
   browserChannel?: string;
@@ -144,12 +145,12 @@ export function loadConfig(): AppConfig {
   );
   const responseTimeoutMs = integerFromEnvironment(
     "WHATSAPP_RESPONSE_TIMEOUT_MS",
-    30_000,
+    60_000,
     1_000,
   );
   const responseIdleMs = integerFromEnvironment(
     "WHATSAPP_RESPONSE_IDLE_MS",
-    1_800,
+    10_000,
     500,
   );
   if (responseIdleMs >= responseTimeoutMs) {
@@ -191,6 +192,11 @@ export function loadConfig(): AppConfig {
       "PGN_RESET_TIMEOUT_MS",
       30_000,
       1_000,
+    ),
+    postResetQuietMs: integerFromEnvironment(
+      "POST_RESET_QUIET_MS",
+      10_000,
+      1,
     ),
     betweenTestsMs: integerFromEnvironment(
       "WHATSAPP_BETWEEN_TESTS_MS",

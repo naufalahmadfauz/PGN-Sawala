@@ -9,6 +9,9 @@ console.log(
     command: config.resetCommand,
     confirmation: config.resetConfirmation,
     timeoutMs: config.resetTimeoutMs,
+    responseIdleMs: config.responseIdleMs,
+    responseTimeoutMs: config.responseTimeoutMs,
+    postResetQuietMs: config.postResetQuietMs,
   }),
 );
 if (parsed.issues.some((issue) => issue.severity === "ERROR")) {

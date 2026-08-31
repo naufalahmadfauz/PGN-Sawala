@@ -33,7 +33,7 @@ export interface ResponseCapture {
   firstResponseAt?: Date;
   completedAt: Date;
   firstResponseMs?: number;
-  totalResponseMs: number;
+  totalResponseMs?: number;
   timedOut: boolean;
 }
 
@@ -52,6 +52,14 @@ export interface BotSessionResetAttempt {
   error?: string;
   evidencePath?: string;
   diagnosticsPath?: string;
+  messageStateAtCompletion?: WhatsAppMessage[];
+}
+
+export interface PostResetDrainResult {
+  startedAt: Date;
+  completedAt: Date;
+  quietMs: number;
+  staleMessages: WhatsAppMessage[];
 }
 
 export interface TestCase {

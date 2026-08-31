@@ -3,22 +3,44 @@ import {
   access,
   copyFile,
   mkdir,
+  readFile,
   rename,
   rm,
+  writeFile,
 } from "node:fs/promises";
 import path from "node:path";
 import ExcelJS, { type Cell, type Worksheet } from "exceljs";
+import JSZip from "jszip";
+import type {
+  BotSessionResetAttempt,
+  PostResetDrainResult,
+} from "../types";
 import {
   cellText,
   parsePgnWorkbook,
 } from "./pgn-workbook-loader";
 import {
+  KB_SHEET_NAME,
+  NEGATIVE_SHEET_NAME,
   TRANSCRIPT_SHEET_NAME,
   type ExecutedTurn,
   type PgnTestScenario,
   type PgnWorkbookDocument,
 } from "./pgn-types";
-import type { BotSessionResetAttempt } from "../types";
+
+interface PreservedTablePart {
+  partPath: string;
+  identity: string;
+  structure: string;
+  contents: Buffer;
+}
+
+type PreservedTableParts = Map<string, PreservedTablePart>;
+
+const preservedTableParts = new WeakMap<ExcelJS.Workbook, PreservedTableParts>();
+
+const TABLE_CONTENT_TYPE =
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml";
 
 const TRANSCRIPT_HEADERS = [
   "Run ID",
@@ -77,6 +99,219 @@ function writeExecutionDate(cell: Cell, value: Date): void {
 
 function secondsFromMilliseconds(milliseconds: number): number {
   return Math.round((milliseconds / 1_000) * 100) / 100;
+}
+
+function decodeXmlAttribute(value: string): string {
+  return value
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&amp;/gi, "&")
+    .replace(/&#x([0-9a-f]+);/gi, (_, digits: string) =>
+      String.fromCodePoint(Number.parseInt(digits, 16)),
+    )
+    .replace(/&#([0-9]+);/g, (_, digits: string) =>
+      String.fromCodePoint(Number.parseInt(digits, 10)),
+    );
+}
+
+function xmlAttribute(tag: string, name: string): string | undefined {
+  const match = tag.match(
+    new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i"),
+  );
+  const value = match?.[1] ?? match?.[2];
+  return value === undefined ? undefined : decodeXmlAttribute(value);
+}
+
+function describeTablePart(partPath: string, contents: Buffer): PreservedTablePart {
+  const xml = contents.toString("utf8");
+  const tableTag = xml.match(/<table(?:\s|>)[^>]*>/i)?.[0];
+  if (!tableTag) {
+    throw new Error(`XLSX table part is invalid: ${partPath}`);
+  }
+  const identity = xmlAttribute(tableTag, "displayName") ?? xmlAttribute(tableTag, "name");
+  const ref = xmlAttribute(tableTag, "ref");
+  if (!identity || !ref) {
+    throw new Error(`XLSX table part lacks displayName/name or ref: ${partPath}`);
+  }
+  const columnNames = [...xml.matchAll(/<tableColumn(?:\s|>)[^>]*>/gi)].map(
+    ([tag]) => xmlAttribute(tag, "name") ?? "",
+  );
+  return {
+    partPath,
+    identity,
+    structure: JSON.stringify({ identity, ref, columnNames }),
+    contents,
+  };
+}
+
+async function validateTablePackageTopology(
+  archive: JSZip,
+  tableParts: PreservedTableParts,
+): Promise<void> {
+  const partPaths = new Set(
+    [...tableParts.values()].map((tablePart) => tablePart.partPath),
+  );
+  const referencedPaths = new Set<string>();
+  for (const [relationshipPath, entry] of Object.entries(archive.files)) {
+    if (!/^xl\/worksheets\/_rels\/[^/]+\.rels$/i.test(relationshipPath) || entry.dir) {
+      continue;
+    }
+    const relationshipsXml = await entry.async("string");
+    for (const [tag] of relationshipsXml.matchAll(/<Relationship(?:\s|>)[^>]*\/?\s*>/gi)) {
+      const type = xmlAttribute(tag, "Type");
+      if (!type?.endsWith("/table")) {
+        continue;
+      }
+      const target = xmlAttribute(tag, "Target");
+      if (!target) {
+        throw new Error(`XLSX table relationship lacks a target: ${relationshipPath}`);
+      }
+      const worksheetDirectory = path.posix.dirname(
+        path.posix.dirname(relationshipPath),
+      );
+      referencedPaths.add(
+        target.startsWith("/")
+          ? target.slice(1)
+          : path.posix.normalize(path.posix.join(worksheetDirectory, target)),
+      );
+    }
+  }
+
+  const contentTypesEntry = archive.file("[Content_Types].xml");
+  if (!contentTypesEntry) {
+    throw new Error("XLSX package lacks [Content_Types].xml");
+  }
+  const contentTypesXml = await contentTypesEntry.async("string");
+  const tableContentTypes = new Map<string, string>();
+  for (const [tag] of contentTypesXml.matchAll(/<Override(?:\s|>)[^>]*\/?\s*>/gi)) {
+    const partName = xmlAttribute(tag, "PartName");
+    const contentType = xmlAttribute(tag, "ContentType");
+    if (partName && contentType) {
+      tableContentTypes.set(partName.replace(/^\//, ""), contentType);
+    }
+  }
+
+  for (const partPath of partPaths) {
+    if (!referencedPaths.has(partPath)) {
+      throw new Error(`XLSX table part is not referenced by a worksheet: ${partPath}`);
+    }
+    if (tableContentTypes.get(partPath) !== TABLE_CONTENT_TYPE) {
+      throw new Error(`XLSX table part has no valid content type: ${partPath}`);
+    }
+  }
+  for (const referencedPath of referencedPaths) {
+    if (!partPaths.has(referencedPath)) {
+      throw new Error(`XLSX worksheet references a missing table part: ${referencedPath}`);
+    }
+  }
+}
+
+async function tablePartsFromArchive(archive: JSZip): Promise<PreservedTableParts> {
+  const tableParts: PreservedTableParts = new Map();
+  for (const [partPath, entry] of Object.entries(archive.files)) {
+    if (/^xl\/tables\/[^/]+\.xml$/i.test(partPath) && !entry.dir) {
+      const tablePart = describeTablePart(
+        partPath,
+        await entry.async("nodebuffer"),
+      );
+      if (tableParts.has(tablePart.identity)) {
+        throw new Error(
+          `XLSX contains duplicate table identity "${tablePart.identity}"`,
+        );
+      }
+      tableParts.set(tablePart.identity, tablePart);
+    }
+  }
+  await validateTablePackageTopology(archive, tableParts);
+  return tableParts;
+}
+
+async function readTableParts(filePath: string): Promise<PreservedTableParts> {
+  return tablePartsFromArchive(await JSZip.loadAsync(await readFile(filePath)));
+}
+
+function assertCompatibleTableParts(
+  expected: PreservedTableParts,
+  actual: PreservedTableParts,
+): void {
+  if (expected.size !== actual.size) {
+    throw new Error(
+      `Executed workbook table count (${actual.size}) does not match source (${expected.size})`,
+    );
+  }
+  for (const [identity, expectedPart] of expected) {
+    const actualPart = actual.get(identity);
+    if (!actualPart || actualPart.structure !== expectedPart.structure) {
+      throw new Error(
+        `Executed workbook table "${identity}" does not match the source structure`,
+      );
+    }
+  }
+}
+
+async function tablePartsMatch(
+  filePath: string,
+  expected: PreservedTableParts,
+): Promise<boolean> {
+  const actual = await readTableParts(filePath);
+  assertCompatibleTableParts(expected, actual);
+  return [...expected].every(([identity, expectedPart]) =>
+    actual.get(identity)?.contents.equals(expectedPart.contents),
+  );
+}
+
+async function restoreTableParts(
+  filePath: string,
+  tableParts: PreservedTableParts,
+): Promise<void> {
+  const archive = await JSZip.loadAsync(await readFile(filePath));
+  const generatedTableParts = await tablePartsFromArchive(archive);
+  assertCompatibleTableParts(tableParts, generatedTableParts);
+  for (const [identity, generatedPart] of generatedTableParts) {
+    archive.file(generatedPart.partPath, tableParts.get(identity)!.contents);
+  }
+  const repaired = await archive.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+  });
+  await writeFile(filePath, repaired);
+  if (!(await tablePartsMatch(filePath, tableParts))) {
+    throw new Error("XLSX table preservation verification failed");
+  }
+}
+
+function sourceOwnedCells(workbook: ExcelJS.Workbook): string {
+  const definitions = [
+    { sheetName: KB_SHEET_NAME, columns: [1, 2, 3, 4, 5, 6, 7, 8] },
+    { sheetName: NEGATIVE_SHEET_NAME, columns: [1, 2, 3, 4, 5, 6, 7, 13] },
+  ];
+  return JSON.stringify(
+    definitions.map(({ sheetName, columns }) => {
+      const worksheet = workbook.getWorksheet(sheetName);
+      if (!worksheet) {
+        return { sheetName, missing: true };
+      }
+      const rows = Array.from({ length: worksheet.rowCount }, (_, rowIndex) =>
+        columns.map((column) => cellText(worksheet.getCell(rowIndex + 1, column))),
+      );
+      return { sheetName, rows };
+    }),
+  );
+}
+
+async function assertExecutedWorkbookMatchesSource(
+  sourcePath: string,
+  executedWorkbook: ExcelJS.Workbook,
+): Promise<void> {
+  const sourceWorkbook = new ExcelJS.Workbook();
+  await sourceWorkbook.xlsx.readFile(sourcePath);
+  if (sourceOwnedCells(sourceWorkbook) !== sourceOwnedCells(executedWorkbook)) {
+    throw new Error(
+      "Executed workbook inputs do not match the source workbook; use a new output path",
+    );
+  }
 }
 
 function appendTranscriptRows(
@@ -222,21 +457,31 @@ export async function openExecutedPgnWorkbook(
   sourcePath: string,
   outputPath: string,
 ): Promise<PgnWorkbookDocument & { resumed: boolean }> {
+  if (path.resolve(sourcePath) === path.resolve(outputPath)) {
+    throw new Error("Executed workbook path must differ from the immutable source");
+  }
   await mkdir(path.dirname(outputPath), { recursive: true });
+  const tableParts = await readTableParts(sourcePath);
   const resumed = await access(outputPath)
     .then(() => true)
     .catch(() => false);
   if (!resumed) {
     await copyFile(sourcePath, outputPath, fsConstants.COPYFILE_EXCL);
+  } else {
+    assertCompatibleTableParts(tableParts, await readTableParts(outputPath));
   }
 
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(outputPath);
+  if (resumed) {
+    await assertExecutedWorkbookMatchesSource(sourcePath, workbook);
+  }
+  preservedTableParts.set(workbook, tableParts);
   const hadTranscript = Boolean(
     workbook.getWorksheet(TRANSCRIPT_SHEET_NAME),
   );
   ensureTranscriptWorksheet(workbook);
-  if (!hadTranscript) {
+  if (!hadTranscript || !(await tablePartsMatch(outputPath, tableParts))) {
     await saveExecutedPgnWorkbook(workbook, outputPath);
   }
   return { workbook, parsed: parsePgnWorkbook(workbook), resumed };
@@ -279,7 +524,11 @@ export function appendSessionResetTranscript(
     null,
   ];
   const appendRow = (
-    role: "CONTROL_USER" | "CONTROL_BOT" | "CONTROL_SYSTEM",
+    role:
+      | "CONTROL_USER"
+      | "CONTROL_BOT"
+      | "CONTROL_SYSTEM"
+      | "STALE_BOT",
     message: string,
     timestamp: Date,
     firstResponseMs?: number,
@@ -303,9 +552,10 @@ export function appendSessionResetTranscript(
   if (attempt.sentAt) {
     appendRow("CONTROL_USER", attempt.command, attempt.sentAt);
   }
-  for (const response of attempt.responseMessages) {
+  const controlMessageIndexes = resetConfirmationMessageIndexes(attempt);
+  for (const [index, response] of attempt.responseMessages.entries()) {
     appendRow(
-      "CONTROL_BOT",
+      controlMessageIndexes.has(index) ? "CONTROL_BOT" : "STALE_BOT",
       response.text,
       response.observedAt,
       attempt.firstResponseMs,
@@ -323,6 +573,75 @@ export function appendSessionResetTranscript(
   }
 }
 
+function normalizeTranscriptText(value: string): string {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function resetConfirmationMessageIndexes(
+  attempt: BotSessionResetAttempt,
+): Set<number> {
+  const expected = normalizeTranscriptText(attempt.expectedConfirmation);
+  for (let end = 0; end < attempt.responseMessages.length; end += 1) {
+    for (let start = end; start >= 0; start -= 1) {
+      const combined = attempt.responseMessages
+        .slice(start, end + 1)
+        .map((message) => message.text)
+        .join("\n");
+      if (normalizeTranscriptText(combined).includes(expected)) {
+        return new Set(
+          Array.from({ length: end - start + 1 }, (_, index) => start + index),
+        );
+      }
+    }
+  }
+  return new Set();
+}
+
+export function appendPostResetDrainTranscript(
+  workbook: ExcelJS.Workbook,
+  runId: string,
+  scenario: PgnTestScenario,
+  drain: PostResetDrainResult,
+): void {
+  const worksheet = ensureTranscriptWorksheet(workbook);
+  const common = [
+    runId,
+    scenario.testCaseId,
+    scenario.sheetName,
+    scenario.sourceRowNumber,
+    null,
+  ];
+  for (const staleMessage of drain.staleMessages) {
+    const row = worksheet.addRow([
+      ...common,
+      "STALE_BOT",
+      staleMessage.text,
+      staleMessage.observedAt,
+      null,
+      null,
+      "STALE_DRAINED",
+      "",
+      "",
+    ]);
+    row.alignment = { vertical: "top", wrapText: true };
+    row.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
+  }
+
+  const completionRow = worksheet.addRow([
+    ...common,
+    "CONTROL_SYSTEM",
+    `Post-reset quiet period confirmed: ${drain.quietMs} ms${drain.staleMessages.length ? `; stale messages drained: ${drain.staleMessages.length}` : ""}`,
+    drain.completedAt,
+    null,
+    null,
+    "QUIET_CONFIRMED",
+    "",
+    "",
+  ]);
+  completionRow.alignment = { vertical: "top", wrapText: true };
+  completionRow.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
+}
+
 export async function saveExecutedPgnWorkbook(
   workbook: ExcelJS.Workbook,
   outputPath: string,
@@ -330,6 +649,10 @@ export async function saveExecutedPgnWorkbook(
   const temporaryPath = `${outputPath}.${process.pid}.tmp`;
   try {
     await workbook.xlsx.writeFile(temporaryPath);
+    const tableParts = preservedTableParts.get(workbook);
+    if (tableParts) {
+      await restoreTableParts(temporaryPath, tableParts);
+    }
     await rename(temporaryPath, outputPath);
   } catch (error) {
     await rm(temporaryPath, { force: true }).catch(() => undefined);

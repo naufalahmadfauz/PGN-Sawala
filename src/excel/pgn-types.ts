@@ -66,6 +66,7 @@ export interface PgnWorkbookDocument {
 }
 
 export interface ExecutedBotMessage {
+  sequence: number;
   message: string;
   timestamp: Date;
 }

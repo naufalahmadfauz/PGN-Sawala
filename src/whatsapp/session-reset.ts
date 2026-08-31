@@ -1,6 +1,7 @@
 import type {
   BotSessionResetAttempt,
   MessageSnapshot,
+  PostResetDrainResult,
   SentMessage,
   WhatsAppMessage,
 } from "../types";
@@ -9,6 +10,7 @@ export interface BotSessionClient {
   captureMessageState(): Promise<MessageSnapshot>;
   sendMessage(message: string, baseline: MessageSnapshot): Promise<SentMessage>;
   getMessages(): Promise<WhatsAppMessage[]>;
+  isRemoteTyping?(): Promise<boolean>;
   saveDebugArtifacts(
     name: string,
   ): Promise<{ screenshotPath: string; diagnosticsPath: string }>;
@@ -20,6 +22,15 @@ export interface ResetBotSessionOptions {
   timeoutMs: number;
   failureArtifactName: string;
   pollIntervalMs?: number;
+}
+
+export interface PostResetQuietOptions {
+  baselineMessages: WhatsAppMessage[];
+  quietMs: number;
+  pollIntervalMs?: number;
+  now?: () => number;
+  wait?: (milliseconds: number) => Promise<void>;
+  log?: (message: string) => void;
 }
 
 function normalizeMessage(value: string): string {
@@ -100,6 +111,7 @@ export async function resetBotSession(
       error: message,
       evidencePath,
       diagnosticsPath,
+      messageStateAtCompletion: [...latestMessages],
     };
     console.error(`[Session] ERROR: ${message}`);
     throw new BotSessionResetError(attempt);
@@ -107,8 +119,10 @@ export async function resetBotSession(
 
   console.log("[Session] Resetting bot...");
   let baseline: MessageSnapshot;
+  let latestMessages: WhatsAppMessage[] = [];
   try {
     baseline = await client.captureMessageState();
+    latestMessages = [...baseline.messages];
   } catch (error) {
     return fail(`Could not snapshot WhatsApp messages: ${errorMessage(error)}`);
   }
@@ -127,6 +141,7 @@ export async function resetBotSession(
     let messages: WhatsAppMessage[];
     try {
       messages = await client.getMessages();
+      latestMessages = messages;
     } catch (error) {
       return fail(`Could not read reset response: ${errorMessage(error)}`);
     }
@@ -180,6 +195,7 @@ export async function resetBotSession(
           ? firstResponseAt.getTime() - sentMessage.sentAt.getTime()
           : undefined,
         totalResponseMs: completedAt.getTime() - sentMessage.sentAt.getTime(),
+        messageStateAtCompletion: [...messages],
       };
     }
 
@@ -192,4 +208,84 @@ export async function resetBotSession(
   return fail(
     `Reset confirmation timed out after ${options.timeoutMs} ms; expected "${confirmation}"`,
   );
+}
+
+export async function waitForPostResetQuiet(
+  client: Pick<BotSessionClient, "getMessages" | "isRemoteTyping">,
+  options: PostResetQuietOptions,
+): Promise<PostResetDrainResult> {
+  if (!Number.isInteger(options.quietMs) || options.quietMs < 1) {
+    throw new Error("Post-reset quiet window must be a positive integer");
+  }
+  const pollIntervalMs = options.pollIntervalMs ?? 250;
+  if (!Number.isInteger(pollIntervalMs) || pollIntervalMs < 1) {
+    throw new Error("Post-reset poll interval must be a positive integer");
+  }
+
+  const now = options.now ?? (() => Date.now());
+  const pause = options.wait ?? wait;
+  const log = options.log ?? ((message: string) => console.log(message));
+  const startedAtMs = now();
+  let quietSinceMs = startedAtMs;
+  const knownMessages = new Map(
+    options.baselineMessages.map((message) => [message.id, message.text]),
+  );
+  const staleMessages: WhatsAppMessage[] = [];
+  let typingWasVisible = false;
+
+  log(
+    `[Session] Waiting for post-reset quiet period: ${options.quietMs} ms`,
+  );
+  while (true) {
+    const messages = await client.getMessages();
+    for (const message of messages) {
+      const knownText = knownMessages.get(message.id);
+      knownMessages.set(message.id, message.text);
+      if (
+        message.direction !== "incoming" ||
+        !message.text ||
+        knownText === message.text
+      ) {
+        continue;
+      }
+
+      const observedAtMs = now();
+      const staleMessage = {
+        ...message,
+        observedAt: new Date(observedAtMs),
+      };
+      staleMessages.push(staleMessage);
+      quietSinceMs = observedAtMs;
+      log(`[Session] STALE BOT MESSAGE:\n"${message.text}"`);
+      log(`[Session] Quiet timer restarted: ${options.quietMs} ms`);
+    }
+
+    const typing = (await client.isRemoteTyping?.()) ?? false;
+    const currentTime = now();
+    if (typing) {
+      quietSinceMs = currentTime;
+      if (!typingWasVisible) {
+        log("[Session] Bot is typing; post-reset quiet timer held");
+      }
+    } else if (typingWasVisible) {
+      quietSinceMs = currentTime;
+      log(
+        `[Session] Typing stopped; quiet timer restarted: ${options.quietMs} ms`,
+      );
+    }
+    typingWasVisible = typing;
+
+    if (!typing && currentTime - quietSinceMs >= options.quietMs) {
+      log("[Session] Post-reset quiet period complete");
+      return {
+        startedAt: new Date(startedAtMs),
+        completedAt: new Date(currentTime),
+        quietMs: options.quietMs,
+        staleMessages,
+      };
+    }
+    await pause(
+      Math.min(pollIntervalMs, options.quietMs - (currentTime - quietSinceMs)),
+    );
+  }
 }

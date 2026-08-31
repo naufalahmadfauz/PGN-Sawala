@@ -10,7 +10,9 @@
     "test:single": "xvfb-run -a tsx scripts/test-single.ts",
     "test:pgn": "xvfb-run -a tsx src/pgn-runner.ts",
     "test:pgn:validate": "tsx scripts/validate-pgn-workbook.ts",
-    "test:session-reset": "tsx --test scripts/session-reset.test.ts"
+    "test:response-collector": "tsx --test scripts/response-collector.test.ts",
+    "test:session-reset": "tsx --test scripts/session-reset.test.ts",
+    "test:workbook-writer": "tsx --test scripts/workbook-writer.test.ts"
   },
   "repository": {
     "type": "git",
@@ -34,6 +36,7 @@
   "dependencies": {
     "dotenv": "^17.4.2",
     "exceljs": "^4.4.0",
+    "jszip": "^3.10.1",
     "tmux": "^1.0.0"
   },
   "overrides": {

@@ -9,6 +9,9 @@ export interface PgnSessionIsolationConfig {
   command: string;
   confirmation: string;
   timeoutMs: number;
+  responseIdleMs: number;
+  responseTimeoutMs: number;
+  postResetQuietMs: number;
 }
 
 function formatSheetSummary(
@@ -52,7 +55,14 @@ export function formatPgnValidation(
     `Strategy: WhatsApp Conversation Builder debug command "${isolation.command}"`,
     `Expected confirmation: "${isolation.confirmation}"`,
     `Reset timeout: ${isolation.timeoutMs} ms`,
+    `Post-reset quiet window: ${isolation.postResetQuietMs} ms`,
     "Status: ENABLED",
+    "",
+    "Response completion",
+    "-------------------",
+    `Idle window: ${isolation.responseIdleMs} ms`,
+    `Hard timeout: ${isolation.responseTimeoutMs} ms`,
+    "Multiple bot bubbles: ENABLED",
   ];
 
   if (parsed.issues.length > 0) {

@@ -9,6 +9,7 @@ import {
 } from "./excel/pgn-workbook-loader";
 import {
   applyScenarioExecution,
+  appendPostResetDrainTranscript,
   appendSessionResetTranscript,
   openExecutedPgnWorkbook,
   saveExecutedPgnWorkbook,
@@ -26,6 +27,7 @@ import { WhatsAppClient } from "./whatsapp/client";
 import {
   BotSessionResetError,
   resetBotSession,
+  waitForPostResetQuiet,
 } from "./whatsapp/session-reset";
 
 interface CliOptions {
@@ -132,7 +134,11 @@ async function executeTurn(
     sentMessage = await client.sendMessage(turn.userInput, baseline);
     let response;
     try {
-      response = await client.waitForBotResponse(baseline, sentMessage);
+      response = await client.waitForBotResponse(
+        baseline,
+        sentMessage,
+        `${scenario.testCaseId} Turn ${turn.turnNumber}`,
+      );
     } catch (error) {
       const completedAt = new Date();
       const detail = error instanceof Error ? error.message : String(error);
@@ -184,7 +190,8 @@ async function executeTurn(
       technicalStatus,
       sentAt: sentMessage.sentAt,
       completedAt: response.completedAt,
-      botMessages: response.messages.map((message) => ({
+      botMessages: response.messages.map((message, index) => ({
+        sequence: index + 1,
         message: message.text,
         timestamp: message.observedAt,
       })),
@@ -229,12 +236,13 @@ function makeResetArtifactPathsRelative(
   }
 }
 
-async function resetBeforeScenario(
+async function resetAndDrainSession(
   client: WhatsAppClient,
   config: AppConfig,
   runId: string,
   scenario: PgnTestScenario,
   workbook: Workbook,
+  finalCleanup = false,
 ): Promise<void> {
   try {
     const attempt = await resetBotSession(client, {
@@ -243,8 +251,14 @@ async function resetBeforeScenario(
       timeoutMs: config.resetTimeoutMs,
       failureArtifactName: `reset-failure-${safeFileName(scenario.testCaseId)}-${runId}`,
     });
+    const drain = await waitForPostResetQuiet(client, {
+      baselineMessages:
+        attempt.messageStateAtCompletion ?? attempt.responseMessages,
+      quietMs: config.postResetQuietMs,
+    });
     makeResetArtifactPathsRelative(config, attempt);
     appendSessionResetTranscript(workbook, runId, scenario, attempt);
+    appendPostResetDrainTranscript(workbook, runId, scenario, drain);
     await saveExecutedPgnWorkbook(workbook, config.pgnExecutedWorkbookPath);
   } catch (error) {
     if (!(error instanceof BotSessionResetError)) {
@@ -266,12 +280,18 @@ async function resetBeforeScenario(
     }
     console.error("[Session] ABORTING TEST RUN");
     console.error(
-      "[Session] Reason: Unable to confirm clean PGN bot session before next scenario.",
+      finalCleanup
+        ? "[Session] Reason: Unable to confirm final PGN bot session cleanup."
+        : "[Session] Reason: Unable to confirm clean PGN bot session before next scenario.",
     );
     console.error("[Session] Completed test results have been saved.");
-    console.error("[Session] Remaining scenarios were NOT executed.");
+    if (!finalCleanup) {
+      console.error("[Session] Remaining scenarios were NOT executed.");
+    }
     throw new Error(
-      "Unable to confirm clean PGN bot session before next scenario.",
+      finalCleanup
+        ? "Unable to confirm final PGN bot session cleanup."
+        : "Unable to confirm clean PGN bot session before next scenario.",
       { cause: error },
     );
   }
@@ -372,7 +392,7 @@ export async function runPgnWorkbook(args = process.argv.slice(2)): Promise<void
     for (let scenarioIndex = 0; scenarioIndex < selection.runnable.length; scenarioIndex += 1) {
       const scenario = selection.runnable[scenarioIndex];
       const executions: ExecutedTurn[] = [];
-      await resetBeforeScenario(
+      await resetAndDrainSession(
         client,
         config,
         runId,
@@ -412,16 +432,16 @@ export async function runPgnWorkbook(args = process.argv.slice(2)): Promise<void
         config.pgnExecutedWorkbookPath,
       );
       console.log(`[Workbook] Saved after ${scenario.testCaseId}`);
-
-      if (
-        scenarioIndex < selection.runnable.length - 1 &&
-        config.betweenTestsMs > 0
-      ) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, config.betweenTestsMs),
-        );
-      }
     }
+
+    await resetAndDrainSession(
+      client,
+      config,
+      runId,
+      selection.runnable.at(-1)!,
+      executed.workbook,
+      true,
+    );
   } finally {
     await client.close();
   }

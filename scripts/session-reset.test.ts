@@ -9,6 +9,7 @@ import {
   BotSessionResetError,
   resetBotSession,
   type BotSessionClient,
+  waitForPostResetQuiet,
 } from "../src/whatsapp/session-reset";
 
 function message(
@@ -122,4 +123,82 @@ test("reset ignores historical confirmations and captures timeout diagnostics", 
   assert.match(failure.message, /timed out after 20 ms/);
   assert.equal(failure.attempt.evidencePath, "/tmp/reset-failure.png");
   assert.equal(client.debugCaptures, 1);
+});
+
+test("post-reset drain restarts its quiet timer after stale traffic", async () => {
+  let currentTimeMs = 0;
+  const logs: string[] = [];
+  const resetConfirmation = message(
+    "reset-confirmation",
+    "incoming",
+    "Session deleted",
+    2,
+  );
+  const staleMessage = message(
+    "stale-response",
+    "incoming",
+    "Delayed response from previous scenario",
+    3,
+  );
+  const client = {
+    async getMessages(): Promise<WhatsAppMessage[]> {
+      return currentTimeMs >= 4_000
+        ? [resetConfirmation, staleMessage]
+        : [resetConfirmation];
+    },
+  };
+
+  const result = await waitForPostResetQuiet(client, {
+    baselineMessages: [resetConfirmation],
+    quietMs: 10_000,
+    pollIntervalMs: 1_000,
+    now: () => currentTimeMs,
+    wait: async (milliseconds) => {
+      currentTimeMs += milliseconds;
+    },
+    log: (line) => logs.push(line),
+  });
+
+  assert.equal(result.completedAt.getTime(), 14_000);
+  assert.deepEqual(
+    result.staleMessages.map((item) => item.text),
+    ["Delayed response from previous scenario"],
+  );
+  assert(logs.some((line) => line.includes("STALE BOT MESSAGE")));
+  assert(logs.some((line) => line.includes("Quiet timer restarted")));
+});
+
+test("post-reset drain holds and restarts its quiet timer for typing", async () => {
+  let currentTimeMs = 0;
+  const logs: string[] = [];
+  const resetConfirmation = message(
+    "reset-confirmation",
+    "incoming",
+    "Session deleted",
+    2,
+  );
+  const client = {
+    async getMessages(): Promise<WhatsAppMessage[]> {
+      return [resetConfirmation];
+    },
+    async isRemoteTyping(): Promise<boolean> {
+      return currentTimeMs >= 9_000 && currentTimeMs < 12_000;
+    },
+  };
+
+  const result = await waitForPostResetQuiet(client, {
+    baselineMessages: [resetConfirmation],
+    quietMs: 10_000,
+    pollIntervalMs: 1_000,
+    now: () => currentTimeMs,
+    wait: async (milliseconds) => {
+      currentTimeMs += milliseconds;
+    },
+    log: (line) => logs.push(line),
+  });
+
+  assert.equal(result.completedAt.getTime(), 22_000);
+  assert.equal(result.staleMessages.length, 0);
+  assert(logs.some((line) => line.includes("Bot is typing")));
+  assert(logs.some((line) => line.includes("Typing stopped")));
 });

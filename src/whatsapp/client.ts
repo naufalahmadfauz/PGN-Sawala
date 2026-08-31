@@ -10,6 +10,7 @@ import type {
 } from "../types";
 import {
   collectBotResponse,
+  isRemoteTyping,
   readMessages,
   snapshotMessages,
 } from "./response-collector";
@@ -218,6 +219,10 @@ export class WhatsAppClient {
     return readMessages(this.requirePage());
   }
 
+  async isRemoteTyping(): Promise<boolean> {
+    return isRemoteTyping(this.requirePage());
+  }
+
   async captureMessageState(): Promise<MessageSnapshot> {
     await this.waitForMessageHistorySettled(30_000);
     return snapshotMessages(this.requirePage());
@@ -238,7 +243,6 @@ export class WhatsAppClient {
     );
     await composer.click();
     await composer.fill(message);
-    const sentAt = new Date();
     await composer.press("Enter");
 
     const deadline = Date.now() + 15_000;
@@ -267,7 +271,7 @@ export class WhatsAppClient {
         if (sentMessage.deliveryStatus !== "pending") {
           console.log("[WhatsApp] Outgoing message confirmed");
           return {
-            sentAt,
+            sentAt: new Date(),
             messageId: sentMessage.id,
             renderedText: sentMessage.text,
           };
@@ -291,6 +295,7 @@ export class WhatsAppClient {
   async waitForBotResponse(
     baseline: MessageSnapshot,
     sentMessage: SentMessage,
+    context?: string,
   ): Promise<ResponseCapture> {
     return collectBotResponse(this.requirePage(), {
       baseline,
@@ -298,6 +303,8 @@ export class WhatsAppClient {
       outgoingMessageId: sentMessage.messageId,
       timeoutMs: this.config.responseTimeoutMs,
       idleMs: this.config.responseIdleMs,
+      context,
+      excludedIncomingTexts: [this.config.resetConfirmation],
     });
   }
 

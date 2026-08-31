@@ -9,13 +9,23 @@ import {
   whatsappSelectors,
 } from "./locators";
 
-interface CollectResponseOptions {
+export interface CollectResponseOptions {
   baseline: MessageSnapshot;
   sentAt: Date;
   outgoingMessageId: string;
   timeoutMs: number;
   idleMs: number;
   pollIntervalMs?: number;
+  context?: string;
+  excludedIncomingTexts?: string[];
+}
+
+export interface ResponseCollectorEnvironment {
+  readMessages(): Promise<WhatsAppMessage[]>;
+  isRemoteTyping(): Promise<boolean>;
+  now(): number;
+  wait(milliseconds: number): Promise<void>;
+  log?(message: string): void;
 }
 
 interface RawMessage {
@@ -26,7 +36,7 @@ interface RawMessage {
   deliveryStatus?: "pending" | "sent" | "delivered" | "failed";
 }
 
-async function isRemoteTyping(page: Page): Promise<boolean> {
+export async function isRemoteTyping(page: Page): Promise<boolean> {
   for (const selector of whatsappSelectors.typingIndicator) {
     const indicator = page.locator(selector).first();
     if (!(await indicator.isVisible().catch(() => false))) {
@@ -38,6 +48,19 @@ async function isRemoteTyping(page: Page): Promise<boolean> {
     }
   }
   return false;
+}
+
+function normalizeMessage(value: string): string {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+export function combineBotMessages(messages: WhatsAppMessage[]): string {
+  if (messages.length === 1) {
+    return messages[0].text;
+  }
+  return messages
+    .map((message, index) => `Message ${index + 1}:\n${message.text}`)
+    .join("\n\n");
 }
 
 export async function readMessages(page: Page): Promise<WhatsAppMessage[]> {
@@ -162,7 +185,7 @@ export async function readMessages(page: Page): Promise<WhatsAppMessage[]> {
           }
         }
         const rawId = idElement?.getAttribute("data-id");
-        const fallbackIdSource = `${metadata}|${text}`;
+        const fallbackIdSource = `${metadata}|${direction}|${domIndex}`;
         let fallbackHash = 2166136261;
         for (let index = 0; index < fallbackIdSource.length; index += 1) {
           fallbackHash ^= fallbackIdSource.charCodeAt(index);
@@ -199,14 +222,96 @@ export async function collectBotResponse(
   page: Page,
   options: CollectResponseOptions,
 ): Promise<ResponseCapture> {
+  return collectBotResponseWithEnvironment(options, {
+    readMessages: () => readMessages(page),
+    isRemoteTyping: () => isRemoteTyping(page),
+    now: () => Date.now(),
+    wait: (milliseconds) => page.waitForTimeout(milliseconds),
+    log: (message) => console.log(message),
+  });
+}
+
+export async function collectBotResponseWithEnvironment(
+  options: CollectResponseOptions,
+  environment: ResponseCollectorEnvironment,
+): Promise<ResponseCapture> {
   const pollIntervalMs = options.pollIntervalMs ?? 250;
   const deadline = options.sentAt.getTime() + options.timeoutMs;
   const captured = new Map<string, WhatsAppMessage>();
-  let firstResponseAt: Date | undefined;
-  let lastIncomingAtMs: number | undefined;
+  const responseActivityAt = new Map<string, number>();
+  const ignored = new Map<string, string>();
+  const excludedTexts = new Set(
+    (options.excludedIncomingTexts ?? []).map(normalizeMessage),
+  );
+  const prefix = options.context ? `[Test ${options.context}] ` : "";
+  const log = (message: string): void => {
+    const formatted = `${prefix}${message}`;
+    if (environment.log) {
+      environment.log(formatted);
+    } else {
+      console.log(formatted);
+    }
+  };
+  let firstResponseAtMs: number | undefined;
+  let lastResponseAtMs: number | undefined;
+  let quietSinceMs: number | undefined;
+  let typingWasVisible = false;
 
-  while (Date.now() < deadline) {
-    const messages = await readMessages(page);
+  const refreshResponseTiming = (): void => {
+    const messages = [...captured.values()];
+    firstResponseAtMs = messages.length
+      ? Math.min(...messages.map((message) => message.observedAt.getTime()))
+      : undefined;
+    lastResponseAtMs = responseActivityAt.size
+      ? Math.max(...responseActivityAt.values())
+      : undefined;
+    quietSinceMs = lastResponseAtMs;
+  };
+
+  if (!Number.isInteger(options.idleMs) || options.idleMs < 1) {
+    throw new Error("Response idle window must be a positive integer");
+  }
+  if (
+    !Number.isInteger(options.timeoutMs) ||
+    options.timeoutMs <= options.idleMs
+  ) {
+    throw new Error("Response timeout must be greater than the idle window");
+  }
+  if (!Number.isInteger(pollIntervalMs) || pollIntervalMs < 1) {
+    throw new Error("Response poll interval must be a positive integer");
+  }
+
+  const result = (timedOut: boolean, completedAtMs: number): ResponseCapture => {
+    const messages = [...captured.values()].sort(
+      (left, right) => left.domIndex - right.domIndex,
+    );
+    const firstResponseAt =
+      firstResponseAtMs === undefined
+        ? undefined
+        : new Date(firstResponseAtMs);
+    return {
+      messages,
+      combinedResponse: combineBotMessages(messages),
+      sentAt: options.sentAt,
+      firstResponseAt,
+      completedAt: new Date(completedAtMs),
+      firstResponseMs:
+        firstResponseAtMs === undefined
+          ? undefined
+          : firstResponseAtMs - options.sentAt.getTime(),
+      totalResponseMs:
+        lastResponseAtMs === undefined
+          ? undefined
+          : lastResponseAtMs - options.sentAt.getTime(),
+      timedOut,
+    };
+  };
+
+  while (environment.now() < deadline) {
+    const messages = await environment.readMessages();
+    if (environment.now() >= deadline) {
+      break;
+    }
     const outgoingAnchor = messages.find(
       (message) =>
         message.direction === "outgoing" &&
@@ -222,62 +327,104 @@ export async function collectBotResponse(
         message.domIndex > outgoingAnchor!.domIndex,
     );
 
+    const observedAtMs = environment.now();
     for (const message of newIncoming) {
+      const normalized = normalizeMessage(message.text);
+      if (excludedTexts.has(normalized)) {
+        const removed = captured.delete(message.id);
+        responseActivityAt.delete(message.id);
+        if (removed) {
+          refreshResponseTiming();
+        }
+        if (ignored.get(message.id) !== message.text) {
+          ignored.set(message.id, message.text);
+          if (firstResponseAtMs !== undefined) {
+            quietSinceMs = observedAtMs;
+          }
+          log(`[Collector] Ignored control response: ${message.text}`);
+        }
+        continue;
+      }
+      if (ignored.has(message.id)) {
+        if (ignored.get(message.id) !== message.text) {
+          ignored.set(message.id, message.text);
+          if (firstResponseAtMs !== undefined) {
+            quietSinceMs = observedAtMs;
+          }
+          log(`[Collector] Ignored control response update: ${message.text}`);
+        }
+        continue;
+      }
+
       const existing = captured.get(message.id);
       if (!existing) {
-        const observedAt = new Date();
+        const observedAt = new Date(observedAtMs);
         const capturedMessage = { ...message, observedAt };
         captured.set(message.id, capturedMessage);
-        firstResponseAt ??= observedAt;
-        lastIncomingAtMs = observedAt.getTime();
+        responseActivityAt.set(message.id, observedAtMs);
+        firstResponseAtMs ??= observedAtMs;
+        lastResponseAtMs = observedAtMs;
+        quietSinceMs = observedAtMs;
+        log(
+          `[Bot] Message ${captured.size} received at +${observedAtMs - options.sentAt.getTime()} ms`,
+        );
+        log(`[Collector] Idle timer reset: ${options.idleMs} ms`);
       } else if (existing.text !== message.text) {
         captured.set(message.id, { ...message, observedAt: existing.observedAt });
-        lastIncomingAtMs = Date.now();
+        responseActivityAt.set(message.id, observedAtMs);
+        lastResponseAtMs = Math.max(...responseActivityAt.values());
+        quietSinceMs = observedAtMs;
+        const sequence = [...captured.keys()].indexOf(message.id) + 1;
+        log(
+          `[Bot] Message ${sequence} updated at +${observedAtMs - options.sentAt.getTime()} ms`,
+        );
+        log(`[Collector] Idle timer reset: ${options.idleMs} ms`);
       }
     }
 
-    if (
-      firstResponseAt &&
-      lastIncomingAtMs !== undefined &&
-      Date.now() - lastIncomingAtMs >= options.idleMs &&
-      !(await isRemoteTyping(page))
-    ) {
-      const completedAt = new Date();
-      const responseMessages = [...captured.values()].sort(
-        (left, right) => left.domIndex - right.domIndex,
-      );
-      return {
-        messages: responseMessages,
-        combinedResponse: responseMessages.map(({ text }) => text).join("\n"),
-        sentAt: options.sentAt,
-        firstResponseAt,
-        completedAt,
-        firstResponseMs:
-          firstResponseAt.getTime() - options.sentAt.getTime(),
-        totalResponseMs: completedAt.getTime() - options.sentAt.getTime(),
-        timedOut: false,
-      };
+    if (firstResponseAtMs !== undefined) {
+      const typing = await environment.isRemoteTyping();
+      const currentTimeMs = environment.now();
+      if (currentTimeMs >= deadline) {
+        break;
+      }
+      if (typing) {
+        quietSinceMs = currentTimeMs;
+        if (!typingWasVisible) {
+          log("[Collector] Bot is typing; quiet timer held");
+        }
+      } else if (typingWasVisible) {
+        quietSinceMs = currentTimeMs;
+        log(`[Collector] Typing stopped; idle timer reset: ${options.idleMs} ms`);
+      }
+      typingWasVisible = typing;
+
+      if (
+        !typing &&
+        quietSinceMs !== undefined &&
+        currentTimeMs - quietSinceMs >= options.idleMs
+      ) {
+        log(`[Collector] No incoming messages for ${options.idleMs} ms`);
+        log("[Collector] Response complete");
+        log(`[Collector] ${captured.size} bot messages captured`);
+        log(
+          `[Collector] First response: ${firstResponseAtMs - options.sentAt.getTime()} ms`,
+        );
+        log(
+          `[Collector] Total response: ${lastResponseAtMs! - options.sentAt.getTime()} ms`,
+        );
+        return result(false, currentTimeMs);
+      }
     }
 
-    await page.waitForTimeout(
-      Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())),
-    );
+    const remainingMs = deadline - environment.now();
+    if (remainingMs > 0) {
+      await environment.wait(Math.min(pollIntervalMs, remainingMs));
+    }
   }
 
-  const completedAt = new Date();
-  const responseMessages = [...captured.values()].sort(
-    (left, right) => left.domIndex - right.domIndex,
-  );
-  return {
-    messages: responseMessages,
-    combinedResponse: responseMessages.map(({ text }) => text).join("\n"),
-    sentAt: options.sentAt,
-    firstResponseAt,
-    completedAt,
-    firstResponseMs: firstResponseAt
-      ? firstResponseAt.getTime() - options.sentAt.getTime()
-      : undefined,
-    totalResponseMs: completedAt.getTime() - options.sentAt.getTime(),
-    timedOut: true,
-  };
+  const completedAtMs = Math.min(environment.now(), deadline);
+  log(`[Collector] Hard timeout after ${options.timeoutMs} ms`);
+  log(`[Collector] ${captured.size} bot messages captured before timeout`);
+  return result(true, completedAtMs);
 }
