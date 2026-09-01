@@ -20,6 +20,10 @@ import {
   parsePgnWorkbook,
 } from "./pgn-workbook-loader";
 import {
+  ensureEvidenceWorkbookSchema,
+  writeEvidenceHyperlink,
+} from "./evidence-workbook";
+import {
   KB_SHEET_NAME,
   NEGATIVE_SHEET_NAME,
   TRANSCRIPT_SHEET_NAME,
@@ -56,6 +60,8 @@ const TRANSCRIPT_HEADERS = [
   "Status",
   "Error",
   "Evidence Path",
+  "Evidence URL",
+  "Evidence Status",
 ];
 
 function ensureTranscriptWorksheet(workbook: ExcelJS.Workbook): Worksheet {
@@ -79,7 +85,7 @@ function ensureTranscriptWorksheet(workbook: ExcelJS.Workbook): Worksheet {
   header.alignment = { vertical: "middle", wrapText: true };
   worksheet.views = [{ state: "frozen", ySplit: 1 }];
   const widths = [
-    24, 18, 28, 12, 9, 16, 70, 24, 20, 20, 18, 45, 55,
+    24, 18, 28, 12, 9, 16, 70, 24, 20, 20, 18, 45, 55, 20, 24,
   ];
   widths.forEach((width, index) => {
     worksheet.getColumn(index + 1).width = width;
@@ -337,7 +343,12 @@ function appendTranscriptRows(
     execution.technicalStatus,
     execution.error ?? "",
     execution.evidencePath ?? "",
+    execution.evidenceUrl ? "View Evidence" : "",
+    execution.evidenceStatus ?? "",
   ]);
+  if (execution.evidenceUrl) {
+    writeEvidenceHyperlink(userRow.getCell(14), execution.evidenceUrl);
+  }
   userRow.alignment = { vertical: "top", wrapText: true };
   userRow.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
 
@@ -353,7 +364,12 @@ function appendTranscriptRows(
         execution.technicalStatus,
         execution.error ?? "",
         execution.evidencePath ?? "",
+        execution.evidenceUrl ? "View Evidence" : "",
+        execution.evidenceStatus ?? "",
       ]);
+      if (execution.evidenceUrl) {
+        writeEvidenceHyperlink(botRow.getCell(14), execution.evidenceUrl);
+      }
       botRow.alignment = { vertical: "top", wrapText: true };
       botRow.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
     }
@@ -368,7 +384,12 @@ function appendTranscriptRows(
       execution.technicalStatus,
       execution.error,
       execution.evidencePath ?? "",
+      execution.evidenceUrl ? "View Evidence" : "",
+      execution.evidenceStatus ?? "",
     ]);
+    if (execution.evidenceUrl) {
+      writeEvidenceHyperlink(errorRow.getCell(14), execution.evidenceUrl);
+    }
     errorRow.alignment = { vertical: "top", wrapText: true };
     errorRow.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
   }
@@ -389,6 +410,9 @@ function applyKnowledgeBaseExecution(
       responseTime.numFmt = '0.00" s"';
     }
     writeExecutionDate(worksheet.getCell(row, 11), execution.completedAt);
+    if (execution.evidenceUrl) {
+      writeEvidenceHyperlink(worksheet.getCell(row, 14), execution.evidenceUrl);
+    }
     if (execution.technicalStatus !== "CAPTURED") {
       appendTechnicalNote(
         worksheet.getCell(row, 13),
@@ -443,6 +467,10 @@ function applyNegativeExecution(
 
   const completedAt = executions.at(-1)?.completedAt ?? new Date();
   writeExecutionDate(worksheet.getCell(row, 10), completedAt);
+  const finalEvidence = executions.filter((execution) => execution.evidenceUrl).at(-1);
+  if (finalEvidence?.evidenceUrl) {
+    writeEvidenceHyperlink(worksheet.getCell(row, 14), finalEvidence.evidenceUrl);
+  }
   for (const execution of executions) {
     if (execution.technicalStatus !== "CAPTURED") {
       appendTechnicalNote(
@@ -481,7 +509,12 @@ export async function openExecutedPgnWorkbook(
     workbook.getWorksheet(TRANSCRIPT_SHEET_NAME),
   );
   ensureTranscriptWorksheet(workbook);
-  if (!hadTranscript || !(await tablePartsMatch(outputPath, tableParts))) {
+  const evidenceSchemaChanged = ensureEvidenceWorkbookSchema(workbook);
+  if (
+    !hadTranscript ||
+    evidenceSchemaChanged ||
+    !(await tablePartsMatch(outputPath, tableParts))
+  ) {
     await saveExecutedPgnWorkbook(workbook, outputPath);
   }
   return { workbook, parsed: parsePgnWorkbook(workbook), resumed };
@@ -507,6 +540,30 @@ export function applyScenarioExecution(
   for (const execution of executions) {
     appendTranscriptRows(transcript, runId, scenario, execution);
   }
+}
+
+export function applyLatestScenarioExecution(
+  workbook: ExcelJS.Workbook,
+  runId: string,
+  scenario: PgnTestScenario,
+  executions: ExecutedTurn[],
+): void {
+  const worksheet = workbook.getWorksheet(scenario.sheetName);
+  const latest = executions.at(-1);
+  if (!worksheet || !latest) {
+    throw new Error(`Cannot apply latest execution for "${scenario.testCaseId}"`);
+  }
+  if (scenario.sheetKind === "kb") {
+    applyKnowledgeBaseExecution(worksheet, executions);
+  } else {
+    applyNegativeExecution(worksheet, scenario, executions);
+  }
+  appendTranscriptRows(
+    ensureTranscriptWorksheet(workbook),
+    runId,
+    scenario,
+    latest,
+  );
 }
 
 export function appendSessionResetTranscript(
@@ -544,6 +601,8 @@ export function appendSessionResetTranscript(
       attempt.status,
       attempt.error ?? "",
       attempt.evidencePath ?? "",
+      "",
+      "",
     ]);
     row.alignment = { vertical: "top", wrapText: true };
     row.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
@@ -622,6 +681,8 @@ export function appendPostResetDrainTranscript(
       "STALE_DRAINED",
       "",
       "",
+      "",
+      "",
     ]);
     row.alignment = { vertical: "top", wrapText: true };
     row.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
@@ -635,6 +696,8 @@ export function appendPostResetDrainTranscript(
     null,
     null,
     "QUIET_CONFIRMED",
+    "",
+    "",
     "",
     "",
   ]);

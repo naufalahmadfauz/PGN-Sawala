@@ -308,9 +308,52 @@ export class WhatsAppClient {
     });
   }
 
+  async getConversationPane(): Promise<Locator> {
+    return waitForFirstVisibleLocator(
+      this.requirePage(),
+      whatsappSelectors.conversationRoot,
+      15_000,
+    );
+  }
+
   async captureScreenshot(absolutePath: string): Promise<void> {
     await mkdir(path.dirname(absolutePath), { recursive: true });
-    await this.requirePage().screenshot({ path: absolutePath, fullPage: true });
+    const page = this.requirePage();
+    const conversationPane = await this.getConversationPane();
+    const box = await conversationPane.boundingBox();
+    const viewport = page.viewportSize();
+    if (
+      !box ||
+      !viewport ||
+      box.width >= viewport.width * 0.9 ||
+      box.x < viewport.width * 0.15
+    ) {
+      throw new Error(
+        "Conversation pane bounds are unsafe; refusing to capture the WhatsApp sidebar",
+      );
+    }
+    await conversationPane.evaluate((root) => {
+      const candidates = [root, ...root.querySelectorAll<HTMLElement>("*")]
+        .filter(
+          (element): element is HTMLElement =>
+            element instanceof HTMLElement &&
+            element.scrollHeight > element.clientHeight + 20,
+        )
+        .sort(
+          (left, right) =>
+            right.scrollHeight - right.clientHeight -
+            (left.scrollHeight - left.clientHeight),
+        );
+      const scrollContainer = candidates[0];
+      if (scrollContainer) {
+        scrollContainer.scrollTop = scrollContainer.scrollHeight;
+      }
+    });
+    await page.waitForTimeout(250);
+    await conversationPane.screenshot({
+      path: absolutePath,
+      animations: "disabled",
+    });
   }
 
   async saveDebugArtifacts(

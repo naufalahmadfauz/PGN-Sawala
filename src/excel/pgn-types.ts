@@ -4,6 +4,16 @@ export const KB_SHEET_NAME = "Test Case Knowledge Base";
 export const NEGATIVE_SHEET_NAME = "Negative Case";
 export const TRANSCRIPT_SHEET_NAME = "Execution Transcript";
 
+export type EvidenceStatus =
+  | "EVIDENCE_PENDING"
+  | "EVIDENCE_SYNCED"
+  | "EVIDENCE_ALREADY_SYNCED"
+  | "EVIDENCE_LOCAL_ONLY"
+  | "EVIDENCE_CAPTURE_ERROR"
+  | "EVIDENCE_UPLOAD_ERROR"
+  | "EVIDENCE_MISSING"
+  | "EVIDENCE_REQUIRES_RERUN";
+
 export type PgnSheetKind = "kb" | "negative";
 export type TechnicalStatus =
   | "CAPTURED"
@@ -82,4 +92,8 @@ export interface ExecutedTurn {
   totalResponseMs?: number;
   error?: string;
   evidencePath?: string;
+  evidenceUrl?: string;
+  evidenceStatus?: EvidenceStatus;
+  evidenceDriveFileId?: string;
+  evidenceDriveFileName?: string;
 }

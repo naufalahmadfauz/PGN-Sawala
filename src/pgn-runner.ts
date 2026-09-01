@@ -8,12 +8,18 @@ import {
   loadPgnWorkbook,
 } from "./excel/pgn-workbook-loader";
 import {
-  applyScenarioExecution,
+  applyLatestScenarioExecution,
   appendPostResetDrainTranscript,
   appendSessionResetTranscript,
   openExecutedPgnWorkbook,
   saveExecutedPgnWorkbook,
 } from "./excel/pgn-workbook-writer";
+import {
+  EVIDENCE_MIGRATION_VERSION,
+  getEvidenceRunMetadata,
+  upsertEvidenceFileMetadata,
+  upsertEvidenceRunMetadata,
+} from "./excel/evidence-workbook";
 import { assertPgnWorkbookValid } from "./excel/pgn-workbook-validator";
 import type {
   ExecutedTurn,
@@ -23,6 +29,11 @@ import type {
   TechnicalStatus,
 } from "./excel/pgn-types";
 import type { BotSessionResetAttempt, SentMessage } from "./types";
+import {
+  createGoogleDriveEvidencePublisher,
+  type EvidenceDrivePublisher,
+} from "./evidence/google-drive";
+import { evidenceFileName } from "./evidence/evidence-migration";
 import { WhatsAppClient } from "./whatsapp/client";
 import {
   BotSessionResetError,
@@ -36,6 +47,11 @@ interface CliOptions {
   testIds: Set<string>;
   rerunAll: boolean;
   rerunIds: Set<string>;
+}
+
+interface RunEvidenceContext {
+  publisher: EvidenceDrivePublisher;
+  folderId: string;
 }
 
 function parseIdList(value: string): string[] {
@@ -126,6 +142,7 @@ async function executeTurn(
   runId: string,
   scenario: PgnTestScenario,
   turn: PgnTestTurn,
+  driveEvidence?: RunEvidenceContext,
 ): Promise<ExecutedTurn> {
   const artifactKey = `${runId}-${safeFileName(scenario.testCaseId)}-turn-${turn.turnNumber}`;
   let sentMessage: SentMessage | undefined;
@@ -163,13 +180,43 @@ async function executeTurn(
       `${artifactKey}.png`,
     );
     let evidencePath: string | undefined;
+    let evidenceUrl: string | undefined;
+    let evidenceStatus: ExecutedTurn["evidenceStatus"];
+    let evidenceDriveFileId: string | undefined;
+    let evidenceDriveFileName: string | undefined;
     try {
       await client.captureScreenshot(evidenceAbsolutePath);
       evidencePath = relativeToProject(config, evidenceAbsolutePath);
+      evidenceStatus = driveEvidence
+        ? "EVIDENCE_PENDING"
+        : "EVIDENCE_LOCAL_ONLY";
     } catch (error) {
+      evidenceStatus = "EVIDENCE_CAPTURE_ERROR";
       console.error(
         `[Evidence] Screenshot failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+    }
+    if (driveEvidence && evidencePath) {
+      try {
+        const uploaded = await driveEvidence.publisher.uploadPng({
+          folderId: driveEvidence.folderId,
+          localPath: evidenceAbsolutePath,
+          fileName: evidenceFileName(
+            scenario.testCaseId,
+            turn.turnNumber,
+          ),
+        });
+        evidenceUrl = uploaded.webViewLink;
+        evidenceDriveFileId = uploaded.id;
+        evidenceDriveFileName = uploaded.name;
+        evidenceStatus = "EVIDENCE_SYNCED";
+        console.log(`[Evidence] Uploaded ${uploaded.name}`);
+      } catch (error) {
+        evidenceStatus = "EVIDENCE_UPLOAD_ERROR";
+        console.error(
+          `[Evidence] EVIDENCE_UPLOAD_ERROR: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
 
     const technicalStatus: TechnicalStatus = response.timedOut
@@ -200,6 +247,10 @@ async function executeTurn(
       totalResponseMs: response.totalResponseMs,
       error,
       evidencePath,
+      evidenceUrl,
+      evidenceStatus,
+      evidenceDriveFileId,
+      evidenceDriveFileName,
     };
   } catch (error) {
     const completedAt = new Date();
@@ -383,6 +434,27 @@ export async function runPgnWorkbook(args = process.argv.slice(2)): Promise<void
   );
 
   const runId = createRunId();
+  let driveEvidence: RunEvidenceContext | undefined;
+  if (config.googleDriveEvidenceEnabled) {
+    const publisher = createGoogleDriveEvidencePublisher(config);
+    await publisher.validateParentFolder();
+    const storedRun = getEvidenceRunMetadata(executed.workbook, runId);
+    const folder = await publisher.ensureRunFolder(runId, storedRun?.folderId);
+    upsertEvidenceRunMetadata(executed.workbook, {
+      runId,
+      folderId: folder.id,
+      folderUrl: folder.webViewLink,
+      migrationVersion: EVIDENCE_MIGRATION_VERSION,
+      timestamp: new Date(),
+      mode: "FUTURE",
+    });
+    await saveExecutedPgnWorkbook(
+      executed.workbook,
+      config.pgnExecutedWorkbookPath,
+    );
+    driveEvidence = { publisher, folderId: folder.id };
+    console.log(`[Evidence] Drive run folder ready: ${folder.name}`);
+  }
   const client = new WhatsAppClient(config);
   try {
     await client.open();
@@ -410,8 +482,37 @@ export async function runPgnWorkbook(args = process.argv.slice(2)): Promise<void
           runId,
           scenario,
           turn,
+          driveEvidence,
         );
         executions.push(execution);
+        if (driveEvidence) {
+          upsertEvidenceFileMetadata(executed.workbook, {
+            evidenceKey: `${runId}|${scenario.testCaseId}|${turn.turnNumber}`,
+            runId,
+            testCaseId: scenario.testCaseId,
+            turnNumber: turn.turnNumber,
+            driveFileId: execution.evidenceDriveFileId,
+            driveFileName:
+              execution.evidenceDriveFileName ??
+              evidenceFileName(scenario.testCaseId, turn.turnNumber),
+            evidenceUrl: execution.evidenceUrl,
+            localCleanPath: execution.evidencePath,
+            status: execution.evidenceStatus ?? "EVIDENCE_CAPTURE_ERROR",
+          });
+        }
+        applyLatestScenarioExecution(
+          executed.workbook,
+          runId,
+          scenario,
+          executions,
+        );
+        await saveExecutedPgnWorkbook(
+          executed.workbook,
+          config.pgnExecutedWorkbookPath,
+        );
+        console.log(
+          `[Workbook] Saved after ${scenario.testCaseId} turn ${turn.turnNumber}`,
+        );
         if (execution.combinedResponse) {
           console.log(`[Bot] ${execution.combinedResponse}`);
         }
@@ -426,12 +527,6 @@ export async function runPgnWorkbook(args = process.argv.slice(2)): Promise<void
         }
       }
 
-      applyScenarioExecution(executed.workbook, runId, scenario, executions);
-      await saveExecutedPgnWorkbook(
-        executed.workbook,
-        config.pgnExecutedWorkbookPath,
-      );
-      console.log(`[Workbook] Saved after ${scenario.testCaseId}`);
     }
 
     await resetAndDrainSession(

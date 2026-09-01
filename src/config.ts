@@ -15,6 +15,8 @@ export interface AppConfig {
   artifactsDir: string;
   debugDir: string;
   evidenceDir: string;
+  evidenceCleanDir: string;
+  reportArchiveDir: string;
   loginScreenshotPath: string;
   dataFilePath: string;
   reportFilePath: string;
@@ -31,6 +33,11 @@ export interface AppConfig {
   betweenTestsMs: number;
   headless: boolean;
   browserChannel?: string;
+  googleDriveEvidenceEnabled: boolean;
+  googleDriveEvidenceParentFolderId?: string;
+  googleDriveEvidenceFolderPrefix: string;
+  googleServiceAccountJson?: string;
+  legacyEvidenceCropLeft?: number;
   target?: WhatsAppTarget;
 }
 
@@ -68,6 +75,42 @@ function booleanFromEnvironment(name: string, fallback: boolean): boolean {
 
 function textFromEnvironment(name: string, fallback: string): string {
   return process.env[name]?.trim() || fallback;
+}
+
+export function normalizeGoogleDriveFolderId(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error("GOOGLE_DRIVE_EVIDENCE_PARENT_FOLDER must not be empty");
+  }
+
+  let folderId = trimmed;
+  if (/^https?:\/\//i.test(trimmed)) {
+    let url: URL;
+    try {
+      url = new URL(trimmed);
+    } catch {
+      throw new Error("GOOGLE_DRIVE_EVIDENCE_PARENT_FOLDER is not a valid URL");
+    }
+    if (url.hostname !== "drive.google.com") {
+      throw new Error(
+        "GOOGLE_DRIVE_EVIDENCE_PARENT_FOLDER URL must use drive.google.com",
+      );
+    }
+    const match = url.pathname.match(/\/folders\/([A-Za-z0-9_-]+)/);
+    if (!match) {
+      throw new Error(
+        "GOOGLE_DRIVE_EVIDENCE_PARENT_FOLDER URL must contain /folders/<ID>",
+      );
+    }
+    folderId = match[1];
+  }
+
+  if (!/^[A-Za-z0-9_-]{10,}$/.test(folderId)) {
+    throw new Error(
+      "GOOGLE_DRIVE_EVIDENCE_PARENT_FOLDER must be a Drive folder ID or folder URL",
+    );
+  }
+  return folderId;
 }
 
 function resolveInsideDirectory(
@@ -158,6 +201,24 @@ export function loadConfig(): AppConfig {
       "WHATSAPP_RESPONSE_IDLE_MS must be less than WHATSAPP_RESPONSE_TIMEOUT_MS",
     );
   }
+  const configuredDriveParent =
+    process.env.GOOGLE_DRIVE_EVIDENCE_PARENT_FOLDER?.trim();
+  const configuredCropLeft = process.env.LEGACY_EVIDENCE_CROP_LEFT?.trim();
+  const legacyEvidenceCropLeft = configuredCropLeft
+    ? integerFromEnvironment("LEGACY_EVIDENCE_CROP_LEFT", 0, 1)
+    : undefined;
+  const googleDriveEvidenceFolderPrefix = textFromEnvironment(
+    "GOOGLE_DRIVE_EVIDENCE_FOLDER_PREFIX",
+    "PGN-WhatsApp-Evidence",
+  );
+  if (
+    googleDriveEvidenceFolderPrefix.includes("/") ||
+    googleDriveEvidenceFolderPrefix.length > 120
+  ) {
+    throw new Error(
+      "GOOGLE_DRIVE_EVIDENCE_FOLDER_PREFIX must not contain / and must be at most 120 characters",
+    );
+  }
 
   return {
     projectRoot,
@@ -166,6 +227,8 @@ export function loadConfig(): AppConfig {
     artifactsDir,
     debugDir: path.join(artifactsDir, "debug"),
     evidenceDir: path.join(artifactsDir, "evidence"),
+    evidenceCleanDir: path.join(artifactsDir, "evidence", "clean"),
+    reportArchiveDir: path.join(projectRoot, "reports", "archive"),
     loginScreenshotPath: path.join(artifactsDir, "whatsapp-login.png"),
     dataFilePath,
     reportFilePath,
@@ -206,6 +269,17 @@ export function loadConfig(): AppConfig {
     headless: booleanFromEnvironment("WHATSAPP_HEADLESS", false),
     browserChannel:
       process.env.WHATSAPP_BROWSER_CHANNEL?.trim() || undefined,
+    googleDriveEvidenceEnabled: booleanFromEnvironment(
+      "GOOGLE_DRIVE_EVIDENCE_ENABLED",
+      false,
+    ),
+    googleDriveEvidenceParentFolderId: configuredDriveParent
+      ? normalizeGoogleDriveFolderId(configuredDriveParent)
+      : undefined,
+    googleDriveEvidenceFolderPrefix,
+    googleServiceAccountJson:
+      process.env.GOOGLE_SERVICE_ACCOUNT_JSON?.trim() || undefined,
+    legacyEvidenceCropLeft,
     target: readTarget(),
   };
 }
