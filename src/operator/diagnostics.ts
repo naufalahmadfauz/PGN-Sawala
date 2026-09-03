@@ -362,3 +362,135 @@ export function formatDiagnosticReport(report: DiagnosticReport): string {
     )
     .join("\n");
 }
+
+function diagnosticSymbol(status: DiagnosticStatus): string {
+  if (status === "ok") return "✓";
+  if (status === "error") return "✗";
+  if (status === "info") return "•";
+  return "!";
+}
+
+function checkById(
+  report: DiagnosticReport,
+  id: string,
+): DiagnosticCheck | undefined {
+  return report.checks.find((check) => check.id === id);
+}
+
+function friendlyBrowserRuntime(report: DiagnosticReport): string {
+  const runtime = checkById(report, "browser-runtime");
+  if (runtime?.status === "error") {
+    return runtime.detail;
+  }
+  const codespaces = checkById(report, "os")?.detail.includes("Codespaces");
+  if (report.browserRuntime.mode === "xvfb") {
+    return codespaces
+      ? "Codespaces detected; Xvfb will be used automatically"
+      : "Headless Linux detected; Xvfb will be used automatically";
+  }
+  return "ready";
+}
+
+export function formatSetupInspection(report: DiagnosticReport): string {
+  return report.checks
+    .map((check) => {
+      const symbol = diagnosticSymbol(check.status);
+      if (check.id === "drive") {
+        if (check.status === "ok") {
+          return `${symbol} Google Drive configuration: detected`;
+        }
+        if (check.status === "warn") {
+          return `${symbol} Google Drive configuration: disabled`;
+        }
+        return `${symbol} Google Drive configuration: needs attention`;
+      }
+      if (check.id === "browser-runtime") {
+        return `${symbol} Browser runtime: ${friendlyBrowserRuntime(report)}`;
+      }
+      return `${symbol} ${check.label}: ${check.detail}`;
+    })
+    .join("\n");
+}
+
+function successfulCheckLine(
+  check: DiagnosticCheck | undefined,
+  success: string,
+  failure: string,
+): string {
+  if (check?.status === "ok") return `✓ ${success}`;
+  if (check?.status === "warn") return `! ${failure}`;
+  return `✗ ${failure}`;
+}
+
+export function formatSetupChecklist(report: DiagnosticReport): string {
+  const node = checkById(report, "node");
+  const npm = checkById(report, "npm");
+  const environment = checkById(report, "env");
+  const drive = checkById(report, "drive");
+  const browserRuntime = checkById(report, "browser-runtime");
+  const lines = [
+    successfulCheckLine(
+      node,
+      `Node.js ${node?.detail.match(/v?([0-9]+(?:\.[0-9]+){2})/)?.[1] ?? "available"}`,
+      "Node.js needs attention",
+    ),
+    successfulCheckLine(
+      npm,
+      `npm ${npm?.detail ?? "available"}`,
+      "npm needs attention",
+    ),
+    successfulCheckLine(
+      checkById(report, "dependencies"),
+      "Dependencies installed",
+      "Dependencies need attention",
+    ),
+    successfulCheckLine(
+      checkById(report, "chromium"),
+      "Chromium installed",
+      "Chromium missing",
+    ),
+    successfulCheckLine(
+      checkById(report, "source-workbook"),
+      "Source workbook found",
+      "Source workbook missing",
+    ),
+    successfulCheckLine(
+      checkById(report, "executed-workbook"),
+      "Executed workbook found",
+      "Executed workbook not created yet",
+    ),
+    successfulCheckLine(
+      checkById(report, "whatsapp-profile"),
+      "WhatsApp profile present",
+      "WhatsApp profile missing",
+    ),
+    successfulCheckLine(
+      checkById(report, "whatsapp-target"),
+      "WhatsApp target configured",
+      "WhatsApp target not configured",
+    ),
+  ];
+  if (environment?.status === "ok") {
+    lines.push("✓ .env found");
+  } else {
+    lines.push("! .env not found; current environment settings are unchanged");
+  }
+  if (drive?.status === "ok" && /verified/i.test(drive.detail)) {
+    lines.push("✓ Google Drive access verified");
+  } else if (drive?.status === "warn") {
+    lines.push("! Google Drive access not checked; Drive is disabled");
+  } else {
+    lines.push("✗ Google Drive access not verified");
+  }
+  if (browserRuntime?.status === "error") {
+    lines.push("✗ Browser runtime unavailable");
+  } else if (report.browserRuntime.mode === "xvfb") {
+    lines.push(`✓ Browser runtime: ${friendlyBrowserRuntime(report)}`);
+  } else {
+    lines.push("✓ Browser runtime ready");
+  }
+  if (checkById(report, "configuration")?.status === "error") {
+    lines.push("✗ Configuration needs attention");
+  }
+  return lines.join("\n");
+}

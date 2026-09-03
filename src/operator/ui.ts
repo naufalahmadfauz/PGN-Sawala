@@ -16,6 +16,7 @@ export interface SelectOption<Value extends string> {
   value: Value;
   label: string;
   hint?: string;
+  disabled?: boolean;
 }
 
 export interface SelectPrompt<Value extends string> {
@@ -27,6 +28,8 @@ export interface SelectPrompt<Value extends string> {
 export interface ConfirmPrompt {
   message: string;
   initialValue?: boolean;
+  active?: string;
+  inactive?: string;
 }
 
 export interface TextPrompt {

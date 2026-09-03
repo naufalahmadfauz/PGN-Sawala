@@ -1,4 +1,5 @@
 import { safeGoogleCredentialError } from "../evidence/google-service-account";
+import type { SetupNextAction } from "./setup";
 import type { OperatorUi } from "./ui";
 
 export interface RetestReadiness {
@@ -19,7 +20,7 @@ export interface OperatorActions {
   loginWhatsApp(): Promise<void>;
   verifyWhatsApp(): Promise<void>;
   recreateWhatsApp(): Promise<void>;
-  setup(): Promise<void>;
+  setup(): Promise<SetupNextAction | void>;
   diagnostics(): Promise<void>;
   typecheck(): Promise<void>;
   regressionTests(): Promise<void>;
@@ -65,6 +66,23 @@ async function confirmExecution(
     message: `${scope} will open WhatsApp, send reset and testcase messages, update the executed workbook, and may upload evidence. Continue?`,
     initialValue: false,
   });
+}
+
+export async function runConfirmedFullTest(
+  ui: OperatorUi,
+  actions: OperatorActions,
+): Promise<boolean> {
+  const confirmed = await confirmExecution(ui, "A full test run");
+  if (confirmed === undefined) return false;
+  if (!confirmed) {
+    ui.info("Test execution cancelled");
+    return true;
+  }
+  const result = await attempt(ui, "Starting PGN execution", () =>
+    actions.runPgn([]),
+  );
+  if (result.ok) ui.success("PGN execution finished");
+  return true;
 }
 
 async function runTestsMenu(
@@ -400,6 +418,21 @@ export async function runControlPanel(
     if (choice === "setup") {
       const result = await attempt(ui, "Opening setup", actions.setup);
       keepRunning = result.ok;
+      if (result.ok && result.value === "diagnostics") {
+        const diagnostics = await attempt(
+          ui,
+          "Running diagnostics",
+          actions.diagnostics,
+        );
+        keepRunning = diagnostics.ok;
+      }
+      if (result.ok && result.value === "full-test") {
+        keepRunning = await runConfirmedFullTest(ui, actions);
+      }
+      if (result.ok && result.value === "exit") {
+        ui.outro("Operator control panel closed");
+        return;
+      }
     }
     if (choice === "diagnostics") {
       const result = await attempt(ui, "Running diagnostics", actions.diagnostics);

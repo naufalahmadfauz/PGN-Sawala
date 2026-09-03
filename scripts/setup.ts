@@ -1,23 +1,26 @@
 import { runCliMain } from "../src/cli-entrypoint";
-import { REPOSITORY_ROOT } from "../src/environment";
-import { runBrowserAction } from "../src/operator/browser-runtime";
+import {
+  runConfirmedFullTest,
+  runControlPanel,
+} from "../src/operator/control-panel";
+import { createDefaultActions } from "../src/operator/default-actions";
 import { runSetupWizard } from "../src/operator/setup";
 import { createClackUi } from "../src/operator/ui";
-import { loadConfig } from "../src/config";
-import { loginWhatsApp } from "../src/whatsapp/auth";
-import path from "node:path";
 
 const ui = createClackUi();
 runCliMain(async () => {
-  await runSetupWizard(ui, {
-    loginWhatsApp: async () => {
-      const config = loadConfig();
-      await runBrowserAction({
-        headless: config.headless,
-        projectRoot: config.projectRoot,
-        scriptPath: path.join(REPOSITORY_ROOT, "scripts", "whatsapp-login.ts"),
-        direct: () => loginWhatsApp(config),
-      });
-    },
+  const actions = createDefaultActions(ui);
+  const result = await runSetupWizard(ui, {
+    loginWhatsApp: actions.loginWhatsApp,
   });
+  if (result.cancelled) return;
+  if (result.nextAction === "diagnostics") {
+    await actions.diagnostics();
+  } else if (result.nextAction === "main-menu") {
+    await runControlPanel(ui, actions);
+  } else if (result.nextAction === "full-test") {
+    await runConfirmedFullTest(ui, actions);
+  } else {
+    ui.outro("Setup closed");
+  }
 });

@@ -13,7 +13,8 @@ import {
 } from "../environment";
 import {
   collectDiagnostics,
-  formatDiagnosticReport,
+  formatSetupChecklist,
+  formatSetupInspection,
   type DiagnosticReport,
 } from "./diagnostics";
 import { runInheritedCommand } from "./process";
@@ -48,7 +49,14 @@ export interface SetupResult {
   environmentUpdated: boolean;
   chromiumInstalled: boolean;
   loginStarted: boolean;
+  nextAction?: SetupNextAction;
 }
+
+export type SetupNextAction =
+  | "diagnostics"
+  | "main-menu"
+  | "full-test"
+  | "exit";
 
 function envValue(value: string): string {
   if (!value) return "";
@@ -204,13 +212,13 @@ export async function runSetupWizard(
     () => diagnose(false),
     "Workstation inspected",
   );
-  ui.note(formatDiagnosticReport(report), "Environment");
+  ui.note(formatSetupInspection(report), "Environment");
 
   const configure = await ui.confirm({
-    message: report.environmentFilePresent
-      ? "Update repository-local configuration?"
-      : "Create a repository-local .env configuration?",
+    message: "Would you like to review or update your setup?",
     initialValue: !report.environmentFilePresent,
+    active: "Yes",
+    inactive: "No, keep current settings",
   });
   if (configure === undefined) return cancelled(ui);
 
@@ -457,16 +465,35 @@ export async function runSetupWizard(
       report = await diagnose(true);
     }
   }
-  ui.note(formatDiagnosticReport(report), "Final checks");
-  ui.outro(
-    report.ready
-      ? "Setup complete. Run npm run pgn to open the control panel."
-      : "Setup complete with items to resolve; run npm run doctor for details.",
-  );
+  ui.note(formatSetupChecklist(report), "Setup checklist");
+  ui.success("Setup complete");
+  if (!report.ready) {
+    ui.warn("Some items need attention. Run diagnostics to show details.");
+  }
+  const nextAction = await ui.select<SetupNextAction>({
+    message: "What would you like to do next?",
+    options: [
+      {
+        value: "diagnostics",
+        label: "Run diagnostics",
+        hint: "Show detailed technical output",
+      },
+      { value: "main-menu", label: "Open main menu" },
+      {
+        value: "full-test",
+        label: "Start full test",
+        hint: report.ready ? undefined : "Resolve setup issues first",
+        disabled: !report.ready,
+      },
+      { value: "exit", label: "Exit" },
+    ],
+    initialValue: report.ready ? "main-menu" : "diagnostics",
+  });
   return {
     cancelled: false,
     environmentUpdated,
     chromiumInstalled,
     loginStarted,
+    nextAction: nextAction ?? "exit",
   };
 }

@@ -87,7 +87,8 @@ export function createDefaultActions(ui: OperatorUi): OperatorActions {
         recreateWhatsAppAuthentication(),
       ),
     setup: async () => {
-      await runSetupWizard(ui, { loginWhatsApp: login });
+      const result = await runSetupWizard(ui, { loginWhatsApp: login });
+      return result.nextAction;
     },
     diagnostics: async () => {
       const report = await ui.task(
