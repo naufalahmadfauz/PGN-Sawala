@@ -1,6 +1,7 @@
 import { access } from "node:fs/promises";
 import ExcelJS, { type Cell, type Worksheet } from "exceljs";
 import { parseTurnsFromCell } from "./multi-turn-parser";
+import { normalizeTestStatus } from "./pgn-test-status";
 import {
   KB_SHEET_NAME,
   NEGATIVE_SHEET_NAME,
@@ -91,6 +92,26 @@ function validateHeaders(
   });
 }
 
+function readScenarioStatus(
+  worksheet: Worksheet,
+  rowNumber: number,
+  columnNumber: number,
+  issues: PgnValidationIssue[],
+): { rawStatus: string; status: PgnTestScenario["status"] } {
+  const rawStatus = cellText(worksheet.getCell(rowNumber, columnNumber)).trim();
+  const status = normalizeTestStatus(rawStatus);
+  if (rawStatus && !status) {
+    issues.push({
+      code: "UNKNOWN_STATUS",
+      severity: "WARNING",
+      sheetName: worksheet.name,
+      rowNumber,
+      message: `Unknown Status "${rawStatus}".`,
+    });
+  }
+  return { rawStatus, status };
+}
+
 function parseKnowledgeBaseSheet(
   worksheet: Worksheet,
   issues: PgnValidationIssue[],
@@ -126,12 +147,19 @@ function parseKnowledgeBaseSheet(
 
       const turnNumber =
         parseTurnNumber(rawTurn, worksheet.name, rowNumber, issues) ?? 1;
+      const scenarioStatus = readScenarioStatus(
+        worksheet,
+        rowNumber,
+        12,
+        issues,
+      );
       currentScenario = {
         testCaseId,
         sheetKind: "kb",
         sheetName: worksheet.name,
         sourceRowNumber: rowNumber,
         category: cellText(worksheet.getCell(rowNumber, 2)).trim(),
+        ...scenarioStatus,
         turns: [],
       };
       scenarios.push(currentScenario);
@@ -270,12 +298,19 @@ function parseNegativeSheet(
       rowNumber,
     );
     issues.push(...parsedTurns.issues);
+    const scenarioStatus = readScenarioStatus(
+      worksheet,
+      rowNumber,
+      11,
+      issues,
+    );
     scenarios.push({
       testCaseId,
       sheetKind: "negative",
       sheetName: worksheet.name,
       sourceRowNumber: rowNumber,
       category: cellText(worksheet.getCell(rowNumber, 2)).trim(),
+      ...scenarioStatus,
       turns: parsedTurns.turns.map((turn) => ({
         sheetName: worksheet.name,
         rowNumber,

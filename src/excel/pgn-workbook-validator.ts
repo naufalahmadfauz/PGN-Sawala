@@ -65,8 +65,16 @@ export function formatPgnValidation(
     "Multiple bot bubbles: ENABLED",
   ];
 
-  if (parsed.issues.length > 0) {
+  const errors = parsed.issues.filter((issue) => issue.severity === "ERROR");
+  if (errors.length > 0) {
     lines.push("", ...parsed.issues.map(formatIssue), "", "NOT READY");
+  } else if (parsed.issues.length > 0) {
+    lines.push(
+      "",
+      ...parsed.issues.map(formatIssue),
+      "",
+      "READY WITH WARNINGS",
+    );
   } else {
     lines.push("", "READY TO EXECUTE");
   }

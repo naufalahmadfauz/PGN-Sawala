@@ -8,6 +8,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import ExcelJS, { type Cell, type Worksheet } from "exceljs";
 import JSZip from "jszip";
@@ -19,6 +20,10 @@ import {
   cellText,
   parsePgnWorkbook,
 } from "./pgn-workbook-loader";
+import {
+  ensureEvidenceWorkbookSchema,
+  writeEvidenceHyperlink,
+} from "./evidence-workbook";
 import {
   KB_SHEET_NAME,
   NEGATIVE_SHEET_NAME,
@@ -38,6 +43,7 @@ interface PreservedTablePart {
 type PreservedTableParts = Map<string, PreservedTablePart>;
 
 const preservedTableParts = new WeakMap<ExcelJS.Workbook, PreservedTableParts>();
+const expectedOutputHashes = new WeakMap<ExcelJS.Workbook, string>();
 
 const TABLE_CONTENT_TYPE =
   "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml";
@@ -56,6 +62,8 @@ const TRANSCRIPT_HEADERS = [
   "Status",
   "Error",
   "Evidence Path",
+  "Evidence URL",
+  "Evidence Status",
 ];
 
 function ensureTranscriptWorksheet(workbook: ExcelJS.Workbook): Worksheet {
@@ -79,7 +87,7 @@ function ensureTranscriptWorksheet(workbook: ExcelJS.Workbook): Worksheet {
   header.alignment = { vertical: "middle", wrapText: true };
   worksheet.views = [{ state: "frozen", ySplit: 1 }];
   const widths = [
-    24, 18, 28, 12, 9, 16, 70, 24, 20, 20, 18, 45, 55,
+    24, 18, 28, 12, 9, 16, 70, 24, 20, 20, 18, 45, 55, 20, 24,
   ];
   widths.forEach((width, index) => {
     worksheet.getColumn(index + 1).width = width;
@@ -99,6 +107,14 @@ function writeExecutionDate(cell: Cell, value: Date): void {
 
 function secondsFromMilliseconds(milliseconds: number): number {
   return Math.round((milliseconds / 1_000) * 100) / 100;
+}
+
+async function fileHash(filePath: string): Promise<string> {
+  return createHash("sha256").update(await readFile(filePath)).digest("hex");
+}
+
+function bufferHash(contents: Uint8Array): string {
+  return createHash("sha256").update(contents).digest("hex");
 }
 
 function decodeXmlAttribute(value: string): string {
@@ -337,7 +353,12 @@ function appendTranscriptRows(
     execution.technicalStatus,
     execution.error ?? "",
     execution.evidencePath ?? "",
+    execution.evidenceUrl ? "View Evidence" : "",
+    execution.evidenceStatus ?? "",
   ]);
+  if (execution.evidenceUrl) {
+    writeEvidenceHyperlink(userRow.getCell(14), execution.evidenceUrl);
+  }
   userRow.alignment = { vertical: "top", wrapText: true };
   userRow.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
 
@@ -353,7 +374,12 @@ function appendTranscriptRows(
         execution.technicalStatus,
         execution.error ?? "",
         execution.evidencePath ?? "",
+        execution.evidenceUrl ? "View Evidence" : "",
+        execution.evidenceStatus ?? "",
       ]);
+      if (execution.evidenceUrl) {
+        writeEvidenceHyperlink(botRow.getCell(14), execution.evidenceUrl);
+      }
       botRow.alignment = { vertical: "top", wrapText: true };
       botRow.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
     }
@@ -368,7 +394,12 @@ function appendTranscriptRows(
       execution.technicalStatus,
       execution.error,
       execution.evidencePath ?? "",
+      execution.evidenceUrl ? "View Evidence" : "",
+      execution.evidenceStatus ?? "",
     ]);
+    if (execution.evidenceUrl) {
+      writeEvidenceHyperlink(errorRow.getCell(14), execution.evidenceUrl);
+    }
     errorRow.alignment = { vertical: "top", wrapText: true };
     errorRow.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
   }
@@ -376,8 +407,14 @@ function appendTranscriptRows(
 
 function applyKnowledgeBaseExecution(
   worksheet: Worksheet,
+  scenario: PgnTestScenario,
   executions: ExecutedTurn[],
 ): void {
+  for (const turn of scenario.turns) {
+    for (const column of [9, 10, 11, 14]) {
+      worksheet.getCell(turn.rowNumber, column).value = null;
+    }
+  }
   for (const execution of executions) {
     const row = execution.turn.rowNumber;
     if (execution.combinedResponse) {
@@ -389,6 +426,9 @@ function applyKnowledgeBaseExecution(
       responseTime.numFmt = '0.00" s"';
     }
     writeExecutionDate(worksheet.getCell(row, 11), execution.completedAt);
+    if (execution.evidenceUrl) {
+      writeEvidenceHyperlink(worksheet.getCell(row, 14), execution.evidenceUrl);
+    }
     if (execution.technicalStatus !== "CAPTURED") {
       appendTechnicalNote(
         worksheet.getCell(row, 13),
@@ -404,8 +444,18 @@ function applyNegativeExecution(
   executions: ExecutedTurn[],
 ): void {
   const row = scenario.sourceRowNumber;
+  for (const column of [8, 9, 10, 14]) {
+    worksheet.getCell(row, column).value = null;
+  }
   const isMultiTurn = scenario.turns.length > 1;
   const allTurnsExecuted = executions.length === scenario.turns.length;
+  const latest = executions.at(-1);
+  if (
+    !allTurnsExecuted &&
+    (!latest || latest.technicalStatus === "CAPTURED")
+  ) {
+    return;
+  }
   const allTurnsHaveResponses =
     allTurnsExecuted &&
     executions.every((execution) => Boolean(execution.combinedResponse));
@@ -443,6 +493,18 @@ function applyNegativeExecution(
 
   const completedAt = executions.at(-1)?.completedAt ?? new Date();
   writeExecutionDate(worksheet.getCell(row, 10), completedAt);
+  const finalExecution = executions.at(-1);
+  const expectedFinalTurn = scenario.turns.at(-1)?.turnNumber;
+  if (
+    finalExecution &&
+    finalExecution.turn.turnNumber === expectedFinalTurn &&
+    finalExecution.evidenceUrl
+  ) {
+    writeEvidenceHyperlink(
+      worksheet.getCell(row, 14),
+      finalExecution.evidenceUrl,
+    );
+  }
   for (const execution of executions) {
     if (execution.technicalStatus !== "CAPTURED") {
       appendTechnicalNote(
@@ -472,7 +534,11 @@ export async function openExecutedPgnWorkbook(
   }
 
   const workbook = new ExcelJS.Workbook();
-  await workbook.xlsx.readFile(outputPath);
+  const outputContents = await readFile(outputPath);
+  await workbook.xlsx.load(
+    outputContents as unknown as Parameters<typeof workbook.xlsx.load>[0],
+  );
+  expectedOutputHashes.set(workbook, bufferHash(outputContents));
   if (resumed) {
     await assertExecutedWorkbookMatchesSource(sourcePath, workbook);
   }
@@ -481,7 +547,12 @@ export async function openExecutedPgnWorkbook(
     workbook.getWorksheet(TRANSCRIPT_SHEET_NAME),
   );
   ensureTranscriptWorksheet(workbook);
-  if (!hadTranscript || !(await tablePartsMatch(outputPath, tableParts))) {
+  const evidenceSchemaChanged = ensureEvidenceWorkbookSchema(workbook);
+  if (
+    !hadTranscript ||
+    evidenceSchemaChanged ||
+    !(await tablePartsMatch(outputPath, tableParts))
+  ) {
     await saveExecutedPgnWorkbook(workbook, outputPath);
   }
   return { workbook, parsed: parsePgnWorkbook(workbook), resumed };
@@ -493,20 +564,45 @@ export function applyScenarioExecution(
   scenario: PgnTestScenario,
   executions: ExecutedTurn[],
 ): void {
+  applyScenarioResults(workbook, scenario, executions);
+  const transcript = ensureTranscriptWorksheet(workbook);
+  for (const execution of executions) {
+    appendTranscriptRows(transcript, runId, scenario, execution);
+  }
+}
+
+export function applyScenarioResults(
+  workbook: ExcelJS.Workbook,
+  scenario: PgnTestScenario,
+  executions: ExecutedTurn[],
+): void {
   const worksheet = workbook.getWorksheet(scenario.sheetName);
   if (!worksheet) {
     throw new Error(`Worksheet "${scenario.sheetName}" was not found`);
   }
   if (scenario.sheetKind === "kb") {
-    applyKnowledgeBaseExecution(worksheet, executions);
+    applyKnowledgeBaseExecution(worksheet, scenario, executions);
   } else {
     applyNegativeExecution(worksheet, scenario, executions);
   }
+}
 
-  const transcript = ensureTranscriptWorksheet(workbook);
-  for (const execution of executions) {
-    appendTranscriptRows(transcript, runId, scenario, execution);
+export function appendLatestTurnExecution(
+  workbook: ExcelJS.Workbook,
+  runId: string,
+  scenario: PgnTestScenario,
+  executions: ExecutedTurn[],
+): void {
+  const latest = executions.at(-1);
+  if (!workbook.getWorksheet(scenario.sheetName) || !latest) {
+    throw new Error(`Cannot append latest execution for "${scenario.testCaseId}"`);
   }
+  appendTranscriptRows(
+    ensureTranscriptWorksheet(workbook),
+    runId,
+    scenario,
+    latest,
+  );
 }
 
 export function appendSessionResetTranscript(
@@ -544,6 +640,8 @@ export function appendSessionResetTranscript(
       attempt.status,
       attempt.error ?? "",
       attempt.evidencePath ?? "",
+      "",
+      "",
     ]);
     row.alignment = { vertical: "top", wrapText: true };
     row.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
@@ -622,6 +720,8 @@ export function appendPostResetDrainTranscript(
       "STALE_DRAINED",
       "",
       "",
+      "",
+      "",
     ]);
     row.alignment = { vertical: "top", wrapText: true };
     row.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
@@ -637,6 +737,8 @@ export function appendPostResetDrainTranscript(
     "QUIET_CONFIRMED",
     "",
     "",
+    "",
+    "",
   ]);
   completionRow.alignment = { vertical: "top", wrapText: true };
   completionRow.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
@@ -648,12 +750,24 @@ export async function saveExecutedPgnWorkbook(
 ): Promise<void> {
   const temporaryPath = `${outputPath}.${process.pid}.tmp`;
   try {
+    const expectedHash = expectedOutputHashes.get(workbook);
+    if (expectedHash && (await fileHash(outputPath)) !== expectedHash) {
+      throw new Error(
+        "Executed workbook changed outside this process; refusing to overwrite it",
+      );
+    }
     await workbook.xlsx.writeFile(temporaryPath);
     const tableParts = preservedTableParts.get(workbook);
     if (tableParts) {
       await restoreTableParts(temporaryPath, tableParts);
     }
+    if (expectedHash && (await fileHash(outputPath)) !== expectedHash) {
+      throw new Error(
+        "Executed workbook changed while saving; refusing to overwrite it",
+      );
+    }
     await rename(temporaryPath, outputPath);
+    expectedOutputHashes.set(workbook, await fileHash(outputPath));
   } catch (error) {
     await rm(temporaryPath, { force: true }).catch(() => undefined);
     throw error;

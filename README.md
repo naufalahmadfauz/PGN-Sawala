@@ -9,17 +9,72 @@ This harness drives the consumer WhatsApp Web UI with Playwright. Messages follo
 - `npm run test:single` sends `Halo`, captures all new incoming messages through the configured quiet window, and writes `reports/PGN_Single_Test_Result.xlsx`.
 - `npm run test:pgn:validate` validates the real PGN workbook without opening WhatsApp or sending messages.
 - `npm run test:pgn` executes the real PGN workbook and progressively saves the executed copy.
+- `npm run test:pgn:fresh` archives the current report and prepares a clean full-run workbook without opening WhatsApp.
+- `npm run test:pgn:retest:validate` lists approved retest scenarios and readiness without opening WhatsApp.
+- `npm run test:pgn:retest` executes only approved retest scenarios.
+- `npm run evidence:validate` validates existing local evidence, creates three cleaned previews, and optionally checks Drive access without contacting WhatsApp.
+- `npm run evidence:migrate` backs up the completed workbook, cleans and uploads existing evidence, and writes hyperlinks without contacting WhatsApp.
 - `npm run test:response-collector` runs deterministic delayed-message and hard-timeout tests without opening WhatsApp.
 - `npm run test:session-reset` tests reset confirmation and failure handling without opening WhatsApp.
 - `npm run test:workbook-writer` verifies result writes preserve the source XLSX table metadata.
+- `npm run test:config` verifies `.env`, credential-source precedence, safe credential parsing, and fresh-run preservation without contacting WhatsApp or Drive.
 - `npm run data:template` creates a starter legacy test-case workbook without overwriting an existing one.
 - `npm run check` runs the TypeScript compiler.
 
 ## Configuration
 
-Local settings belong in `.env`; supported keys and defaults are listed in `.env.example`. Configure either `PGN_WHATSAPP_PHONE` (international digits, without `+`) or `PGN_WHATSAPP_CHAT`. A phone number is preferred when both are present because the direct WhatsApp chat URL avoids ambiguous chat-name matches. The harness verifies the open conversation header against that target and confirms each outgoing WhatsApp message before collecting a response.
+All commands load the repository-root `.env` through the central configuration module. A missing `.env` is valid. Existing process environment variables, including Codespaces Secrets and CI variables, are never overwritten by `.env` values with the same name.
 
-The authenticated profile is fixed at `.whatsapp-profile/`. Data files are restricted to `data/`, and generated reports are restricted to `reports/`. The profile, `.env`, QR images, evidence, diagnostics, and executed workbooks are gitignored. Treat the profile as an authenticated secret and do not share or commit it.
+Configure either `PGN_WHATSAPP_PHONE` (international digits, without `+`) or `PGN_WHATSAPP_CHAT`. A phone number is preferred when both are present because the direct WhatsApp chat URL avoids ambiguous chat-name matches. The harness verifies the open conversation header against that target and confirms each outgoing WhatsApp message before collecting a response.
+
+The authenticated profile is fixed at `.whatsapp-profile/`. Data files are restricted to `data/`, and generated reports are restricted to `reports/`. The profile, `.env`, `.secrets/`, service-account JSON files, QR images, evidence, diagnostics, and executed workbooks are gitignored. Treat the profile and credentials as secrets and do not share or commit them. Fresh-run preparation only archives and replaces generated test workbooks; it never removes `.env` or `.secrets/`.
+
+### Google Drive Evidence
+
+Drive evidence is disabled by default. It continues to use Google Drive API v3, Shared Drive support, inherited permissions, and one evidence subfolder per run.
+
+#### Local Development
+
+The recommended local setup is:
+
+```bash
+cp .env.example .env
+mkdir -p .secrets
+```
+
+Place the downloaded Service Account JSON at:
+
+`.secrets/google-service-account.json`
+
+Then edit `.env`:
+
+```dotenv
+GOOGLE_DRIVE_EVIDENCE_ENABLED=true
+GOOGLE_DRIVE_EVIDENCE_PARENT_FOLDER=<Shared Drive folder URL>
+GOOGLE_SERVICE_ACCOUNT_FILE=.secrets/google-service-account.json
+```
+
+Validate configuration before migration or execution:
+
+```bash
+npm run evidence:validate
+```
+
+Both `.env` and `.secrets/` are gitignored. A relative `GOOGLE_SERVICE_ACCOUNT_FILE` path is resolved from the repository root, even if a command is launched from another working directory.
+
+#### Codespaces / CI
+
+Environment variables and GitHub Codespaces Secrets remain fully supported. Set these without creating `.env`:
+
+```text
+GOOGLE_DRIVE_EVIDENCE_ENABLED
+GOOGLE_DRIVE_EVIDENCE_PARENT_FOLDER
+GOOGLE_SERVICE_ACCOUNT_JSON
+```
+
+Process environment values take precedence over `.env` values with the same name. The supported credential methods, in priority order, are `GOOGLE_SERVICE_ACCOUNT_JSON`, `GOOGLE_SERVICE_ACCOUNT_JSON_BASE64`, and `GOOGLE_SERVICE_ACCOUNT_FILE`. Only one is required. Validation reports the selected source and warns if multiple methods are configured, but never prints raw or decoded credentials.
+
+`GOOGLE_DRIVE_EVIDENCE_PARENT_FOLDER` accepts either a raw folder ID or a `https://drive.google.com/drive/folders/...` URL. Use a Shared Drive and add the Service Account `client_email` as Content manager. The harness verifies parent-folder and write access, creates or reuses one deterministic subfolder per run, and lets files inherit its access; it never creates `anyoneWithLink` permissions. Credentials, private keys, access tokens, and refresh tokens are never written to the workbook or logs. An optional `LEGACY_EVIDENCE_CROP_LEFT` can override legacy crop auto-detection after manual verification.
 
 ## Real PGN Workbook
 
@@ -37,9 +92,32 @@ Later runs resume from that executed copy. Existing Bot Response cells are skipp
 
 `Negative Case` reads input from column E and writes results to H-J. Explicit `Turn 1:`, `Turn 2:`, and later markers inside one cell execute sequentially in the same scenario context. Their responses and timings are combined with turn labels.
 
-The executed copy adds `Execution Transcript` with per-turn user and bot messages, timestamps, first-response timing, total timing, technical status, and evidence paths. Every bot bubble has its own transcript row. Multiple bubbles are labeled `Message 1:`, `Message 2:`, and later in the logical Bot Response cell. The workbook is atomically replaced after every attempted scenario.
+The executed copy adds `Execution Transcript` with per-turn user and bot messages, timestamps, first-response timing, total timing, technical status, and evidence paths. Every bot bubble has its own transcript row. Multiple bubbles are labeled `Message 1:`, `Message 2:`, and later in the logical Bot Response cell. The workbook is atomically replaced after every attempted turn.
+
+Evidence hyperlinks use column N on both report sheets. This column remains outside the immutable `Negative Case` table at A:M. `Execution Transcript` keeps local paths in M, adds hyperlink column N and evidence-only status column O, and `Execution Metadata` stores run-folder and Drive file IDs without using an Excel table or storing credentials.
 
 ExcelJS misreads this source workbook's table defaults and otherwise emits invalid AutoFilter metadata. Each atomic save therefore restores every immutable source table definition byte-for-byte into the table targets generated by ExcelJS, validates the table relationships and content types, and only then replaces the executed workbook. Resume is refused if the executed workbook's table structure or source-owned input cells no longer match the source.
+
+## Existing Run Evidence Backfill
+
+Configure Drive, then run:
+
+```bash
+npm run evidence:validate
+npm run evidence:migrate
+```
+
+Validation reads the completed workbook and existing `artifacts/evidence/*.png`, checks transcript mapping and missing screenshots, and creates representative previews for `PGN-KB-003`, `PGN-KB-031` turn 2, and `PGN-KB-075`. The legacy crop boundary is derived and cross-checked from image pixels instead of accepting an arbitrary coordinate.
+
+Migration never imports the WhatsApp runner, opens Playwright, sends `reset`, or sends testcase messages. It reads only the active evidence directory, does not import pre-fix archives, preserves original screenshots, writes cleaned files under `artifacts/evidence/clean/<RUN_ID>/`, creates an exact `reports/archive/*-before-evidence*.xlsx` backup for every invocation, uploads PNGs with up to three attempts, and saves the workbook after every evidence record. Missing or unusable evidence is reported as `EVIDENCE_MISSING` or `EVIDENCE_REQUIRES_RERUN`; it is never regenerated automatically. Upload failures retain the cleaned local file, record `EVIDENCE_UPLOAD_ERROR`, clear any stale current-result link, and continue when safe.
+
+Migration is resumable. Stored Drive file IDs are reused, exact-name files are found before upload, and run folders are recovered from `Execution Metadata` or by deterministic name. Local crop bytes and Drive checksums are revalidated on every invocation, so stale cached or remote content is updated without creating duplicates. Runs recorded as `FUTURE` or `RETEST` retain their already scoped conversation-pane PNGs and are never passed through the legacy crop.
+
+## Future Run Evidence
+
+Normal PGN execution waits for response settlement, scrolls the active conversation to the bottom, and captures a Playwright `Locator.screenshot()` of the visible conversation pane selected from `#main` or the semantic conversation wrapper. The full WhatsApp page, navigation rail, chat list, search area, and unrelated contacts are excluded. Full-page screenshots remain available only for local failure diagnostics and are not uploaded as normal evidence.
+
+When Drive evidence is enabled, the runner validates the parent and creates the run folder before opening WhatsApp. Each attempted turn is captured locally when possible, uploaded, linked in Excel, and atomically saved with its current result before the next turn or reset. A rerun clears stale result values and links that are not produced by the new attempt. Evidence upload status remains separate from `CAPTURED`, `TIMEOUT`, `SEND_ERROR`, and `CHAT_ERROR`, so a Drive failure does not invalidate a chatbot response.
 
 ## Filters And Resume
 
@@ -53,6 +131,49 @@ npm run test:pgn -- --test PGN-KB-031 --rerun PGN-NEG-018
 ```
 
 `--rerun` without an ID reruns the selected set. `--rerun ID` selects and reruns that scenario. Without rerun, completed scenarios are skipped. A partially completed multi-turn scenario is skipped because continuing it later would not guarantee the original turn context.
+
+## Full New Run
+
+Prepare, validate, and launch these as separate commands:
+
+```bash
+npm run test:pgn:fresh
+npm run test:pgn:validate
+npm run test:pgn
+```
+
+`test:pgn:fresh` never starts WhatsApp. It creates an exact timestamped archive of the previous executed workbook, creates a new executed copy from the immutable source, clears generated Bot Response, Response Time, Test Date, Evidence, transcript, evidence metadata, and retest sheets, then exits. Prepared User Input, Expected Bot Response, Status, and Notes remain unchanged. Normal full-run selection ignores semantic Status values, so every scenario is runnable after fresh preparation.
+
+## Retest Fixed Cases
+
+Set the primary scenario row in the executed workbook to `Ready for Re-test`, then validate and launch separately:
+
+```bash
+npm run test:pgn:retest:validate
+npm run test:pgn:retest
+```
+
+Retest selection is trimmed and case-insensitive. It accepts only `Ready for Re-test` and the exact alias `Ready for Retest`; values such as `Failed`, `Blocked`, `Review`, `ready`, and `retest` are not automatic candidates. Recognized statuses are `Passed`, `Failed`, `Blocked`, `Review`, `Ready for Re-test`, and `Pending Evaluation`. Unknown non-empty statuses are reported as workbook validation warnings and are never interpreted as retest approval.
+
+The complete selection is frozen before execution starts. A positive multi-turn scenario selected from its primary row executes every continuation turn, and a negative multi-turn scenario executes every parsed turn without a reset between turns. Unselected result rows are not changed.
+
+Before the first reset for each selected scenario, the runner appends an idempotent snapshot to `Retest History`. Positive multi-turn scenarios receive one history row per result row. The snapshot retains the previous transcript Run ID, semantic Status, Bot Response, Response Time, Test Date, and Evidence URL. New results and evidence are written back to the same history row as the retest progresses, while the active report points to the latest execution.
+
+Every batch receives a new ID such as `RETEST-20260902T053000Z`. The ID is used by `Execution Transcript`, `Retest Metadata`, evidence metadata, and the dedicated Drive folder `PGN-WhatsApp-Retest-20260902T053000Z`. Previous Drive files and folders are never deleted or replaced by another run.
+
+After every turn, transcript, evidence metadata, active results, history, and resume state are atomically saved. When all turns in a scenario have technical status `CAPTURED`, its semantic Status becomes `Pending Evaluation`; automation never assigns `Passed` or `Failed`. A timeout or send/chat error keeps the previous semantic Status and records the technical failure separately.
+
+Useful retest filters are:
+
+```bash
+npm run test:pgn:retest -- --limit 3
+npm run test:pgn:retest -- --test PGN-KB-075
+npm run test:pgn:retest -- --resume RETEST-20260902T053000Z
+```
+
+`--test` explicitly selects only the named scenario and prints a warning if its current Status is not `Ready for Re-test`. `--resume` reloads the immutable selected-ID set from `Retest Metadata`, skips scenarios already completed successfully in that same run, retries prior technical failures, reuses its Drive folder, and deduplicates history rows. If all scenarios were saved but final session cleanup failed, resume retries that cleanup before marking the run complete. `--resume` cannot be combined with `--test` or `--sheet`, though `--limit` can constrain the remaining resumed scenarios. If a new selection is empty, the retest command exits successfully before Drive setup or WhatsApp startup.
+
+Selected retests require Google Drive evidence to be configured. Parent-folder authentication and retest-folder creation are completed before WhatsApp opens; invalid or disabled Drive configuration aborts without sending a testcase message. Per-file upload failures after startup remain non-fatal and are recorded separately from chatbot technical status.
 
 ## Response Completion
 

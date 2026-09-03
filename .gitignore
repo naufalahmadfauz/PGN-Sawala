@@ -12,7 +12,15 @@ node_modules/
 
 # Local configuration and generated reports
 .env
+.env.local
+.env.*.local
 .env.*
 !.env.example
+/.secrets/
+.secrets/
+/service-account*.json
+*service-account*.json
 /reports/*.xlsx
 /reports/**/*.xlsx
+/reports/*.lock
+/reports/**/*.lock

@@ -1,8 +1,19 @@
 import type ExcelJS from "exceljs";
+import type { PgnTestStatus } from "./pgn-test-status";
 
 export const KB_SHEET_NAME = "Test Case Knowledge Base";
 export const NEGATIVE_SHEET_NAME = "Negative Case";
 export const TRANSCRIPT_SHEET_NAME = "Execution Transcript";
+
+export type EvidenceStatus =
+  | "EVIDENCE_PENDING"
+  | "EVIDENCE_SYNCED"
+  | "EVIDENCE_ALREADY_SYNCED"
+  | "EVIDENCE_LOCAL_ONLY"
+  | "EVIDENCE_CAPTURE_ERROR"
+  | "EVIDENCE_UPLOAD_ERROR"
+  | "EVIDENCE_MISSING"
+  | "EVIDENCE_REQUIRES_RERUN";
 
 export type PgnSheetKind = "kb" | "negative";
 export type TechnicalStatus =
@@ -24,6 +35,8 @@ export interface PgnTestScenario {
   sheetName: string;
   sourceRowNumber: number;
   category: string;
+  rawStatus: string;
+  status?: PgnTestStatus;
   turns: PgnTestTurn[];
 }
 
@@ -34,7 +47,8 @@ export type ValidationIssueCode =
   | "INVALID_TURN_ROW"
   | "MISSING_SHEET"
   | "MISSING_TEST_CASE_ID"
-  | "MISSING_USER_INPUT";
+  | "MISSING_USER_INPUT"
+  | "UNKNOWN_STATUS";
 
 export interface PgnValidationIssue {
   code: ValidationIssueCode;
@@ -82,4 +96,8 @@ export interface ExecutedTurn {
   totalResponseMs?: number;
   error?: string;
   evidencePath?: string;
+  evidenceUrl?: string;
+  evidenceStatus?: EvidenceStatus;
+  evidenceDriveFileId?: string;
+  evidenceDriveFileName?: string;
 }
