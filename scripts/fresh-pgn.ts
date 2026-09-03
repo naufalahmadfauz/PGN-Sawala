@@ -1,10 +1,12 @@
 import path from "node:path";
-import { loadConfig } from "../src/config";
+import { loadConfig, type AppConfig } from "../src/config";
+import { isEntrypoint, runCliMain } from "../src/cli-entrypoint";
 import { createFreshPgnWorkbook } from "../src/excel/fresh-workbook";
 import { acquireWorkbookLock } from "../src/excel/workbook-lock";
 
-async function main(): Promise<void> {
-  const config = loadConfig();
+export async function prepareFreshPgnWorkbook(
+  config: AppConfig = loadConfig(),
+): Promise<void> {
   const release = await acquireWorkbookLock(
     config.pgnExecutedWorkbookPath,
     "PGN fresh-run preparation",
@@ -25,7 +27,6 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-});
+if (isEntrypoint(import.meta.url)) {
+  runCliMain(() => prepareFreshPgnWorkbook());
+}

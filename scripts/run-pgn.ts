@@ -7,12 +7,12 @@ import { runPgnWorkbook } from "../src/pgn-runner";
 const config = loadConfig();
 runCliMain(() =>
   runBrowserEntrypoint(
-    () => runPgnWorkbook(process.argv.slice(2), "retest"),
+    () => runPgnWorkbook(process.argv.slice(2), "full"),
     {
       headless: config.headless,
       projectRoot: config.projectRoot,
       browserRequired: async () =>
-        (await inspectPgnExecution(process.argv.slice(2), "retest", config))
+        (await inspectPgnExecution(process.argv.slice(2), "full", config))
           .browserRequired,
     },
   ),

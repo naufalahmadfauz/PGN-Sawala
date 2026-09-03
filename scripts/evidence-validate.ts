@@ -1,7 +1,8 @@
 import { access, readdir } from "node:fs/promises";
 import path from "node:path";
 import ExcelJS from "exceljs";
-import { loadConfig } from "../src/config";
+import { loadConfig, type AppConfig } from "../src/config";
+import { isEntrypoint, runCliMain } from "../src/cli-entrypoint";
 import {
   createRepresentativeEvidencePreviews,
   discoverEvidenceInventory,
@@ -15,8 +16,15 @@ async function exists(filePath: string): Promise<boolean> {
     .catch(() => false);
 }
 
-async function main(): Promise<void> {
-  const config = loadConfig();
+export interface EvidenceValidationResult {
+  ready: boolean;
+  missingCount: number;
+  pendingUploadCount: number;
+}
+
+export async function validateEvidence(
+  config: AppConfig = loadConfig(),
+): Promise<EvidenceValidationResult> {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(config.pgnExecutedWorkbookPath);
   const inventory = discoverEvidenceInventory(workbook);
@@ -83,6 +91,7 @@ async function main(): Promise<void> {
       `Credential warning: Multiple sources configured; using ${config.googleServiceAccount!.source}`,
     );
   }
+  let ready = true;
   if (!config.googleDriveEvidenceEnabled) {
     console.log("Authentication: NOT CHECKED");
     console.log("Parent folder access: NOT CHECKED");
@@ -93,7 +102,7 @@ async function main(): Promise<void> {
     console.log("Parent folder access: ERROR");
     console.log("Write access: NOT CHECKED");
     console.log("NOT READY");
-    process.exitCode = 1;
+    ready = false;
   } else {
     try {
       const publisher = createGoogleDriveEvidencePublisher(config);
@@ -111,7 +120,7 @@ async function main(): Promise<void> {
         `Reason: ${safeGoogleCredentialError(error, config.googleServiceAccount?.value)}`,
       );
       console.log("NOT READY");
-      process.exitCode = 1;
+      ready = false;
     }
   }
 
@@ -130,9 +139,17 @@ async function main(): Promise<void> {
   console.log("");
   console.log("WhatsApp messages sent: 0");
   console.log("Testcases rerun: 0");
+  return {
+    ready,
+    missingCount: missing.length,
+    pendingUploadCount: inventory.records.length - existingUrls,
+  };
 }
 
-main().catch((error) => {
-  console.error(safeGoogleCredentialError(error));
-  process.exitCode = 1;
-});
+if (isEntrypoint(import.meta.url)) {
+  runCliMain(async () => {
+    if (!(await validateEvidence()).ready) {
+      process.exitCode = 1;
+    }
+  }, safeGoogleCredentialError);
+}

@@ -1,6 +1,7 @@
 import { access } from "node:fs/promises";
 import path from "node:path";
-import { loadConfig } from "../src/config";
+import { loadConfig, type AppConfig } from "../src/config";
+import { isEntrypoint, runCliMain } from "../src/cli-entrypoint";
 import {
   MAIN_EVIDENCE_COLUMN,
   readEvidenceHyperlink,
@@ -70,8 +71,19 @@ function printScenario(
   );
 }
 
-async function main(): Promise<void> {
-  const options = parseCliOptions(process.argv.slice(2));
+export interface RetestValidationResult {
+  selectedCount: number;
+  readyCount: number;
+  finalCleanupOnly: boolean;
+  shouldExecute: boolean;
+  readyToExecute: boolean;
+}
+
+export async function validateRetest(
+  args = process.argv.slice(2),
+  config: AppConfig = loadConfig(),
+): Promise<RetestValidationResult> {
+  const options = parseCliOptions(args);
   if (options.rerunAll || options.rerunIds.size) {
     throw new Error("--rerun is not used in retest mode; use --test instead");
   }
@@ -81,7 +93,6 @@ async function main(): Promise<void> {
   ) {
     throw new Error("--resume cannot be combined with --test or --sheet");
   }
-  const config = loadConfig();
   const workbookPath = (await exists(config.pgnExecutedWorkbookPath))
     ? config.pgnExecutedWorkbookPath
     : config.pgnSourceWorkbookPath;
@@ -165,7 +176,9 @@ async function main(): Promise<void> {
   const profilePresent = await exists(config.profileDir);
   console.log(`WhatsApp profile: ${profilePresent ? "PRESENT" : "MISSING"}`);
   console.log("");
-  if (!selection.selected.length && !finalCleanupOnly) {
+  const shouldExecute = selection.selected.length > 0 || finalCleanupOnly;
+  const readyToExecute = !shouldExecute || (driveReady && profilePresent);
+  if (!shouldExecute) {
     console.log("Nothing to execute.");
   } else if (driveReady && profilePresent) {
     console.log(
@@ -177,11 +190,22 @@ async function main(): Promise<void> {
         ? "NOT READY TO COMPLETE RETEST CLEANUP"
         : "NOT READY TO RETEST",
     );
-    process.exitCode = 1;
   }
+  return {
+    selectedCount: selection.selected.length,
+    readyCount:
+      selection.readyBySheet.kb.length + selection.readyBySheet.negative.length,
+    finalCleanupOnly,
+    shouldExecute,
+    readyToExecute,
+  };
 }
 
-main().catch((error) => {
-  console.error(safeGoogleCredentialError(error));
-  process.exitCode = 1;
-});
+if (isEntrypoint(import.meta.url)) {
+  runCliMain(async () => {
+    const result = await validateRetest();
+    if (result.shouldExecute && !result.readyToExecute) {
+      process.exitCode = 1;
+    }
+  }, safeGoogleCredentialError);
+}

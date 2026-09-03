@@ -4,15 +4,18 @@
   "description": "Real-channel WhatsApp Web test harness for the PGN chatbot",
   "scripts": {
     "check": "tsc --noEmit",
+    "pgn": "tsx scripts/pgn.ts",
+    "setup": "tsx scripts/setup.ts",
+    "doctor": "tsx scripts/doctor.ts",
     "data:template": "tsx scripts/create-test-template.ts",
     "evidence:validate": "tsx scripts/evidence-validate.ts",
     "evidence:migrate": "tsx scripts/evidence-migrate.ts",
-    "whatsapp:login": "xvfb-run -a tsx scripts/whatsapp-login.ts",
-    "whatsapp:verify": "xvfb-run -a tsx scripts/whatsapp-verify.ts",
-    "test:single": "xvfb-run -a tsx scripts/test-single.ts",
-    "test:pgn": "xvfb-run -a tsx src/pgn-runner.ts",
+    "whatsapp:login": "tsx scripts/whatsapp-login.ts",
+    "whatsapp:verify": "tsx scripts/whatsapp-verify.ts",
+    "test:single": "tsx scripts/test-single.ts",
+    "test:pgn": "tsx scripts/run-pgn.ts",
     "test:pgn:fresh": "tsx scripts/fresh-pgn.ts",
-    "test:pgn:retest": "xvfb-run -a tsx scripts/retest-pgn.ts",
+    "test:pgn:retest": "tsx scripts/retest-pgn.ts",
     "test:pgn:retest:validate": "tsx scripts/validate-retest.ts",
     "test:pgn:validate": "tsx scripts/validate-pgn-workbook.ts",
     "test:response-collector": "tsx --test scripts/response-collector.test.ts",
@@ -20,7 +23,8 @@
     "test:workbook-writer": "tsx --test scripts/workbook-writer.test.ts",
     "test:config": "tsx --test scripts/config.test.ts",
     "test:retest": "tsx --test scripts/retest.test.ts",
-    "test:evidence": "tsx --test scripts/evidence-migration.test.ts"
+    "test:evidence": "tsx --test scripts/evidence-migration.test.ts",
+    "test:operator": "tsx --test scripts/operator.test.ts"
   },
   "repository": {
     "type": "git",
@@ -42,6 +46,7 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
+    "@clack/prompts": "^1.7.0",
     "dotenv": "^17.4.2",
     "exceljs": "^4.4.0",
     "googleapis": "^178.0.0",

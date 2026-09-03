@@ -2,9 +2,45 @@
 
 This harness drives the consumer WhatsApp Web UI with Playwright. Messages follow the real route through the PGN WhatsApp Business number, LivePerson, and the PGN bot; no direct bot or messaging API is used.
 
-## Commands
+## Getting Started
 
-- `npm run whatsapp:login` launches headed Playwright Chromium under Xvfb, writes only a validated QR to `artifacts/whatsapp-login.png`, and waits for login.
+Install the project, run the guided setup, and open the operator control panel:
+
+```bash
+npm install
+npm run setup
+npm run pgn
+```
+
+The setup wizard inspects Node.js, npm, dependencies, Playwright Chromium, the PGN workbooks, `.env`, Google Drive configuration, browser display support, and the saved WhatsApp profile. It can safely create or update `.env`, validate a service-account file, install Chromium, and optionally open WhatsApp login. Credential values and profile contents are never displayed.
+
+`npm run pgn` provides one interactive entry point for:
+
+- full and filtered PGN runs
+- approved retest validation, execution, and resume
+- workbook, evidence, and Drive validation
+- evidence migration
+- WhatsApp login, verification, and explicit authentication recreation
+- setup and diagnostics
+- TypeScript checks and safe regression tests
+
+Execution, fresh-run preparation, evidence migration, and authentication recreation require explicit confirmation. Cancelling a prompt or selecting Back does not launch the selected action.
+
+Run non-interactive prerequisite checks at any time:
+
+```bash
+npm run doctor
+```
+
+### Browser Support
+
+Browser commands run directly on Windows and macOS. Linux runs directly when `DISPLAY` is available or Chromium is configured headless. On headless Linux and GitHub Codespaces, the launcher uses `xvfb-run` only when a headed browser needs it. If no display provider is available, the command exits with a concrete setup instruction instead of relying on shell-specific syntax.
+
+### Advanced Commands
+
+The direct commands remain available for automation and experienced operators:
+
+- `npm run whatsapp:login` opens Playwright Chromium, writes only a validated QR to `artifacts/whatsapp-login.png`, and waits for login.
 - `npm run whatsapp:verify` verifies that `.whatsapp-profile/` opens without another QR scan.
 - `npm run test:single` sends `Halo`, captures all new incoming messages through the configured quiet window, and writes `reports/PGN_Single_Test_Result.xlsx`.
 - `npm run test:pgn:validate` validates the real PGN workbook without opening WhatsApp or sending messages.
@@ -18,6 +54,9 @@ This harness drives the consumer WhatsApp Web UI with Playwright. Messages follo
 - `npm run test:session-reset` tests reset confirmation and failure handling without opening WhatsApp.
 - `npm run test:workbook-writer` verifies result writes preserve the source XLSX table metadata.
 - `npm run test:config` verifies `.env`, credential-source precedence, safe credential parsing, and fresh-run preservation without contacting WhatsApp or Drive.
+- `npm run test:retest` verifies retest selection and history behavior with temporary workbook fixtures.
+- `npm run test:evidence` verifies evidence migration with temporary files and mocked Drive operations.
+- `npm run test:operator` verifies setup, diagnostics, menus, cancellation, and platform behavior with mocks only.
 - `npm run data:template` creates a starter legacy test-case workbook without overwriting an existing one.
 - `npm run check` runs the TypeScript compiler.
 

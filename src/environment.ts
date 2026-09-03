@@ -27,6 +27,7 @@ export interface LoadEnvironmentOptions {
 }
 
 let defaultEnvironment: LoadedEnvironment | undefined;
+let defaultProcessEnvironmentKeys: Set<string> | undefined;
 
 export function loadEnvironment(
   options: LoadEnvironmentOptions = {},
@@ -41,11 +42,16 @@ export function loadEnvironment(
     return defaultEnvironment;
   }
 
-  const preexistingKeys = new Set(
-    Object.keys(values).filter((name) =>
-      Object.prototype.hasOwnProperty.call(values, name),
-    ),
-  );
+  if (useDefaultCache && !defaultProcessEnvironmentKeys) {
+    defaultProcessEnvironmentKeys = new Set(Object.keys(values));
+  }
+  const preexistingKeys = useDefaultCache
+    ? new Set(defaultProcessEnvironmentKeys)
+    : new Set(
+        Object.keys(values).filter((name) =>
+          Object.prototype.hasOwnProperty.call(values, name),
+        ),
+      );
   const envFilePath = path.join(repositoryRoot, ".env");
   const result = dotenv.config({
     path: envFilePath,
@@ -75,6 +81,18 @@ export function loadEnvironment(
     defaultEnvironment = loaded;
   }
   return loaded;
+}
+
+export function synchronizeEnvironmentFileUpdates(
+  updates: Readonly<Record<string, string>>,
+): void {
+  defaultProcessEnvironmentKeys ??= new Set(Object.keys(process.env));
+  for (const [name, value] of Object.entries(updates)) {
+    if (!defaultProcessEnvironmentKeys.has(name)) {
+      process.env[name] = value;
+    }
+  }
+  defaultEnvironment = undefined;
 }
 
 export function summarizeEnvironmentSources(

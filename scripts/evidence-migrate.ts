@@ -1,12 +1,14 @@
 import path from "node:path";
-import { loadConfig } from "../src/config";
+import { loadConfig, type AppConfig } from "../src/config";
+import { isEntrypoint, runCliMain } from "../src/cli-entrypoint";
 import { runEvidenceMigration } from "../src/evidence/evidence-migration";
 import { createGoogleDriveEvidencePublisher } from "../src/evidence/google-drive";
 import { safeGoogleCredentialError } from "../src/evidence/google-service-account";
 import { acquireWorkbookLock } from "../src/excel/workbook-lock";
 
-async function main(): Promise<void> {
-  const config = loadConfig();
+export async function migrateEvidence(
+  config: AppConfig = loadConfig(),
+): Promise<void> {
   const publisher = createGoogleDriveEvidencePublisher(config);
   const releaseWorkbookLock = await acquireWorkbookLock(
     config.pgnExecutedWorkbookPath,
@@ -73,7 +75,6 @@ async function main(): Promise<void> {
   console.log("Testcases rerun during migration: 0");
 }
 
-main().catch((error) => {
-  console.error(safeGoogleCredentialError(error));
-  process.exitCode = 1;
-});
+if (isEntrypoint(import.meta.url)) {
+  runCliMain(() => migrateEvidence(), safeGoogleCredentialError);
+}
