@@ -12,7 +12,7 @@ const DEFAULT_MAX_RETRY_DELAY_MS = 2_000;
 const DEFAULT_MIN_PROGRESS_INTERVAL_MS = 10_000;
 const INTERRUPTION_REQUEST_TIMEOUT_MS = 700;
 
-export type DiscordRunMode = "full" | "retest";
+export type DiscordRunMode = "full" | "retest" | "demo";
 
 export interface DiscordRunStartedEvent {
   runId: string;
@@ -67,7 +67,14 @@ export interface DiscordNotifier {
   runInterrupted(
     signal: "SIGINT" | "SIGTERM",
     event: DiscordRunProgressEvent,
+    details?: DiscordInterruptionDetails,
   ): Promise<void>;
+}
+
+export interface DiscordInterruptionDetails {
+  reason?: string;
+  workbookProgress?: string;
+  evidenceProgress?: string;
 }
 
 export interface DiscordNotifierDependencies {
@@ -494,7 +501,9 @@ function environmentLabel(
 }
 
 function modeLabel(mode: DiscordRunMode): string {
-  return mode === "retest" ? "Ready-for-Retest" : "Full Test";
+  if (mode === "retest") return "Ready-for-Retest";
+  if (mode === "demo") return "Discord Demo";
+  return "Full Test";
 }
 
 function embed(
@@ -570,7 +579,11 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
     const transport = this.availableTransport();
     if (!transport) return;
     const title =
-      event.mode === "retest" ? "PGN Retest Started" : "PGN Full Test Started";
+      event.mode === "retest"
+        ? "PGN Retest Started"
+        : event.mode === "demo"
+          ? "PGN Discord Demo Started"
+          : "PGN Full Test Started";
     const payload = embed(
       title,
       0x3498db,
@@ -581,7 +594,9 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
           name:
             event.mode === "retest"
               ? "Ready-for-Retest scenarios"
-              : "Selected scenarios",
+              : event.mode === "demo"
+                ? "Demo scenarios"
+                : "Selected scenarios",
           value: String(event.selectedScenarios),
           inline: true,
         },
@@ -683,7 +698,11 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
     if (!transport) return;
     const payload = this.failedPayload(
       event,
-      this.run.mode === "retest" ? "PGN Retest Aborted" : "PGN Test Aborted",
+      this.run.mode === "retest"
+        ? "PGN Retest Aborted"
+        : this.run.mode === "demo"
+          ? "PGN Discord Demo Aborted"
+          : "PGN Test Aborted",
     );
     this.terminalPayload = payload;
     if (this.liveMessageId) {
@@ -697,6 +716,7 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
   async runInterrupted(
     signal: "SIGINT" | "SIGTERM",
     event: DiscordRunProgressEvent,
+    details: DiscordInterruptionDetails = {},
   ): Promise<void> {
     if (!this.run || this.terminal) return;
     this.terminal = true;
@@ -707,13 +727,16 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
       {
         ...event,
         failedAt: interruptedAt,
-        reason: `Process received ${signal}`,
-        workbookProgress: "Saved progressively",
-        evidenceProgress: `${event.evidenceUploaded} uploaded`,
+        reason: details.reason ?? `Process received ${signal}`,
+        workbookProgress: details.workbookProgress ?? "Saved progressively",
+        evidenceProgress:
+          details.evidenceProgress ?? `${event.evidenceUploaded} uploaded`,
       },
       this.run.mode === "retest"
         ? "PGN Retest Interrupted"
-        : "PGN Test Interrupted",
+        : this.run.mode === "demo"
+          ? "PGN Discord Demo Interrupted"
+          : "PGN Test Interrupted",
     );
     this.terminalPayload = payload;
     const requests: Promise<unknown>[] = [];
@@ -743,7 +766,11 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
   private runningPayload(event: DiscordRunProgressEvent): DiscordPayload {
     const run = this.run!;
     return embed(
-      run.mode === "retest" ? "PGN Retest Running" : "PGN Test Running",
+      run.mode === "retest"
+        ? "PGN Retest Running"
+        : run.mode === "demo"
+          ? "PGN Discord Demo Running"
+          : "PGN Test Running",
       0xf1c40f,
       [
         { name: "Run ID", value: run.runId, inline: true },
@@ -791,7 +818,9 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
         ? "PGN Retest Checkpoint Saved"
         : run.mode === "retest"
           ? "PGN Retest Completed"
-          : "PGN Test Completed",
+          : run.mode === "demo"
+            ? "PGN Discord Demo Completed"
+            : "PGN Test Completed",
       checkpoint ? 0xf1c40f : 0x2ecc71,
       [
         { name: "Run ID", value: run.runId, inline: true },
@@ -859,7 +888,7 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
           inline: true,
         },
         {
-          name: "Completed",
+          name: run.mode === "demo" ? "Progress" : "Completed",
           value: `${event.completedScenarios} / ${event.totalScenarios}`,
           inline: true,
         },
@@ -947,8 +976,8 @@ export function createDiscordNotifier(
     runProgress: (event) => guard(() => notifier.runProgress(event)),
     runCompleted: (event) => guard(() => notifier.runCompleted(event)),
     runFailed: (event) => guard(() => notifier.runFailed(event)),
-    runInterrupted: (signal, event) =>
-      guard(() => notifier.runInterrupted(signal, event)),
+    runInterrupted: (signal, event, details) =>
+      guard(() => notifier.runInterrupted(signal, event, details)),
   };
 }
 

@@ -53,6 +53,7 @@ The direct commands remain available for automation and experienced operators:
 - `npm run evidence:migrate` backs up the completed workbook, cleans and uploads existing evidence, and writes hyperlinks without contacting WhatsApp.
 - `npm run discord:validate` safely inspects the configured Discord webhook with `GET` and does not post a message.
 - `npm run discord:validate -- --send-test` explicitly posts one Discord test notification.
+- `npm run discord:demo` sends a short fake lifecycle through the existing notifier without running WhatsApp, workbook, evidence, or Drive operations.
 - `npm run test:response-collector` runs deterministic delayed-message and hard-timeout tests without opening WhatsApp.
 - `npm run test:session-reset` tests reset confirmation and failure handling without opening WhatsApp.
 - `npm run test:workbook-writer` verifies result writes preserve the source XLSX table metadata.
@@ -94,6 +95,35 @@ DISCORD_NOTIFY_FAILURE=true
 An active full or Ready-for-Retest run creates one live status message, edits it at the configured scenario or time interval, finalizes it, and posts a fresh completion or technical-failure event. An incomplete retest batch is labeled as a checkpoint instead of a completed retest. Setup offers progress every 5 scenarios, every 10 scenarios, final only, or a custom scenario/time cadence; the final-only preset disables start and progress messages. Start, progress, completion, and failure events can also be controlled independently with the advanced flags above.
 
 Notification delivery is fail-open. Timeouts, rate limits, deleted webhooks, malformed responses, and other Discord failures produce a redacted warning but never stop execution or alter workbook results. Discord payloads contain only operational identifiers, counts, timing, technical status, evidence counts, and the executed workbook basename. They never include WhatsApp messages, bot responses, phone numbers, screenshots, credentials, semantic Pass/Fail decisions, or automatic mentions.
+
+#### Discord Verification
+
+Validate configuration without posting a message:
+
+```bash
+npm run discord:validate
+```
+
+Send exactly one basic test notification:
+
+```bash
+npm run discord:validate -- --send-test
+```
+
+Simulate a complete start, progress, and completion lifecycle:
+
+```bash
+npm run discord:demo
+```
+
+Simulate failure or interruption notifications:
+
+```bash
+npm run discord:demo -- --fail
+npm run discord:demo -- --interrupt
+```
+
+`discord:demo` uses only fake operational data and the existing Discord notifier. It does not launch WhatsApp or Playwright, send PGN testcases, read or modify a workbook, upload evidence, access Google Drive, alter run metadata, or perform fresh-run cleanup. The demo uses one-second event delays and a short bounded notification deadline rather than the production progress cadence.
 
 ### Google Drive Evidence
 

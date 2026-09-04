@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { parseDiscordDemoArgs, runDiscordDemo } from "./discord-demo";
 import { parseDiscordValidationArgs } from "./discord-validate";
 import {
   createDiscordNotifier,
@@ -150,6 +151,254 @@ test("validation CLI requires explicit and unambiguous send-test intent", () => 
     () => parseDiscordValidationArgs(["--send-test", "--send-test"]),
     /Usage:/,
   );
+});
+
+test("demo CLI accepts only one simulated outcome", () => {
+  assert.deepEqual(parseDiscordDemoArgs([]), { outcome: "complete" });
+  assert.deepEqual(parseDiscordDemoArgs(["--fail"]), { outcome: "fail" });
+  assert.deepEqual(parseDiscordDemoArgs(["--interrupt"]), {
+    outcome: "interrupt",
+  });
+  for (const invalid of [
+    ["--unknown"],
+    ["--fail", "--fail"],
+    ["--interrupt", "--interrupt"],
+    ["--fail", "--interrupt"],
+  ]) {
+    assert.throws(() => parseDiscordDemoArgs(invalid), /Usage:/);
+  }
+});
+
+test("demo stops safely when Discord is disabled or the webhook is unavailable", async () => {
+  for (const fixture of [
+    {
+      config: settings({ discordNotificationsEnabled: false }),
+      status: "disabled",
+      message: "Discord notifications are disabled.",
+    },
+    {
+      config: settings({ discordWebhookUrl: undefined }),
+      status: "missing-webhook",
+      message: "Discord webhook: not configured",
+    },
+    {
+      config: settings({ discordWebhookUrl: "https://example.invalid/webhook" }),
+      status: "invalid-webhook",
+      message: "Discord webhook: invalid configuration",
+    },
+    {
+      config: settings({
+        discordConfigurationIssues: [
+          "DISCORD_PROGRESS_EVERY must be a whole number of 1 or greater",
+        ],
+      }),
+      status: "invalid-settings",
+      message: "Discord notification configuration is invalid.",
+    },
+  ] as const) {
+    const logs: string[] = [];
+    let requests = 0;
+    const result = await runDiscordDemo(
+      fixture.config,
+      { outcome: "complete" },
+      {
+        log: (message) => logs.push(message),
+        delay: async () => {
+          throw new Error("A blocked demo must not wait");
+        },
+        notifier: {
+          fetch: (async () => {
+            requests += 1;
+            throw new Error("A blocked demo must not contact Discord");
+          }) as typeof fetch,
+        },
+      },
+    );
+    assert.equal(result.status, fixture.status);
+    assert.equal(requests, 0);
+    assert(logs.includes(fixture.message));
+    assert(!logs.join("\n").includes(webhookUrl));
+  }
+});
+
+test("normal demo creates and edits one live message before completion", async () => {
+  const transport = recordingFetch();
+  const logs: string[] = [];
+  const warnings: string[] = [];
+  const delays: number[] = [];
+  const result = await runDiscordDemo(
+    settings(),
+    { outcome: "complete" },
+    {
+      now: () => new Date("2026-09-04T22:00:00.000Z"),
+      delay: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+      log: (message) => logs.push(message),
+      warn: (message) => warnings.push(message),
+      notifier: { fetch: transport.fetch },
+    },
+  );
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.runId, "DEMO-20260904T220000Z");
+  assert.deepEqual(delays, [1_000, 1_000, 1_000]);
+  assert.deepEqual(
+    transport.calls.map((call) => call.init?.method),
+    ["POST", "PATCH", "PATCH", "PATCH", "POST"],
+  );
+  for (const call of transport.calls.slice(1, 4)) {
+    assert.match(call.url.pathname, /\/messages\/987654321$/);
+  }
+  assert.equal(
+    embedTitle(payload(transport.calls[0]!)),
+    "PGN Discord Demo Started",
+  );
+  assert.equal(embedField(payload(transport.calls[0]!), "Mode"), "Discord Demo");
+  assert.equal(embedField(payload(transport.calls[1]!), "Progress"), "1 / 10");
+  assert.equal(embedField(payload(transport.calls[2]!), "Progress"), "5 / 10");
+  assert.equal(
+    embedTitle(payload(transport.calls[3]!)),
+    "PGN Discord Demo Completed",
+  );
+  assert.deepEqual(payload(transport.calls[3]!), payload(transport.calls[4]!));
+  for (const call of transport.calls) assertSafeMentions(payload(call));
+  assert.equal(warnings.length, 0);
+  assert.match(logs.join("\n"), /Demo event: STARTED/);
+  assert.match(logs.join("\n"), /Demo event: RUNNING 1 \/ 10/);
+  assert.match(logs.join("\n"), /Demo event: RUNNING 5 \/ 10/);
+  assert.match(logs.join("\n"), /Demo event: COMPLETED 10 \/ 10/);
+  assert(!logs.join("\n").includes(webhookUrl));
+});
+
+test("failure demo edits the live message and posts a fake aborted event", async () => {
+  const transport = recordingFetch();
+  const logs: string[] = [];
+  const result = await runDiscordDemo(
+    settings(),
+    { outcome: "fail" },
+    {
+      now: () => new Date("2026-09-04T22:00:00.000Z"),
+      delay: async () => undefined,
+      log: (message) => logs.push(message),
+      notifier: { fetch: transport.fetch },
+    },
+  );
+
+  assert.equal(result.status, "simulated-failure");
+  assert.deepEqual(
+    transport.calls.map((call) => call.init?.method),
+    ["POST", "PATCH", "PATCH", "POST"],
+  );
+  const failureEdit = payload(transport.calls[2]!);
+  assert.equal(embedTitle(failureEdit), "PGN Discord Demo Aborted");
+  assert.equal(
+    embedField(failureEdit, "Reason"),
+    "Simulated failure for Discord notification testing",
+  );
+  assert.equal(embedField(failureEdit, "Progress"), "5 / 10");
+  assert.deepEqual(failureEdit, payload(transport.calls[3]!));
+  assert.match(
+    logs.at(-1) ?? "",
+    /Demo result: simulated failure notification sent successfully/,
+  );
+});
+
+test("interruption demo emits a simulated SIGINT without killing the process", async () => {
+  const transport = recordingFetch();
+  const logs: string[] = [];
+  const result = await runDiscordDemo(
+    settings(),
+    { outcome: "interrupt" },
+    {
+      now: () => new Date("2026-09-04T22:00:00.000Z"),
+      delay: async () => undefined,
+      log: (message) => logs.push(message),
+      notifier: { fetch: transport.fetch },
+    },
+  );
+
+  assert.equal(result.status, "simulated-interruption");
+  assert.deepEqual(
+    transport.calls.map((call) => call.init?.method),
+    ["POST", "PATCH", "PATCH", "POST"],
+  );
+  const interruption = payload(transport.calls[2]!);
+  assert.equal(embedTitle(interruption), "PGN Discord Demo Interrupted");
+  assert.equal(embedField(interruption, "Reason"), "Simulated SIGINT");
+  assert.equal(
+    embedField(interruption, "Workbook progress"),
+    "Demo only; no workbook modified",
+  );
+  assert.match(
+    logs.at(-1) ?? "",
+    /Demo result: simulated interruption notification sent successfully/,
+  );
+});
+
+test("demo respects a mocked 429 retry delay within bounded attempts", async () => {
+  const retryDelays: number[] = [];
+  const transport = recordingFetch(async (_call, index) =>
+    index === 0
+      ? response(429, { retry_after: 0.25 }, { "retry-after": "0.25" })
+      : response(),
+  );
+  const result = await runDiscordDemo(
+    settings(),
+    { outcome: "complete" },
+    {
+      now: () => new Date("2026-09-04T22:00:00.000Z"),
+      delay: async () => undefined,
+      log: () => undefined,
+      warn: () => undefined,
+      notifier: {
+        fetch: transport.fetch,
+        sleep: async (milliseconds) => {
+          retryDelays.push(milliseconds);
+        },
+      },
+    },
+  );
+
+  assert.equal(result.status, "completed");
+  assert.deepEqual(retryDelays, [250]);
+  assert.equal(transport.calls.length, 6);
+});
+
+test("demo transport failures stay fail-open and redact the webhook", async () => {
+  for (const failingTransport of [
+    recordingFetch(async () => response(500, {})),
+    recordingFetch(
+      async (call) =>
+        new Promise<Response>((_resolve, reject) => {
+          call.init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException(`timed out ${webhookUrl}`, "AbortError"));
+          });
+        }),
+    ),
+  ]) {
+    const logs: string[] = [];
+    const warnings: string[] = [];
+    const result = await runDiscordDemo(
+      settings(),
+      { outcome: "complete" },
+      {
+        now: () => new Date("2026-09-04T22:00:00.000Z"),
+        delay: async () => undefined,
+        log: (message) => logs.push(message),
+        warn: (message) => warnings.push(message),
+        notifier: {
+          fetch: failingTransport.fetch,
+          timeoutMs: 1,
+          maxAttempts: 1,
+        },
+      },
+    );
+
+    assert.equal(result.status, "delivery-warning");
+    assert(warnings.length >= 1);
+    assert(![...logs, ...warnings].join("\n").includes(webhookUrl));
+  }
 });
 
 test("safe validation inspects with GET and explicit tests send one message", async () => {
