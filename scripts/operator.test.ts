@@ -17,12 +17,14 @@ import {
   type DiagnosticReport,
 } from "../src/operator/diagnostics";
 import {
+  configureDiscordNotifications,
   runSetupWizard,
   updateEnvironmentText,
 } from "../src/operator/setup";
 import type {
   ConfirmPrompt,
   OperatorUi,
+  SecretPrompt,
   SelectPrompt,
   TextPrompt,
 } from "../src/operator/ui";
@@ -31,6 +33,7 @@ class ScriptedUi implements OperatorUi {
   readonly events: string[] = [];
   readonly selectPrompts: SelectPrompt<string>[] = [];
   readonly confirmPrompts: ConfirmPrompt[] = [];
+  readonly secretPrompts: SecretPrompt[] = [];
 
   constructor(private readonly responses: unknown[] = []) {}
 
@@ -73,6 +76,17 @@ class ScriptedUi implements OperatorUi {
     if (response !== undefined) {
       const validation = prompt.validate?.(response);
       if (validation) throw new Error(`Invalid scripted response: ${validation}`);
+    }
+    return response;
+  }
+
+  async secret(prompt: SecretPrompt): Promise<string | undefined> {
+    this.secretPrompts.push(prompt);
+    this.events.push(`secret:${prompt.message}`);
+    const response = this.response("secret") as string | undefined;
+    if (response !== undefined) {
+      const validation = prompt.validate?.(response);
+      if (validation) throw new Error(`Invalid scripted secret: ${validation}`);
     }
     return response;
   }
@@ -192,6 +206,12 @@ function diagnosticReport(
         detail: "credentials and folder access verified",
       },
       {
+        id: "discord",
+        label: "Discord notifications",
+        status: "warn",
+        detail: "disabled; webhook not configured; connectivity not tested",
+      },
+      {
         id: "browser-runtime",
         label: "Browser runtime",
         status: report.browserRuntime.mode === "unavailable" ? "error" : "ok",
@@ -218,6 +238,14 @@ function stubActions(
     runRetest: async () => undefined,
     validateEvidence: async () => ({ ready: true }),
     migrateEvidence: async () => undefined,
+    validateDiscord: async (sendTest) => ({
+      enabled: true,
+      configured: true,
+      valid: true,
+      connectivity: "ok",
+      testNotificationSent: sendTest,
+    }),
+    configureNotifications: async () => undefined,
     loginWhatsApp: async () => undefined,
     verifyWhatsApp: async () => undefined,
     recreateWhatsApp: async () => undefined,
@@ -346,6 +374,7 @@ test("first-time setup writes only prompted local configuration", async (context
     "+62 812 3456 7890",
     false,
     false,
+    false,
     "exit",
   ]);
   const result = await runSetupWizard(ui, {
@@ -359,6 +388,7 @@ test("first-time setup writes only prompted local configuration", async (context
   assert.match(written, /PGN_WHATSAPP_CHAT=\n/);
   assert.match(written, /WHATSAPP_HEADLESS=false/);
   assert.match(written, /GOOGLE_DRIVE_EVIDENCE_ENABLED=false/);
+  assert.match(written, /DISCORD_NOTIFICATIONS_ENABLED=false/);
   assert.equal(
     ui.confirmPrompts[0].message,
     "Would you like to review or update your setup?",
@@ -375,7 +405,7 @@ test("existing setup preserves comments and unrelated secret fields", async (con
     path.join(projectRoot, ".env"),
     `# retained comment\nUNRELATED_SECRET=${fixtureSecret}\nPGN_WHATSAPP_CHAT=Existing chat\nWHATSAPP_HEADLESS=false\nGOOGLE_DRIVE_EVIDENCE_ENABLED=false\n`,
   );
-  const ui = new ScriptedUi([true, "keep", true, false, "exit"]);
+  const ui = new ScriptedUi([true, "keep", true, false, false, "exit"]);
   await runSetupWizard(ui, {
     projectRoot,
     environment: {},
@@ -388,6 +418,150 @@ test("existing setup preserves comments and unrelated secret fields", async (con
   assert.match(written, /PGN_WHATSAPP_CHAT=Existing chat/);
   assert.match(written, /WHATSAPP_HEADLESS=true/);
   assert.doesNotMatch(ui.events.join("\n"), new RegExp(fixtureSecret));
+});
+
+test("notification setup uses a masked prompt and never sends implicitly", async (context) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-discord-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const webhook = "https://discord.com/api/webhooks/123456789/setup-token";
+  let testCalls = 0;
+  const ui = new ScriptedUi([true, webhook, "5", false]);
+  const configured = await configureDiscordNotifications(ui, {
+    projectRoot,
+    environment: {},
+    testDiscordWebhook: async () => {
+      testCalls += 1;
+      throw new Error("A declined test must not run");
+    },
+  });
+
+  const written = await readFile(path.join(projectRoot, ".env"), "utf8");
+  assert.equal(configured, true);
+  assert.equal(testCalls, 0);
+  assert.equal(ui.secretPrompts.length, 1);
+  assert.equal(ui.secretPrompts[0]?.clearOnError, true);
+  assert.equal(written.includes(webhook), true);
+  assert.match(written, /DISCORD_NOTIFICATIONS_ENABLED=true/);
+  assert.match(written, /DISCORD_PROGRESS_EVERY=5/);
+  assert.match(written, /DISCORD_NOTIFY_PROGRESS=true/);
+  assert.equal(ui.events.join("\n").includes(webhook), false);
+});
+
+test("notification setup posts one explicit test and stores custom progress", async (context) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-discord-test-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const webhook = "https://discord.com/api/webhooks/123456789/custom-token";
+  const tested: string[] = [];
+  const ui = new ScriptedUi([true, webhook, "custom", "7", "3", true]);
+  await configureDiscordNotifications(ui, {
+    projectRoot,
+    environment: {},
+    testDiscordWebhook: async (candidate) => {
+      tested.push(candidate);
+      return {
+        enabled: true,
+        configured: true,
+        valid: true,
+        connectivity: "ok",
+        testNotificationSent: true,
+      };
+    },
+  });
+
+  const written = await readFile(path.join(projectRoot, ".env"), "utf8");
+  assert.equal(tested.length, 1);
+  assert.equal(tested[0] === webhook, true);
+  assert.match(written, /DISCORD_PROGRESS_EVERY=7/);
+  assert.match(written, /DISCORD_PROGRESS_MINUTES=3/);
+  assert.match(ui.events.join("\n"), /Discord test notification sent/);
+  assert.equal(ui.events.join("\n").includes(webhook), false);
+});
+
+test("notification setup preserves an existing webhook without displaying it", async (context) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-discord-keep-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const webhook = "https://discord.com/api/webhooks/123456789/existing-token";
+  await writeFile(
+    path.join(projectRoot, ".env"),
+    `DISCORD_NOTIFICATIONS_ENABLED=true\nDISCORD_WEBHOOK_URL=${webhook}\nDISCORD_NOTIFY_PROGRESS=true\nDISCORD_PROGRESS_EVERY=5\n`,
+  );
+  const ui = new ScriptedUi([true, true, "final", false]);
+  await configureDiscordNotifications(ui, {
+    projectRoot,
+    environment: {},
+  });
+
+  const written = await readFile(path.join(projectRoot, ".env"), "utf8");
+  assert.equal(ui.secretPrompts.length, 0);
+  assert.equal(written.includes(webhook), true);
+  assert.match(written, /DISCORD_NOTIFY_START=false/);
+  assert.match(written, /DISCORD_NOTIFY_PROGRESS=false/);
+  assert.equal(ui.events.join("\n").includes(webhook), false);
+});
+
+test("cancelling the Discord secret prompt writes nothing", async (context) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-discord-cancel-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const ui = new ScriptedUi([true, undefined]);
+  const configured = await configureDiscordNotifications(ui, {
+    projectRoot,
+    environment: {},
+  });
+
+  assert.equal(configured, false);
+  await assert.rejects(
+    readFile(path.join(projectRoot, ".env"), "utf8"),
+    /ENOENT/,
+  );
+});
+
+test("notification setup does not shadow process-managed Discord settings", async (context) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-discord-env-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const ui = new ScriptedUi(["5", false]);
+  const configured = await configureDiscordNotifications(ui, {
+    projectRoot,
+    environment: {
+      DISCORD_NOTIFICATIONS_ENABLED: "true",
+      DISCORD_WEBHOOK_URL:
+        "https://discord.com/api/webhooks/123456789/process-token",
+    },
+  });
+
+  assert.equal(configured, true);
+  assert.equal(
+    ui.confirmPrompts.some(
+      (prompt) => prompt.message === "Enable Discord notifications?",
+    ),
+    false,
+  );
+  assert.equal(ui.secretPrompts.length, 0);
+  assert.match(ui.events.join("\n"), /managed by the process environment/);
+  const written = await readFile(path.join(projectRoot, ".env"), "utf8");
+  assert.match(written, /DISCORD_PROGRESS_EVERY=5/);
+  assert.doesNotMatch(written, /DISCORD_NOTIFICATIONS_ENABLED/);
+  assert.doesNotMatch(written, /DISCORD_WEBHOOK_URL/);
+});
+
+test("notification setup configures local cadence with a process-managed webhook", async (context) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-discord-mixed-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const webhook =
+    "https://discord.com/api/webhooks/123456789/process-secret-token";
+  const ui = new ScriptedUi([true, "10", false]);
+  const configured = await configureDiscordNotifications(ui, {
+    projectRoot,
+    environment: { DISCORD_WEBHOOK_URL: webhook },
+  });
+
+  const written = await readFile(path.join(projectRoot, ".env"), "utf8");
+  assert.equal(configured, true);
+  assert.equal(ui.secretPrompts.length, 0);
+  assert.match(written, /DISCORD_NOTIFICATIONS_ENABLED=true/);
+  assert.match(written, /DISCORD_PROGRESS_EVERY=10/);
+  assert.equal(written.includes(webhook), false);
+  assert.equal(ui.events.join("\n").includes(webhook), false);
+  assert.match(ui.events.join("\n"), /managed by the process environment/);
 });
 
 test("setup refuses to write a missing service-account file", async (context) => {
@@ -687,6 +861,99 @@ test("diagnostics redact credential material from Drive failures", async (contex
   assert.doesNotMatch(detail, /fixture-private-key/);
 });
 
+test("diagnostics report Discord without inspecting it by default", async (context) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-discord-diagnostic-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const webhook = "https://discord.com/api/webhooks/123456789/diagnostic-token";
+  let inspections = 0;
+  const report = await collectDiagnostics({
+    projectRoot,
+    platform: "win32",
+    environment: {
+      PGN_WHATSAPP_PHONE: "628123456789",
+      DISCORD_NOTIFICATIONS_ENABLED: "true",
+      DISCORD_WEBHOOK_URL: webhook,
+    },
+    npmVersion: async () => "11.0.0",
+    packageVersion: async () => "1.0.0",
+    chromiumExecutablePath: async () => "/fixture/chromium",
+    pathExists: async () => true,
+    inspectDiscord: async () => {
+      inspections += 1;
+      throw new Error("Inspection must be explicitly enabled");
+    },
+  });
+
+  const discord = report.checks.find((check) => check.id === "discord");
+  assert.equal(inspections, 0);
+  assert.equal(discord?.status, "ok");
+  assert.match(discord?.detail ?? "", /connectivity not tested/);
+  assert.equal((discord?.detail ?? "").includes(webhook), false);
+});
+
+test("diagnostics identify malformed Discord event settings", async (context) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-discord-invalid-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const report = await collectDiagnostics({
+    projectRoot,
+    platform: "win32",
+    environment: {
+      PGN_WHATSAPP_PHONE: "628123456789",
+      DISCORD_NOTIFICATIONS_ENABLED: "true",
+      DISCORD_WEBHOOK_URL:
+        "https://discord.com/api/webhooks/123456789/diagnostic-token",
+      DISCORD_NOTIFY_COMPLETE: "typo",
+    },
+    npmVersion: async () => "11.0.0",
+    packageVersion: async () => "1.0.0",
+    chromiumExecutablePath: async () => "/fixture/chromium",
+    pathExists: async () => true,
+  });
+
+  const discord = report.checks.find((check) => check.id === "discord");
+  assert.equal(discord?.status, "warn");
+  assert.match(discord?.detail ?? "", /DISCORD_NOTIFY_COMPLETE/);
+  assert.match(discord?.detail ?? "", /affected notifications are disabled/);
+});
+
+test("explicit Discord diagnostics inspect safely and remain non-blocking on failure", async (context) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-discord-inspect-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const webhook = "https://discord.com/api/webhooks/123456789/inspection-token";
+  let inspections = 0;
+  const report = await collectDiagnostics({
+    projectRoot,
+    platform: "win32",
+    environment: {
+      PGN_WHATSAPP_PHONE: "628123456789",
+      DISCORD_NOTIFICATIONS_ENABLED: "true",
+      DISCORD_WEBHOOK_URL: webhook,
+    },
+    npmVersion: async () => "11.0.0",
+    packageVersion: async () => "1.0.0",
+    chromiumExecutablePath: async () => "/fixture/chromium",
+    pathExists: async () => true,
+    checkDiscordAccess: true,
+    inspectDiscord: async () => {
+      inspections += 1;
+      return {
+        enabled: true,
+        configured: true,
+        valid: true,
+        connectivity: "failed",
+        testNotificationSent: false,
+        reason: `Could not inspect ${webhook}`,
+      };
+    },
+  });
+
+  const discord = report.checks.find((check) => check.id === "discord");
+  assert.equal(inspections, 1);
+  assert.equal(discord?.status, "warn");
+  assert.equal((discord?.detail ?? "").includes(webhook), false);
+  assert.equal(report.ready, true);
+});
+
 test("fresh-run cancellation never invokes workbook preparation", async () => {
   let preparations = 0;
   const ui = new ScriptedUi(["run", "fresh", false, "back", "exit"]);
@@ -736,6 +1003,45 @@ test("full execution, evidence migration, and auth recreation require confirmati
     }),
   );
   assert.deepEqual([fullRuns, migrations, recreations], [0, 0, 0]);
+});
+
+test("Notifications menu separates safe status, confirmed test, and configuration", async () => {
+  const validations: boolean[] = [];
+  let configurations = 0;
+  const ui = new ScriptedUi([
+    "notifications",
+    "status",
+    "test",
+    false,
+    "test",
+    true,
+    "configure",
+    "back",
+    "exit",
+  ]);
+  await runControlPanel(
+    ui,
+    stubActions({
+      validateDiscord: async (sendTest) => {
+        validations.push(sendTest);
+        return {
+          enabled: true,
+          configured: true,
+          valid: true,
+          connectivity: "ok",
+          testNotificationSent: sendTest,
+        };
+      },
+      configureNotifications: async () => {
+        configurations += 1;
+      },
+    }),
+  );
+
+  assert.deepEqual(validations, [false, true]);
+  assert.equal(configurations, 1);
+  assert.match(ui.events.join("\n"), /Discord test notification cancelled/);
+  assert.match(ui.events.join("\n"), /Discord test notification sent/);
 });
 
 test("setup completion routes diagnostics and confirmed full tests through existing actions", async () => {

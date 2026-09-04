@@ -41,6 +41,12 @@ import {
 } from "./evidence/google-drive";
 import { safeGoogleCredentialError } from "./evidence/google-service-account";
 import { evidenceFileName } from "./evidence/evidence-migration";
+import {
+  createDiscordNotifier,
+  registerDiscordInterruptionHandlers,
+  validateDiscordWebhookUrl,
+  type DiscordRunProgressEvent,
+} from "./notifications/discord";
 import { parseCliOptions, type CliOptions } from "./pgn-cli";
 import { selectScenarios } from "./pgn-selection";
 import {
@@ -461,250 +467,393 @@ async function runPgnWorkbookLocked(
     `[Session] Isolation enabled: send "${config.resetCommand}" and require "${config.resetConfirmation}" before every scenario`,
   );
 
-  let driveEvidence: RunEvidenceContext | undefined;
-  const storedEvidenceRun = getEvidenceRunMetadata(executed.workbook, runId);
-  let driveFolderId = storedEvidenceRun?.folderId ?? "";
-  let driveFolderUrl = storedEvidenceRun?.folderUrl ?? "";
-  if (config.googleDriveEvidenceEnabled) {
-    const publisher = createGoogleDriveEvidencePublisher(config);
-    const parent = await publisher.validateParentFolder();
-    console.log(`[Evidence] Drive parent ready: ${parent.name} (${parent.id})`);
-    const folder = await publisher.ensureRunFolder(
-      runId,
-      storedEvidenceRun?.folderId,
-      mode === "retest"
-        ? retestDriveFolderName(config.googleDriveRetestFolderPrefix, runId)
-        : undefined,
-    );
-    driveFolderId = folder.id;
-    driveFolderUrl = folder.webViewLink;
-    driveEvidence = { publisher, folderId: folder.id };
-    console.log(`[Evidence] Drive run folder ready: ${folder.name}`);
-  }
-  upsertEvidenceRunMetadata(executed.workbook, {
-    runId,
-    folderId: driveFolderId,
-    folderUrl: driveFolderUrl,
-    migrationVersion: EVIDENCE_MIGRATION_VERSION,
-    timestamp: storedEvidenceRun?.timestamp ?? retestRun?.startedAt ?? new Date(),
-    mode: mode === "retest" ? "RETEST" : "FUTURE",
-  });
-  if (retestRun) {
-    retestRun.folderId = driveFolderId || undefined;
-    retestRun.folderUrl = driveFolderUrl || undefined;
-    retestRun.updatedAt = new Date();
-    upsertRetestRunMetadata(executed.workbook, retestRun);
-  }
-  await saveExecutedPgnWorkbook(
-    executed.workbook,
-    config.pgnExecutedWorkbookPath,
-  );
+  const notificationStartedAt = new Date();
   let executedCount = 0;
   let capturedCount = 0;
   let timeoutCount = 0;
   let errorCount = 0;
   let evidenceUploadedCount = 0;
+  let evidenceUploadErrorCount = 0;
   let awaitingEvaluationCount = 0;
-  const client = new WhatsAppClient(config);
-  try {
-    await client.open();
-    await client.ensureAuthenticated({ allowQrLogin: false });
-    await client.openChat(requireTarget(config));
+  let currentScenarioId: string | undefined;
+  let workbookProgress = retestRun
+    ? "Retest run metadata saved"
+    : "No scenario results saved yet";
+  let failureStage = "initializing the active test run";
+  const notifier = createDiscordNotifier(config);
+  const notificationProgress = (updatedAt = new Date()): DiscordRunProgressEvent => ({
+    completedScenarios: executedCount,
+    totalScenarios: selectedScenarios.length,
+    currentScenarioId,
+    capturedScenarios: capturedCount,
+    timeouts: timeoutCount,
+    technicalErrors: errorCount,
+    evidenceUploaded: evidenceUploadedCount,
+    evidenceUploadErrors: evidenceUploadErrorCount,
+    updatedAt,
+  });
+  const discordHandlesProcessSignals =
+    config.discordNotificationsEnabled &&
+    (config.discordNotifyFailure ||
+      config.discordNotifyStart ||
+      config.discordNotifyProgress) &&
+    validateDiscordWebhookUrl(config.discordWebhookUrl).valid;
+  let progressTimer: NodeJS.Timeout | undefined;
+  let periodicProgress: Promise<void> | undefined;
+  let activeClient: WhatsAppClient | undefined;
+  const notificationOperations = new Set<Promise<void>>();
+  const trackNotification = (operation: Promise<void>): Promise<void> => {
+    const tracked = operation
+      .catch(() => undefined)
+      .finally(() => notificationOperations.delete(tracked));
+    notificationOperations.add(tracked);
+    return tracked;
+  };
+  const requestProgressNotification = (): void => {
+    if (periodicProgress) return;
+    periodicProgress = trackNotification(
+      notifier.runProgress(notificationProgress()),
+    ).finally(() => {
+      periodicProgress = undefined;
+    });
+  };
+  const stopProgressTimer = (): void => {
+    if (progressTimer) clearInterval(progressTimer);
+    progressTimer = undefined;
+  };
+  const unregisterInterruptionHandlers = discordHandlesProcessSignals
+    ? registerDiscordInterruptionHandlers({
+        notifier,
+        progress: () => notificationProgress(),
+        settle: () =>
+          Promise.all([...notificationOperations]).then(() => undefined),
+        cleanup: async () => {
+          stopProgressTimer();
+          await activeClient?.close();
+        },
+      })
+    : () => undefined;
 
-    for (let scenarioIndex = 0; scenarioIndex < selectedScenarios.length; scenarioIndex += 1) {
-      const scenario = selectedScenarios[scenarioIndex];
-      const executions: ExecutedTurn[] = [];
-      if (retestRun) {
-        snapshotRetestHistory(
-          executed.workbook,
+  try {
+    await trackNotification(
+      notifier.runStarted({
+        runId,
+        mode,
+        selectedScenarios: selectedScenarios.length,
+        startedAt: notificationStartedAt,
+        googleDriveEvidenceEnabled: config.googleDriveEvidenceEnabled,
+        workbookPath: config.pgnExecutedWorkbookPath,
+      }),
+    );
+    if (
+      config.discordNotificationsEnabled &&
+      config.discordNotifyProgress &&
+      selectedScenarios.length > 0
+    ) {
+      const progressPollingIntervalMs = Math.min(
+        config.discordProgressMinutes * 60_000,
+        10_000,
+      );
+      progressTimer = setInterval(() => {
+        requestProgressNotification();
+      }, progressPollingIntervalMs);
+      progressTimer.unref();
+    }
+    failureStage = "preparing Google Drive evidence";
+    let driveEvidence: RunEvidenceContext | undefined;
+    const storedEvidenceRun = getEvidenceRunMetadata(executed.workbook, runId);
+    let driveFolderId = storedEvidenceRun?.folderId ?? "";
+    let driveFolderUrl = storedEvidenceRun?.folderUrl ?? "";
+    if (config.googleDriveEvidenceEnabled) {
+      const publisher = createGoogleDriveEvidencePublisher(config);
+      const parent = await publisher.validateParentFolder();
+      console.log(`[Evidence] Drive parent ready: ${parent.name} (${parent.id})`);
+      const folder = await publisher.ensureRunFolder(
+        runId,
+        storedEvidenceRun?.folderId,
+        mode === "retest"
+          ? retestDriveFolderName(config.googleDriveRetestFolderPrefix, runId)
+          : undefined,
+      );
+      driveFolderId = folder.id;
+      driveFolderUrl = folder.webViewLink;
+      driveEvidence = { publisher, folderId: folder.id };
+      console.log(`[Evidence] Drive run folder ready: ${folder.name}`);
+    }
+    upsertEvidenceRunMetadata(executed.workbook, {
+      runId,
+      folderId: driveFolderId,
+      folderUrl: driveFolderUrl,
+      migrationVersion: EVIDENCE_MIGRATION_VERSION,
+      timestamp:
+        storedEvidenceRun?.timestamp ?? retestRun?.startedAt ?? new Date(),
+      mode: mode === "retest" ? "RETEST" : "FUTURE",
+    });
+    if (retestRun) {
+      retestRun.folderId = driveFolderId || undefined;
+      retestRun.folderUrl = driveFolderUrl || undefined;
+      retestRun.updatedAt = new Date();
+      upsertRetestRunMetadata(executed.workbook, retestRun);
+    }
+    await saveExecutedPgnWorkbook(
+      executed.workbook,
+      config.pgnExecutedWorkbookPath,
+    );
+    workbookProgress = "Run metadata saved";
+    const client = new WhatsAppClient(config, {
+      handleProcessSignals: !discordHandlesProcessSignals,
+    });
+    activeClient = client;
+    try {
+      failureStage = "opening WhatsApp Web";
+      await client.open();
+      failureStage = "authenticating WhatsApp Web";
+      await client.ensureAuthenticated({ allowQrLogin: false });
+      failureStage = "opening the configured WhatsApp chat";
+      await client.openChat(requireTarget(config));
+
+      for (
+        let scenarioIndex = 0;
+        scenarioIndex < selectedScenarios.length;
+        scenarioIndex += 1
+      ) {
+        const scenario = selectedScenarios[scenarioIndex];
+        currentScenarioId = scenario.testCaseId;
+        failureStage = `preparing scenario ${scenario.testCaseId}`;
+        const executions: ExecutedTurn[] = [];
+        if (retestRun) {
+          snapshotRetestHistory(
+            executed.workbook,
+            runId,
+            scenario,
+            new Date(),
+          );
+          await saveExecutedPgnWorkbook(
+            executed.workbook,
+            config.pgnExecutedWorkbookPath,
+          );
+        }
+        await resetAndDrainSession(
+          client,
+          config,
           runId,
           scenario,
-          new Date(),
-        );
-        await saveExecutedPgnWorkbook(
           executed.workbook,
-          config.pgnExecutedWorkbookPath,
+        );
+        console.log(
+          `[Scenario] ${scenario.testCaseId} (${scenario.sheetName}, ${scenario.turns.length} turn(s))`,
+        );
+        failureStage = `executing scenario ${scenario.testCaseId}`;
+        for (const turn of scenario.turns) {
+          console.log(`[Turn ${turn.turnNumber}] Sending: ${turn.userInput}`);
+          const execution = await executeTurn(
+            client,
+            config,
+            runId,
+            scenario,
+            turn,
+            driveEvidence,
+          );
+          executions.push(execution);
+          if (execution.evidenceStatus === "EVIDENCE_SYNCED") {
+            evidenceUploadedCount += 1;
+          }
+          if (execution.evidenceStatus === "EVIDENCE_UPLOAD_ERROR") {
+            evidenceUploadErrorCount += 1;
+          }
+          upsertEvidenceFileMetadata(executed.workbook, {
+            evidenceKey: `${runId}|${scenario.testCaseId}|${turn.turnNumber}`,
+            runId,
+            testCaseId: scenario.testCaseId,
+            turnNumber: turn.turnNumber,
+            driveFileId: execution.evidenceDriveFileId,
+            driveFileName:
+              execution.evidenceDriveFileName ??
+              evidenceFileName(scenario.testCaseId, turn.turnNumber),
+            evidenceUrl: execution.evidenceUrl,
+            localCleanPath:
+              execution.evidenceStatus === "EVIDENCE_CAPTURE_ERROR"
+                ? undefined
+                : execution.evidencePath,
+            status: execution.evidenceStatus ?? "EVIDENCE_CAPTURE_ERROR",
+          });
+          appendLatestTurnExecution(
+            executed.workbook,
+            runId,
+            scenario,
+            executions,
+          );
+          applyScenarioResults(executed.workbook, scenario, executions);
+          const scenarioFinished =
+            execution.technicalStatus !== "CAPTURED" ||
+            executions.length === scenario.turns.length;
+          if (retestRun) {
+            updateRetestHistory(
+              executed.workbook,
+              runId,
+              scenario,
+              executions,
+            );
+            if (scenarioFinished) {
+              const successfullyCaptured = applyRetestStatusTransition(
+                executed.workbook,
+                scenario,
+                executions,
+              );
+              if (
+                successfullyCaptured &&
+                !retestRun.finishedIds.includes(scenario.testCaseId)
+              ) {
+                retestRun.finishedIds.push(scenario.testCaseId);
+              }
+              retestRun.updatedAt = new Date();
+              upsertRetestRunMetadata(executed.workbook, retestRun);
+            }
+          }
+          await saveExecutedPgnWorkbook(
+            executed.workbook,
+            config.pgnExecutedWorkbookPath,
+          );
+          workbookProgress = `Saved through ${scenario.testCaseId} turn ${turn.turnNumber}`;
+          console.log(
+            `[Workbook] Saved after ${scenario.testCaseId} turn ${turn.turnNumber}`,
+          );
+          if (execution.combinedResponse) {
+            console.log(`[Bot] ${execution.combinedResponse}`);
+          }
+          console.log(
+            `[Turn ${turn.turnNumber}] ${execution.technicalStatus}; first=${execution.firstResponseMs ?? "n/a"} ms total=${execution.totalResponseMs ?? "n/a"} ms`,
+          );
+          if (execution.technicalStatus !== "CAPTURED") {
+            console.log(
+              `[Scenario] Stopping remaining turns after ${execution.technicalStatus}`,
+            );
+            break;
+          }
+        }
+        executedCount += 1;
+        if (
+          executions.length === scenario.turns.length &&
+          executions.every(
+            (execution) => execution.technicalStatus === "CAPTURED",
+          )
+        ) {
+          capturedCount += 1;
+          if (retestRun) {
+            awaitingEvaluationCount += 1;
+          }
+        } else if (
+          executions.some((execution) => execution.technicalStatus === "TIMEOUT")
+        ) {
+          timeoutCount += 1;
+        } else {
+          errorCount += 1;
+        }
+        requestProgressNotification();
+      }
+
+      failureStage = "performing final bot session cleanup";
+      const finalCleanupScenario =
+        selectedScenarios.at(-1) ??
+        (retestRun
+          ? executed.parsed.scenarios.find(
+              (scenario) =>
+                scenario.testCaseId === retestRun.selectedIds.at(-1),
+            )
+          : undefined);
+      if (!finalCleanupScenario) {
+        throw new Error(
+          "Could not identify a scenario for final session cleanup",
         );
       }
       await resetAndDrainSession(
         client,
         config,
         runId,
-        scenario,
+        finalCleanupScenario,
         executed.workbook,
+        true,
       );
-      console.log(
-        `[Scenario] ${scenario.testCaseId} (${scenario.sheetName}, ${scenario.turns.length} turn(s))`,
-      );
-      for (const turn of scenario.turns) {
-        console.log(`[Turn ${turn.turnNumber}] Sending: ${turn.userInput}`);
-        const execution = await executeTurn(
-          client,
-          config,
-          runId,
-          scenario,
-          turn,
-          driveEvidence,
-        );
-        executions.push(execution);
-        upsertEvidenceFileMetadata(executed.workbook, {
-          evidenceKey: `${runId}|${scenario.testCaseId}|${turn.turnNumber}`,
-          runId,
-          testCaseId: scenario.testCaseId,
-          turnNumber: turn.turnNumber,
-          driveFileId: execution.evidenceDriveFileId,
-          driveFileName:
-            execution.evidenceDriveFileName ??
-            evidenceFileName(scenario.testCaseId, turn.turnNumber),
-          evidenceUrl: execution.evidenceUrl,
-          localCleanPath:
-            execution.evidenceStatus === "EVIDENCE_CAPTURE_ERROR"
-              ? undefined
-              : execution.evidencePath,
-          status: execution.evidenceStatus ?? "EVIDENCE_CAPTURE_ERROR",
-        });
-        appendLatestTurnExecution(
-          executed.workbook,
-          runId,
-          scenario,
-          executions,
-        );
-        applyScenarioResults(executed.workbook, scenario, executions);
-        const scenarioFinished =
-          execution.technicalStatus !== "CAPTURED" ||
-          executions.length === scenario.turns.length;
-        if (retestRun) {
-          updateRetestHistory(
-            executed.workbook,
-            runId,
-            scenario,
-            executions,
-          );
-          if (scenarioFinished) {
-            const successfullyCaptured = applyRetestStatusTransition(
-              executed.workbook,
-              scenario,
-              executions,
-            );
-            if (
-              successfullyCaptured &&
-              !retestRun.finishedIds.includes(scenario.testCaseId)
-            ) {
-              retestRun.finishedIds.push(scenario.testCaseId);
-            }
-            retestRun.updatedAt = new Date();
-            upsertRetestRunMetadata(executed.workbook, retestRun);
-          }
-        }
-        await saveExecutedPgnWorkbook(
-          executed.workbook,
-          config.pgnExecutedWorkbookPath,
-        );
-        console.log(
-          `[Workbook] Saved after ${scenario.testCaseId} turn ${turn.turnNumber}`,
-        );
-        if (execution.combinedResponse) {
-          console.log(`[Bot] ${execution.combinedResponse}`);
-        }
-        console.log(
-          `[Turn ${turn.turnNumber}] ${execution.technicalStatus}; first=${execution.firstResponseMs ?? "n/a"} ms total=${execution.totalResponseMs ?? "n/a"} ms`,
-        );
-        if (execution.technicalStatus !== "CAPTURED") {
-          console.log(
-            `[Scenario] Stopping remaining turns after ${execution.technicalStatus}`,
-          );
-          break;
-        }
-      }
-      executedCount += 1;
-      evidenceUploadedCount += executions.filter(
-        (execution) => execution.evidenceStatus === "EVIDENCE_SYNCED",
-      ).length;
-      if (
-        executions.length === scenario.turns.length &&
-        executions.every((execution) => execution.technicalStatus === "CAPTURED")
-      ) {
-        capturedCount += 1;
-        if (retestRun) {
-          awaitingEvaluationCount += 1;
-        }
-      } else if (
-        executions.some((execution) => execution.technicalStatus === "TIMEOUT")
-      ) {
-        timeoutCount += 1;
-      } else {
-        errorCount += 1;
-      }
+    } finally {
+      await client.close();
+      if (activeClient === client) activeClient = undefined;
     }
 
-    const finalCleanupScenario =
-      selectedScenarios.at(-1) ??
-      (retestRun
-        ? executed.parsed.scenarios.find(
-            (scenario) =>
-              scenario.testCaseId === retestRun.selectedIds.at(-1),
-          )
-        : undefined);
-    if (!finalCleanupScenario) {
-      throw new Error("Could not identify a scenario for final session cleanup");
+    if (retestRun) {
+      failureStage = "saving final retest metadata";
+      retestRun.state = retestRun.selectedIds.every((testCaseId) =>
+        retestRun!.finishedIds.includes(testCaseId),
+      )
+        ? "COMPLETE"
+        : "IN_PROGRESS";
+      retestRun.updatedAt = new Date();
+      upsertRetestRunMetadata(executed.workbook, retestRun);
+      await saveExecutedPgnWorkbook(
+        executed.workbook,
+        config.pgnExecutedWorkbookPath,
+      );
+      workbookProgress = "Final retest metadata saved";
+      console.log(
+        retestRun.state === "COMPLETE"
+          ? "PGN RETEST COMPLETE"
+          : "PGN RETEST CHECKPOINT",
+      );
+      console.log(`Retest Run: ${runId}`);
+      console.log(`Selected: ${selectedScenarios.length}`);
+      if (finalCleanupOnly) {
+        console.log("Execution: Final cleanup retry only");
+      }
+      console.log(`Executed: ${executedCount}`);
+      console.log(`Captured: ${capturedCount}`);
+      console.log(`Timeout: ${timeoutCount}`);
+      console.log(`Errors: ${errorCount}`);
+      console.log(`Skipped by Status: ${skippedByStatusCount}`);
+      console.log(`Evidence Uploaded: ${evidenceUploadedCount}`);
+      console.log(
+        `Workbook: ${relativeToProject(config, config.pgnExecutedWorkbookPath)}`,
+      );
+      console.log(
+        `Evidence Folder: ${driveFolderUrl || driveFolderId || "LOCAL ONLY"}`,
+      );
+      console.log(`Awaiting Evaluation: ${awaitingEvaluationCount}`);
+      if (retestRun.state === "IN_PROGRESS") {
+        console.log(
+          `Remaining in Retest Run: ${retestRun.selectedIds.length - retestRun.finishedIds.length}`,
+        );
+      }
+    } else {
+      console.log(
+        `[Workbook] COMPLETE: ${relativeToProject(config, config.pgnExecutedWorkbookPath)}`,
+      );
     }
-    await resetAndDrainSession(
-      client,
-      config,
-      runId,
-      finalCleanupScenario,
-      executed.workbook,
-      true,
+    stopProgressTimer();
+    const completedAt = new Date();
+    await trackNotification(
+      notifier.runCompleted({
+        ...notificationProgress(completedAt),
+        completedAt,
+        checkpoint: retestRun?.state === "IN_PROGRESS",
+      }),
     );
+    if (periodicProgress) await periodicProgress;
+  } catch (error) {
+    stopProgressTimer();
+    const failedAt = new Date();
+    await trackNotification(
+      notifier.runFailed({
+        ...notificationProgress(failedAt),
+        failedAt,
+        reason: `Technical failure while ${failureStage}.`,
+        workbookProgress,
+        evidenceProgress: `${evidenceUploadedCount} uploaded, ${evidenceUploadErrorCount} upload errors`,
+      }),
+    );
+    if (periodicProgress) await periodicProgress;
+    throw error;
   } finally {
-    await client.close();
+    stopProgressTimer();
+    unregisterInterruptionHandlers();
   }
-
-  if (retestRun) {
-    retestRun.state = retestRun.selectedIds.every((testCaseId) =>
-      retestRun!.finishedIds.includes(testCaseId),
-    )
-      ? "COMPLETE"
-      : "IN_PROGRESS";
-    retestRun.updatedAt = new Date();
-    upsertRetestRunMetadata(executed.workbook, retestRun);
-    await saveExecutedPgnWorkbook(
-      executed.workbook,
-      config.pgnExecutedWorkbookPath,
-    );
-    console.log(
-      retestRun.state === "COMPLETE"
-        ? "PGN RETEST COMPLETE"
-        : "PGN RETEST CHECKPOINT",
-    );
-    console.log(`Retest Run: ${runId}`);
-    console.log(`Selected: ${selectedScenarios.length}`);
-    if (finalCleanupOnly) {
-      console.log("Execution: Final cleanup retry only");
-    }
-    console.log(`Executed: ${executedCount}`);
-    console.log(`Captured: ${capturedCount}`);
-    console.log(`Timeout: ${timeoutCount}`);
-    console.log(`Errors: ${errorCount}`);
-    console.log(`Skipped by Status: ${skippedByStatusCount}`);
-    console.log(`Evidence Uploaded: ${evidenceUploadedCount}`);
-    console.log(
-      `Workbook: ${relativeToProject(config, config.pgnExecutedWorkbookPath)}`,
-    );
-    console.log(
-      `Evidence Folder: ${driveFolderUrl || driveFolderId || "LOCAL ONLY"}`,
-    );
-    console.log(`Awaiting Evaluation: ${awaitingEvaluationCount}`);
-    if (retestRun.state === "IN_PROGRESS") {
-      console.log(
-        `Remaining in Retest Run: ${retestRun.selectedIds.length - retestRun.finishedIds.length}`,
-      );
-    }
-    return;
-  }
-  console.log(
-    `[Workbook] COMPLETE: ${relativeToProject(config, config.pgnExecutedWorkbookPath)}`,
-  );
 }
 
 const entrypoint = process.argv[1];

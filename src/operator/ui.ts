@@ -6,6 +6,7 @@ import {
   log,
   note,
   outro,
+  password,
   select,
   spinner,
   text,
@@ -40,6 +41,13 @@ export interface TextPrompt {
   validate?: (value: string) => string | undefined;
 }
 
+export interface SecretPrompt {
+  message: string;
+  mask?: string;
+  clearOnError?: boolean;
+  validate?: (value: string) => string | undefined;
+}
+
 export interface OperatorUi {
   intro(title: string): void;
   outro(message: string): void;
@@ -49,6 +57,7 @@ export interface OperatorUi {
   ): Promise<Value | undefined>;
   confirm(prompt: ConfirmPrompt): Promise<boolean | undefined>;
   text(prompt: TextPrompt): Promise<string | undefined>;
+  secret(prompt: SecretPrompt): Promise<string | undefined>;
   note(message: string, title?: string): void;
   info(message: string): void;
   success(message: string): void;
@@ -80,6 +89,15 @@ export function createClackUi(): OperatorUi {
     },
     async text(prompt) {
       const result = await text({
+        ...prompt,
+        validate: prompt.validate
+          ? (value) => prompt.validate!(value ?? "")
+          : undefined,
+      });
+      return isCancel(result) ? undefined : result;
+    },
+    async secret(prompt) {
+      const result = await password({
         ...prompt,
         validate: prompt.validate
           ? (value) => prompt.validate!(value ?? "")

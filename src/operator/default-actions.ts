@@ -1,6 +1,7 @@
 import path from "node:path";
 import { loadConfig } from "../config";
 import { REPOSITORY_ROOT } from "../environment";
+import { validateDiscordWebhook } from "../notifications/discord";
 import { runPgnWorkbook } from "../pgn-runner";
 import {
   loginWhatsApp,
@@ -17,7 +18,10 @@ import type { OperatorActions } from "./control-panel";
 import { collectDiagnostics, formatDiagnosticReport } from "./diagnostics";
 import { inspectPgnExecution } from "./pgn-preflight";
 import { runInheritedCommand } from "./process";
-import { runSetupWizard } from "./setup";
+import {
+  configureDiscordNotifications,
+  runSetupWizard,
+} from "./setup";
 import type { OperatorUi } from "./ui";
 
 const SAFE_TEST_FILES = [
@@ -28,6 +32,7 @@ const SAFE_TEST_FILES = [
   "scripts/retest.test.ts",
   "scripts/evidence-migration.test.ts",
   "scripts/operator.test.ts",
+  "scripts/discord.test.ts",
 ];
 
 function scriptPath(name: string): string {
@@ -79,6 +84,11 @@ export function createDefaultActions(ui: OperatorUi): OperatorActions {
       ),
     validateEvidence,
     migrateEvidence,
+    validateDiscord: (sendTest) =>
+      validateDiscordWebhook(loadConfig(), { sendTest }),
+    configureNotifications: async () => {
+      await configureDiscordNotifications(ui);
+    },
     loginWhatsApp: login,
     verifyWhatsApp: () =>
       browserAction("whatsapp-verify.ts", [], () => verifyWhatsApp()),

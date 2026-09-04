@@ -1,4 +1,8 @@
 import { safeGoogleCredentialError } from "../evidence/google-service-account";
+import {
+  safeDiscordError,
+  type DiscordValidationResult,
+} from "../notifications/discord";
 import type { SetupNextAction } from "./setup";
 import type { OperatorUi } from "./ui";
 
@@ -17,6 +21,8 @@ export interface OperatorActions {
   runRetest(args: string[]): Promise<void>;
   validateEvidence(): Promise<{ ready: boolean }>;
   migrateEvidence(): Promise<void>;
+  validateDiscord(sendTest: boolean): Promise<DiscordValidationResult>;
+  configureNotifications(): Promise<void>;
   loginWhatsApp(): Promise<void>;
   verifyWhatsApp(): Promise<void>;
   recreateWhatsApp(): Promise<void>;
@@ -46,9 +52,25 @@ async function attempt<Value>(
     const value = await action();
     return { ok: true, value };
   } catch (error) {
-    ui.error(safeGoogleCredentialError(error));
+    ui.error(
+      safeGoogleCredentialError(new Error(safeDiscordError(error))),
+    );
     return { ok: false };
   }
+}
+
+function discordValidationLines(result: DiscordValidationResult): string {
+  const connectivity =
+    result.connectivity === "ok"
+      ? "OK"
+      : result.connectivity === "failed"
+        ? "FAILED"
+        : "not tested";
+  return [
+    `Enabled ........ ${result.enabled ? "YES" : "NO"}`,
+    `Webhook ........ ${result.configured && result.valid ? "configured" : "not configured"}`,
+    `Connectivity ... ${connectivity}`,
+  ].join("\n");
 }
 
 function parseIds(value: string): string[] {
@@ -354,6 +376,75 @@ async function whatsappMenu(
   }
 }
 
+async function notificationsMenu(
+  ui: OperatorUi,
+  actions: OperatorActions,
+): Promise<boolean> {
+  while (true) {
+    const choice = await ui.select({
+      message: "Notifications",
+      options: [
+        {
+          value: "status",
+          label: "Discord status",
+          hint: "Safely inspect the configured webhook; posts nothing",
+        },
+        { value: "test", label: "Test Discord notification" },
+        { value: "configure", label: "Configure notifications" },
+        { value: "back", label: "Back" },
+      ],
+    });
+    if (choice === undefined) return false;
+    if (choice === "back") return true;
+    if (choice === "configure") {
+      await attempt(
+        ui,
+        "Opening notification settings",
+        actions.configureNotifications,
+      );
+      continue;
+    }
+    if (choice === "status") {
+      const result = await attempt(ui, "Inspecting Discord webhook", () =>
+        actions.validateDiscord(false),
+      );
+      if (result.ok) {
+        ui.note(discordValidationLines(result.value), "Discord notifications");
+        if (result.value.reason) {
+          ui.warn(safeDiscordError(new Error(result.value.reason)));
+        }
+      }
+      continue;
+    }
+
+    const confirmed = await ui.confirm({
+      message: "Send one test notification to the configured Discord channel?",
+      initialValue: false,
+    });
+    if (confirmed === undefined) return false;
+    if (!confirmed) {
+      ui.info("Discord test notification cancelled");
+      continue;
+    }
+    const result = await attempt(ui, "Sending Discord test notification", () =>
+      actions.validateDiscord(true),
+    );
+    if (result.ok) {
+      if (result.value.testNotificationSent) {
+        ui.success("Discord test notification sent");
+      } else if (result.value.testNotificationDeliveryUncertain) {
+        ui.warn(
+          `Discord test notification delivery could not be confirmed; check the channel before retrying: ${safeDiscordError(new Error(result.value.reason ?? "request outcome is unknown"))}`,
+        );
+      } else {
+        ui.warn(
+          `Discord test notification was not sent: ${safeDiscordError(new Error(result.value.reason ?? "validation failed"))}`,
+        );
+      }
+    }
+  }
+}
+
 async function developerMenu(
   ui: OperatorUi,
   actions: OperatorActions,
@@ -363,7 +454,11 @@ async function developerMenu(
       message: "Developer tools",
       options: [
         { value: "check", label: "TypeScript check" },
-        { value: "tests", label: "Safe regression tests", hint: "No WhatsApp or Drive calls" },
+        {
+          value: "tests",
+          label: "Safe regression tests",
+          hint: "No WhatsApp, Drive, or Discord calls",
+        },
         { value: "template", label: "Create legacy workbook template" },
         { value: "back", label: "Back" },
       ],
@@ -393,6 +488,7 @@ export async function runControlPanel(
         { value: "retest", label: "Retest fixed cases" },
         { value: "validate", label: "Validate" },
         { value: "evidence", label: "Evidence" },
+        { value: "notifications", label: "Notifications" },
         { value: "whatsapp", label: "WhatsApp" },
         { value: "setup", label: "Setup" },
         { value: "diagnostics", label: "Diagnostics" },
@@ -413,6 +509,9 @@ export async function runControlPanel(
     if (choice === "retest") keepRunning = await retestMenu(ui, actions);
     if (choice === "validate") keepRunning = await validationMenu(ui, actions);
     if (choice === "evidence") keepRunning = await evidenceMenu(ui, actions);
+    if (choice === "notifications") {
+      keepRunning = await notificationsMenu(ui, actions);
+    }
     if (choice === "whatsapp") keepRunning = await whatsappMenu(ui, actions);
     if (choice === "developer") keepRunning = await developerMenu(ui, actions);
     if (choice === "setup") {

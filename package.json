@@ -7,6 +7,7 @@
     "pgn": "tsx scripts/pgn.ts",
     "setup": "tsx scripts/setup.ts",
     "doctor": "tsx scripts/doctor.ts",
+    "discord:validate": "tsx scripts/discord-validate.ts",
     "data:template": "tsx scripts/create-test-template.ts",
     "evidence:validate": "tsx scripts/evidence-validate.ts",
     "evidence:migrate": "tsx scripts/evidence-migrate.ts",
@@ -24,7 +25,8 @@
     "test:config": "tsx --test scripts/config.test.ts",
     "test:retest": "tsx --test scripts/retest.test.ts",
     "test:evidence": "tsx --test scripts/evidence-migration.test.ts",
-    "test:operator": "tsx --test scripts/operator.test.ts"
+    "test:operator": "tsx --test scripts/operator.test.ts",
+    "test:discord": "tsx --test scripts/discord.test.ts"
   },
   "repository": {
     "type": "git",

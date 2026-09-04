@@ -167,6 +167,14 @@ test("default configuration resolves the repository root independently of cwd", 
     GOOGLE_SERVICE_ACCOUNT_JSON_BASE64: "",
     GOOGLE_SERVICE_ACCOUNT_FILE:
       ".secrets/default-root-service-account.json",
+    DISCORD_NOTIFICATIONS_ENABLED: "false",
+    DISCORD_WEBHOOK_URL: "",
+    DISCORD_PROGRESS_EVERY: "",
+    DISCORD_PROGRESS_MINUTES: "",
+    DISCORD_NOTIFY_START: "",
+    DISCORD_NOTIFY_PROGRESS: "",
+    DISCORD_NOTIFY_COMPLETE: "",
+    DISCORD_NOTIFY_FAILURE: "",
     LEGACY_EVIDENCE_CROP_LEFT: "",
     PGN_TEST_DATA_FILE: "",
     PGN_TEST_REPORT_FILE: "",
@@ -358,4 +366,74 @@ test("fresh-run preparation preserves local environment and credentials", async 
 
   assert((await readFile(envPath)).equals(envBefore));
   assert((await readFile(credentialPath)).equals(credentialsBefore));
+});
+
+test("Discord notification configuration has safe defaults", async (context) => {
+  const repositoryRoot = await temporaryRepository(context);
+  const config = loadConfig({ repositoryRoot, environment: {} });
+
+  assert.equal(config.discordNotificationsEnabled, false);
+  assert.equal(config.discordWebhookUrl, undefined);
+  assert.equal(config.discordProgressEvery, 5);
+  assert.equal(config.discordProgressMinutes, 2);
+  assert.equal(config.discordNotifyStart, true);
+  assert.equal(config.discordNotifyProgress, true);
+  assert.equal(config.discordNotifyComplete, true);
+  assert.equal(config.discordNotifyFailure, true);
+  assert.deepEqual(config.discordConfigurationIssues, []);
+});
+
+test("Discord notification configuration reads overrides and falls back safely", async (context) => {
+  const repositoryRoot = await temporaryRepository(context);
+  const webhookUrl = "https://discord.com/api/webhooks/123456/test-token";
+  const configured = loadConfig({
+    repositoryRoot,
+    environment: {
+      DISCORD_NOTIFICATIONS_ENABLED: "true",
+      DISCORD_WEBHOOK_URL: `  ${webhookUrl}  `,
+      DISCORD_PROGRESS_EVERY: "10",
+      DISCORD_PROGRESS_MINUTES: "3",
+      DISCORD_NOTIFY_START: "false",
+      DISCORD_NOTIFY_PROGRESS: "false",
+      DISCORD_NOTIFY_COMPLETE: "false",
+      DISCORD_NOTIFY_FAILURE: "false",
+    },
+  });
+
+  assert.equal(configured.discordNotificationsEnabled, true);
+  assert.equal(configured.discordWebhookUrl, webhookUrl);
+  assert.equal(configured.discordProgressEvery, 10);
+  assert.equal(configured.discordProgressMinutes, 3);
+  assert.equal(configured.discordNotifyStart, false);
+  assert.equal(configured.discordNotifyProgress, false);
+  assert.equal(configured.discordNotifyComplete, false);
+  assert.equal(configured.discordNotifyFailure, false);
+  assert.deepEqual(configured.discordConfigurationIssues, []);
+
+  const invalid = loadConfig({
+    repositoryRoot,
+    environment: {
+      DISCORD_NOTIFICATIONS_ENABLED: "not-a-boolean",
+      DISCORD_PROGRESS_EVERY: "0",
+      DISCORD_PROGRESS_MINUTES: "not-a-number",
+      DISCORD_NOTIFY_START: "invalid",
+      DISCORD_NOTIFY_COMPLETE: "invalid",
+      DISCORD_NOTIFY_FAILURE: "invalid",
+    },
+  });
+  assert.equal(invalid.discordNotificationsEnabled, false);
+  assert.equal(invalid.discordProgressEvery, 5);
+  assert.equal(invalid.discordProgressMinutes, 2);
+  assert.equal(invalid.discordNotifyStart, false);
+  assert.equal(invalid.discordNotifyProgress, false);
+  assert.equal(invalid.discordNotifyComplete, false);
+  assert.equal(invalid.discordNotifyFailure, false);
+  assert.deepEqual(invalid.discordConfigurationIssues, [
+    "DISCORD_NOTIFICATIONS_ENABLED must be true, false, 1, or 0",
+    "DISCORD_NOTIFY_START must be true, false, 1, or 0",
+    "DISCORD_NOTIFY_COMPLETE must be true, false, 1, or 0",
+    "DISCORD_NOTIFY_FAILURE must be true, false, 1, or 0",
+    "DISCORD_PROGRESS_EVERY must be a whole number of 1 or greater",
+    "DISCORD_PROGRESS_MINUTES must be a whole number of 1 or greater",
+  ]);
 });

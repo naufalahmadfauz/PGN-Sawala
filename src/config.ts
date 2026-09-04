@@ -49,6 +49,15 @@ export interface AppConfig {
   googleDriveConfigurationSource: EnvironmentConfigurationSource;
   googleServiceAccount?: GoogleServiceAccountConfiguration;
   legacyEvidenceCropLeft?: number;
+  discordNotificationsEnabled: boolean;
+  discordWebhookUrl?: string;
+  discordProgressEvery: number;
+  discordProgressMinutes: number;
+  discordNotifyStart: boolean;
+  discordNotifyProgress: boolean;
+  discordNotifyComplete: boolean;
+  discordNotifyFailure: boolean;
+  discordConfigurationIssues: string[];
   target?: WhatsAppTarget;
 }
 
@@ -95,6 +104,55 @@ function textFromEnvironment(
   fallback: string,
 ): string {
   return environment[name]?.trim() || fallback;
+}
+
+function optionalBooleanFromEnvironment(
+  environment: NodeJS.ProcessEnv,
+  name: string,
+  fallback: boolean,
+  invalidFallback = fallback,
+): boolean {
+  try {
+    return booleanFromEnvironment(environment, name, fallback);
+  } catch {
+    return invalidFallback;
+  }
+}
+
+function optionalIntegerFromEnvironment(
+  environment: NodeJS.ProcessEnv,
+  name: string,
+  fallback: number,
+): number {
+  try {
+    return integerFromEnvironment(environment, name, fallback, 1);
+  } catch {
+    return fallback;
+  }
+}
+
+function validOptionalPositiveInteger(
+  environment: NodeJS.ProcessEnv,
+  name: string,
+): boolean {
+  const rawValue = environment[name]?.trim();
+  if (!rawValue) return true;
+  const value = Number(rawValue);
+  return Number.isInteger(value) && value >= 1;
+}
+
+function validOptionalBoolean(
+  environment: NodeJS.ProcessEnv,
+  name: string,
+): boolean {
+  const rawValue = environment[name]?.trim().toLowerCase();
+  return (
+    !rawValue ||
+    rawValue === "true" ||
+    rawValue === "false" ||
+    rawValue === "1" ||
+    rawValue === "0"
+  );
 }
 
 export function normalizeGoogleDriveFolderId(value: string): string {
@@ -281,6 +339,33 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
         : { value }),
     };
   }
+  const discordProgressEvery = optionalIntegerFromEnvironment(
+    environment,
+    "DISCORD_PROGRESS_EVERY",
+    5,
+  );
+  const discordProgressMinutes = optionalIntegerFromEnvironment(
+    environment,
+    "DISCORD_PROGRESS_MINUTES",
+    2,
+  );
+  const discordProgressIntervalsValid =
+    validOptionalPositiveInteger(environment, "DISCORD_PROGRESS_EVERY") &&
+    validOptionalPositiveInteger(environment, "DISCORD_PROGRESS_MINUTES");
+  const discordConfigurationIssues = [
+    ...[
+      "DISCORD_NOTIFICATIONS_ENABLED",
+      "DISCORD_NOTIFY_START",
+      "DISCORD_NOTIFY_PROGRESS",
+      "DISCORD_NOTIFY_COMPLETE",
+      "DISCORD_NOTIFY_FAILURE",
+    ]
+      .filter((name) => !validOptionalBoolean(environment, name))
+      .map((name) => `${name} must be true, false, 1, or 0`),
+    ...["DISCORD_PROGRESS_EVERY", "DISCORD_PROGRESS_MINUTES"]
+      .filter((name) => !validOptionalPositiveInteger(environment, name))
+      .map((name) => `${name} must be a whole number of 1 or greater`),
+  ];
   const googleDriveEvidenceEnabled = booleanFromEnvironment(
     environment,
     "GOOGLE_DRIVE_EVIDENCE_ENABLED",
@@ -363,6 +448,41 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
     ),
     googleServiceAccount,
     legacyEvidenceCropLeft,
+    discordNotificationsEnabled: optionalBooleanFromEnvironment(
+      environment,
+      "DISCORD_NOTIFICATIONS_ENABLED",
+      false,
+    ),
+    discordWebhookUrl: environment.DISCORD_WEBHOOK_URL?.trim() || undefined,
+    discordProgressEvery,
+    discordProgressMinutes,
+    discordNotifyStart: optionalBooleanFromEnvironment(
+      environment,
+      "DISCORD_NOTIFY_START",
+      true,
+      false,
+    ),
+    discordNotifyProgress:
+      discordProgressIntervalsValid &&
+      optionalBooleanFromEnvironment(
+        environment,
+        "DISCORD_NOTIFY_PROGRESS",
+        true,
+        false,
+      ),
+    discordNotifyComplete: optionalBooleanFromEnvironment(
+      environment,
+      "DISCORD_NOTIFY_COMPLETE",
+      true,
+      false,
+    ),
+    discordNotifyFailure: optionalBooleanFromEnvironment(
+      environment,
+      "DISCORD_NOTIFY_FAILURE",
+      true,
+      false,
+    ),
+    discordConfigurationIssues,
     target: readTarget(environment),
   };
 }

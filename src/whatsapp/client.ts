@@ -32,6 +32,10 @@ interface QrInspection {
   transitions: number;
 }
 
+interface WhatsAppClientOptions {
+  handleProcessSignals?: boolean;
+}
+
 export class AuthenticationRequiredError extends Error {
   constructor(message = "WhatsApp authentication is required") {
     super(message);
@@ -43,7 +47,10 @@ export class WhatsAppClient {
   private context?: BrowserContext;
   private page?: Page;
 
-  constructor(private readonly config: AppConfig) {}
+  constructor(
+    private readonly config: AppConfig,
+    private readonly options: WhatsAppClientOptions = {},
+  ) {}
 
   async open(): Promise<void> {
     await Promise.all([
@@ -61,6 +68,8 @@ export class WhatsAppClient {
       viewport: { width: 1440, height: 1000 },
       locale: "en-US",
       args: ["--disable-dev-shm-usage"],
+      handleSIGINT: this.options.handleProcessSignals ?? true,
+      handleSIGTERM: this.options.handleProcessSignals ?? true,
     };
     if (this.config.browserChannel) {
       launchOptions.channel = this.config.browserChannel;

@@ -9,8 +9,15 @@ import {
 } from "../evidence/google-service-account";
 import {
   REPOSITORY_ROOT,
+  loadEnvironment,
   synchronizeEnvironmentFileUpdates,
 } from "../environment";
+import {
+  safeDiscordError,
+  validateDiscordWebhook,
+  validateDiscordWebhookUrl,
+  type DiscordValidationResult,
+} from "../notifications/discord";
 import {
   collectDiagnostics,
   formatSetupChecklist,
@@ -29,12 +36,33 @@ const CONFIGURATION_KEYS = [
   "GOOGLE_SERVICE_ACCOUNT_JSON",
   "GOOGLE_SERVICE_ACCOUNT_JSON_BASE64",
   "GOOGLE_SERVICE_ACCOUNT_FILE",
+  "DISCORD_NOTIFICATIONS_ENABLED",
+  "DISCORD_WEBHOOK_URL",
+  "DISCORD_PROGRESS_EVERY",
+  "DISCORD_PROGRESS_MINUTES",
+  "DISCORD_NOTIFY_START",
+  "DISCORD_NOTIFY_PROGRESS",
 ] as const;
+const DISCORD_SETUP_KEYS = [
+  "DISCORD_NOTIFICATIONS_ENABLED",
+  "DISCORD_WEBHOOK_URL",
+  "DISCORD_PROGRESS_EVERY",
+  "DISCORD_PROGRESS_MINUTES",
+  "DISCORD_NOTIFY_START",
+  "DISCORD_NOTIFY_PROGRESS",
+] as const;
+type DiscordSetupKey = (typeof DISCORD_SETUP_KEYS)[number];
 
-export interface SetupDependencies {
+export interface DiscordSetupDependencies {
   projectRoot?: string;
-  platform?: NodeJS.Platform;
   environment?: NodeJS.ProcessEnv;
+  testDiscordWebhook?: (
+    webhookUrl: string,
+  ) => Promise<DiscordValidationResult>;
+}
+
+export interface SetupDependencies extends DiscordSetupDependencies {
+  platform?: NodeJS.Platform;
   diagnose?: (checkDriveAccess: boolean) => Promise<DiagnosticReport>;
   installChromium?: (withDependencies: boolean) => Promise<void>;
   loginWhatsApp?: () => Promise<void>;
@@ -173,6 +201,301 @@ function configuredValue(
   return environment[name] ?? fileValues[name] ?? "";
 }
 
+function configuredBoolean(
+  name: (typeof CONFIGURATION_KEYS)[number],
+  fileValues: Record<string, string>,
+  environment: NodeJS.ProcessEnv,
+  fallback: boolean,
+): boolean {
+  const value = configuredValue(name, fileValues, environment).trim();
+  if (!value) return fallback;
+  if (/^(?:true|1)$/i.test(value)) return true;
+  if (/^(?:false|0)$/i.test(value)) return false;
+  return fallback;
+}
+
+function configuredPositiveInteger(
+  name: (typeof CONFIGURATION_KEYS)[number],
+  fileValues: Record<string, string>,
+  environment: NodeJS.ProcessEnv,
+  fallback: number,
+): number {
+  const value = Number(configuredValue(name, fileValues, environment));
+  return Number.isInteger(value) && value >= 1 ? value : fallback;
+}
+
+async function defaultTestDiscordWebhook(
+  webhookUrl: string,
+): Promise<DiscordValidationResult> {
+  return validateDiscordWebhook(
+    {
+      discordNotificationsEnabled: true,
+      discordWebhookUrl: webhookUrl,
+    },
+    { sendTest: true },
+  );
+}
+
+async function promptDiscordUpdates(
+  ui: OperatorUi,
+  fileValues: Record<string, string>,
+  environment: NodeJS.ProcessEnv,
+  testDiscordWebhook: (webhookUrl: string) => Promise<DiscordValidationResult>,
+  processManaged: ReadonlySet<DiscordSetupKey>,
+): Promise<Record<string, string> | undefined> {
+  const currentlyEnabled = configuredBoolean(
+    "DISCORD_NOTIFICATIONS_ENABLED",
+    fileValues,
+    environment,
+    false,
+  );
+  const updates: Record<string, string> = {};
+  let enabled = currentlyEnabled;
+  if (processManaged.has("DISCORD_NOTIFICATIONS_ENABLED")) {
+    ui.warn(
+      "Discord enablement is managed by the process environment. Update that environment or Codespaces Secret instead of .env.",
+    );
+  } else {
+    const selected = await ui.confirm({
+      message: "Enable Discord notifications?",
+      initialValue: currentlyEnabled,
+    });
+    if (selected === undefined) return undefined;
+    enabled = selected;
+    updates.DISCORD_NOTIFICATIONS_ENABLED = String(enabled);
+  }
+  if (!enabled) return updates;
+
+  const existingWebhook = configuredValue(
+    "DISCORD_WEBHOOK_URL",
+    fileValues,
+    environment,
+  );
+  const existingValidation = validateDiscordWebhookUrl(existingWebhook);
+  let webhookUrl: string | undefined;
+  if (processManaged.has("DISCORD_WEBHOOK_URL")) {
+    if (existingValidation.valid) {
+      webhookUrl = existingValidation.url;
+      ui.info(
+        "The Discord webhook is managed by the process environment and remains hidden.",
+      );
+    } else {
+      ui.warn(
+        "The process-managed Discord webhook is missing or invalid. Update that environment or Codespaces Secret; .env cannot override it.",
+      );
+    }
+  } else if (existingValidation.valid) {
+    const keep = await ui.confirm({
+      message: "Keep the currently configured Discord webhook?",
+      initialValue: true,
+    });
+    if (keep === undefined) return undefined;
+    if (keep) {
+      webhookUrl = existingValidation.url;
+    } else {
+      const replacement = await ui.secret({
+        message: "Discord Incoming Webhook URL",
+        mask: "*",
+        clearOnError: true,
+        validate: (value) => {
+          const validation = validateDiscordWebhookUrl(value);
+          return validation.valid ? undefined : validation.reason;
+        },
+      });
+      if (replacement === undefined) return undefined;
+      const validation = validateDiscordWebhookUrl(replacement);
+      if (!validation.valid) return undefined;
+      webhookUrl = validation.url;
+      updates.DISCORD_WEBHOOK_URL = webhookUrl;
+    }
+  } else {
+    const entered = await ui.secret({
+      message: "Discord Incoming Webhook URL",
+      mask: "*",
+      clearOnError: true,
+      validate: (value) => {
+        const validation = validateDiscordWebhookUrl(value);
+        return validation.valid ? undefined : validation.reason;
+      },
+    });
+    if (entered === undefined) return undefined;
+    const validation = validateDiscordWebhookUrl(entered);
+    if (!validation.valid) return undefined;
+    webhookUrl = validation.url;
+    updates.DISCORD_WEBHOOK_URL = webhookUrl;
+  }
+
+  const managedProgressKeys = [
+    "DISCORD_NOTIFY_PROGRESS",
+    "DISCORD_PROGRESS_EVERY",
+    "DISCORD_PROGRESS_MINUTES",
+  ].filter((name): name is DiscordSetupKey =>
+    processManaged.has(name as DiscordSetupKey),
+  );
+  if (managedProgressKeys.length) {
+    ui.warn(
+      `Discord progress settings are managed by the process environment (${managedProgressKeys.join(", ")}) and were left unchanged.`,
+    );
+  } else {
+    const currentProgressEnabled = configuredBoolean(
+      "DISCORD_NOTIFY_PROGRESS",
+      fileValues,
+      environment,
+      true,
+    );
+    const currentProgressEvery = configuredPositiveInteger(
+      "DISCORD_PROGRESS_EVERY",
+      fileValues,
+      environment,
+      5,
+    );
+    const currentProgressMinutes = configuredPositiveInteger(
+      "DISCORD_PROGRESS_MINUTES",
+      fileValues,
+      environment,
+      2,
+    );
+    const progressChoice = await ui.select({
+      message: "Discord progress updates",
+      options: [
+        {
+          value: "5",
+          label: "Every 5 scenarios",
+          hint: `or every ${currentProgressMinutes} minutes`,
+        },
+        {
+          value: "10",
+          label: "Every 10 scenarios",
+          hint: `or every ${currentProgressMinutes} minutes`,
+        },
+        { value: "final", label: "Final result only" },
+        { value: "custom", label: "Custom frequency" },
+      ],
+      initialValue: !currentProgressEnabled
+        ? "final"
+        : currentProgressEvery === 5
+          ? "5"
+          : currentProgressEvery === 10
+            ? "10"
+            : "custom",
+    });
+    if (progressChoice === undefined) return undefined;
+    const finalOnly = progressChoice === "final";
+    updates.DISCORD_NOTIFY_PROGRESS = String(!finalOnly);
+    if (finalOnly) {
+      if (processManaged.has("DISCORD_NOTIFY_START")) {
+        ui.warn(
+          "Start notifications remain process-managed, so the final-only preset cannot change them.",
+        );
+      } else {
+        updates.DISCORD_NOTIFY_START = "false";
+      }
+    }
+    if (progressChoice === "5" || progressChoice === "10") {
+      updates.DISCORD_PROGRESS_EVERY = progressChoice;
+      updates.DISCORD_PROGRESS_MINUTES = String(currentProgressMinutes);
+    } else if (progressChoice === "custom") {
+      const every = await ui.text({
+        message: "Scenarios between Discord progress updates",
+        initialValue: String(currentProgressEvery),
+        validate: (value) =>
+          Number.isInteger(Number(value)) && Number(value) >= 1
+            ? undefined
+            : "Enter a whole number of 1 or greater",
+      });
+      if (every === undefined) return undefined;
+      const minutes = await ui.text({
+        message: "Minutes between Discord progress updates",
+        initialValue: String(currentProgressMinutes),
+        validate: (value) =>
+          Number.isInteger(Number(value)) && Number(value) >= 1
+            ? undefined
+            : "Enter a whole number of 1 or greater",
+      });
+      if (minutes === undefined) return undefined;
+      updates.DISCORD_PROGRESS_EVERY = String(Number(every));
+      updates.DISCORD_PROGRESS_MINUTES = String(Number(minutes));
+    }
+  }
+
+  if (!webhookUrl) return updates;
+  const sendTest = await ui.confirm({
+    message: "Send one visible Discord test notification now?",
+    initialValue: false,
+  });
+  if (sendTest === undefined) return undefined;
+  if (sendTest) {
+    try {
+      const result = await ui.task(
+        "Sending one Discord test notification",
+        () => testDiscordWebhook(webhookUrl),
+        "Discord test request completed",
+      );
+      if (result.testNotificationSent) {
+        ui.success("Discord test notification sent.");
+      } else if (result.testNotificationDeliveryUncertain) {
+        ui.warn(
+          `Discord test notification delivery could not be confirmed; check the channel before retrying: ${safeDiscordError(new Error(result.reason ?? "request outcome is unknown"), webhookUrl)}`,
+        );
+      } else {
+        ui.warn(
+          `Discord test notification was not sent: ${safeDiscordError(new Error(result.reason ?? "validation failed"), webhookUrl)}`,
+        );
+      }
+    } catch (error) {
+      ui.warn(
+        `Discord test notification delivery could not be confirmed; check the channel before retrying: ${safeDiscordError(error, webhookUrl)}`,
+      );
+    }
+  }
+  return updates;
+}
+
+export async function configureDiscordNotifications(
+  ui: OperatorUi,
+  dependencies: DiscordSetupDependencies = {},
+): Promise<boolean> {
+  const projectRoot = path.resolve(dependencies.projectRoot ?? REPOSITORY_ROOT);
+  const loadedEnvironment = loadEnvironment({
+    repositoryRoot: projectRoot,
+    values: dependencies.environment ?? process.env,
+  });
+  const environment = loadedEnvironment.values;
+  const fileValues = await readEnvironmentValues(projectRoot);
+  const updates = await promptDiscordUpdates(
+    ui,
+    fileValues,
+    environment,
+    dependencies.testDiscordWebhook ?? defaultTestDiscordWebhook,
+    new Set(
+      DISCORD_SETUP_KEYS.filter(
+        (name) => loadedEnvironment.sourceFor(name) === "process environment",
+      ),
+    ),
+  );
+  if (!updates) {
+    ui.info("Notification configuration cancelled");
+    return false;
+  }
+  if (Object.keys(updates).length === 0) {
+    ui.info("No notification settings were changed.");
+    return true;
+  }
+  await ui.task(
+    "Writing notification settings safely",
+    () => writeEnvironmentUpdates(projectRoot, updates),
+    "Notification settings saved",
+  );
+  if (
+    dependencies.environment === undefined &&
+    projectRoot === REPOSITORY_ROOT
+  ) {
+    synchronizeEnvironmentFileUpdates(updates);
+  }
+  ui.success("Notification settings saved without displaying the webhook.");
+  return true;
+}
+
 function cancelled(ui: OperatorUi): SetupResult {
   ui.cancel("Setup cancelled");
   return {
@@ -189,7 +512,11 @@ export async function runSetupWizard(
 ): Promise<SetupResult> {
   const projectRoot = path.resolve(dependencies.projectRoot ?? REPOSITORY_ROOT);
   const platform = dependencies.platform ?? process.platform;
-  const environment = dependencies.environment ?? process.env;
+  const loadedEnvironment = loadEnvironment({
+    repositoryRoot: projectRoot,
+    values: dependencies.environment ?? process.env,
+  });
+  const environment = loadedEnvironment.values;
   const diagnose =
     dependencies.diagnose ??
     ((checkDriveAccess: boolean) =>
@@ -198,6 +525,7 @@ export async function runSetupWizard(
         platform,
         environment,
         checkDriveAccess,
+        checkDiscordAccess: false,
       }));
   const installChromium =
     dependencies.installChromium ??
@@ -399,6 +727,20 @@ export async function runSetupWizard(
         }
       }
     }
+
+    const discordUpdates = await promptDiscordUpdates(
+      ui,
+      fileValues,
+      environment,
+      dependencies.testDiscordWebhook ?? defaultTestDiscordWebhook,
+      new Set(
+        DISCORD_SETUP_KEYS.filter(
+          (name) => loadedEnvironment.sourceFor(name) === "process environment",
+        ),
+      ),
+    );
+    if (!discordUpdates) return cancelled(ui);
+    Object.assign(updates, discordUpdates);
 
     await ui.task(
       "Writing .env safely",

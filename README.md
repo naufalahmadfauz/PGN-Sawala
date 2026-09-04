@@ -12,7 +12,7 @@ npm run setup
 npm run pgn
 ```
 
-The setup wizard inspects Node.js, npm, dependencies, Playwright Chromium, the PGN workbooks, `.env`, Google Drive configuration, browser display support, and the saved WhatsApp profile. It can safely create or update `.env`, validate a service-account file, install Chromium, and optionally open WhatsApp login. Credential values and profile contents are never displayed.
+The setup wizard inspects Node.js, npm, dependencies, Playwright Chromium, the PGN workbooks, `.env`, Google Drive configuration, optional Discord notifications, browser display support, and the saved WhatsApp profile. It can safely create or update `.env`, validate a service-account file, configure a Discord Incoming Webhook through a masked prompt, install Chromium, and optionally open WhatsApp login. Credential values, webhook URLs, and profile contents are never displayed.
 
 `npm run pgn` provides one interactive entry point for:
 
@@ -20,6 +20,7 @@ The setup wizard inspects Node.js, npm, dependencies, Playwright Chromium, the P
 - approved retest validation, execution, and resume
 - workbook, evidence, and Drive validation
 - evidence migration
+- Discord notification status, testing, and configuration
 - WhatsApp login, verification, and explicit authentication recreation
 - setup and diagnostics
 - TypeScript checks and safe regression tests
@@ -50,6 +51,8 @@ The direct commands remain available for automation and experienced operators:
 - `npm run test:pgn:retest` executes only approved retest scenarios.
 - `npm run evidence:validate` validates existing local evidence, creates three cleaned previews, and optionally checks Drive access without contacting WhatsApp.
 - `npm run evidence:migrate` backs up the completed workbook, cleans and uploads existing evidence, and writes hyperlinks without contacting WhatsApp.
+- `npm run discord:validate` safely inspects the configured Discord webhook with `GET` and does not post a message.
+- `npm run discord:validate -- --send-test` explicitly posts one Discord test notification.
 - `npm run test:response-collector` runs deterministic delayed-message and hard-timeout tests without opening WhatsApp.
 - `npm run test:session-reset` tests reset confirmation and failure handling without opening WhatsApp.
 - `npm run test:workbook-writer` verifies result writes preserve the source XLSX table metadata.
@@ -57,6 +60,7 @@ The direct commands remain available for automation and experienced operators:
 - `npm run test:retest` verifies retest selection and history behavior with temporary workbook fixtures.
 - `npm run test:evidence` verifies evidence migration with temporary files and mocked Drive operations.
 - `npm run test:operator` verifies setup, diagnostics, menus, cancellation, and platform behavior with mocks only.
+- `npm run test:discord` verifies webhook lifecycle, throttling, retries, redaction, and signal handling with mocked HTTP only.
 - `npm run data:template` creates a starter legacy test-case workbook without overwriting an existing one.
 - `npm run check` runs the TypeScript compiler.
 
@@ -67,6 +71,29 @@ All commands load the repository-root `.env` through the central configuration m
 Configure either `PGN_WHATSAPP_PHONE` (international digits, without `+`) or `PGN_WHATSAPP_CHAT`. A phone number is preferred when both are present because the direct WhatsApp chat URL avoids ambiguous chat-name matches. The harness verifies the open conversation header against that target and confirms each outgoing WhatsApp message before collecting a response.
 
 The authenticated profile is fixed at `.whatsapp-profile/`. Data files are restricted to `data/`, and generated reports are restricted to `reports/`. The profile, `.env`, `.secrets/`, service-account JSON files, QR images, evidence, diagnostics, and executed workbooks are gitignored. Treat the profile and credentials as secrets and do not share or commit them. Fresh-run preparation only archives and replaces generated test workbooks; it never removes `.env` or `.secrets/`.
+
+### Discord Notifications
+
+Discord notifications are optional and disabled by default. They use only a Discord Incoming Webhook; no bot token, Gateway connection, Discord application, OAuth flow, or Discord SDK is used. Treat `DISCORD_WEBHOOK_URL` as a secret and store it only in the gitignored `.env`, a Codespaces Secret, or another secret environment variable. Setup accepts it through a masked prompt and never displays an existing value. For Discord values supplied by the higher-precedence process environment or Codespaces Secrets, Setup leaves those keys unchanged, directs you to update their source, and can still configure independent `.env` settings.
+
+The Notifications submenu in `npm run pgn` can show Discord status, send one explicitly confirmed test message, or update notification settings. `npm run doctor` reports only whether notifications are enabled and whether the webhook is configured; it does not contact Discord. `npm run discord:validate` performs a non-posting webhook inspection. A visible test message is sent only when `--send-test` is supplied or an operator explicitly confirms the test in Setup or the Notifications submenu.
+
+The available settings are:
+
+```dotenv
+DISCORD_NOTIFICATIONS_ENABLED=false
+DISCORD_WEBHOOK_URL=
+DISCORD_PROGRESS_EVERY=5
+DISCORD_PROGRESS_MINUTES=2
+DISCORD_NOTIFY_START=true
+DISCORD_NOTIFY_PROGRESS=true
+DISCORD_NOTIFY_COMPLETE=true
+DISCORD_NOTIFY_FAILURE=true
+```
+
+An active full or Ready-for-Retest run creates one live status message, edits it at the configured scenario or time interval, finalizes it, and posts a fresh completion or technical-failure event. An incomplete retest batch is labeled as a checkpoint instead of a completed retest. Setup offers progress every 5 scenarios, every 10 scenarios, final only, or a custom scenario/time cadence; the final-only preset disables start and progress messages. Start, progress, completion, and failure events can also be controlled independently with the advanced flags above.
+
+Notification delivery is fail-open. Timeouts, rate limits, deleted webhooks, malformed responses, and other Discord failures produce a redacted warning but never stop execution or alter workbook results. Discord payloads contain only operational identifiers, counts, timing, technical status, evidence counts, and the executed workbook basename. They never include WhatsApp messages, bot responses, phone numbers, screenshots, credentials, semantic Pass/Fail decisions, or automatic mentions.
 
 ### Google Drive Evidence
 

@@ -7,6 +7,12 @@ import {
   safeGoogleCredentialError,
 } from "../evidence/google-service-account";
 import { REPOSITORY_ROOT } from "../environment";
+import {
+  safeDiscordError,
+  validateDiscordWebhook,
+  validateDiscordWebhookUrl,
+  type DiscordValidationResult,
+} from "../notifications/discord";
 import { detectBrowserRuntime, type BrowserRuntimePlan } from "./browser-runtime";
 import { commandAvailable, runProcess } from "./process";
 
@@ -42,6 +48,8 @@ export interface DiagnosticDependencies {
   hasCommand?: (command: string, args?: readonly string[]) => Promise<boolean>;
   validateDrive?: (config: AppConfig) => Promise<void>;
   checkDriveAccess?: boolean;
+  inspectDiscord?: (config: AppConfig) => Promise<DiscordValidationResult>;
+  checkDiscordAccess?: boolean;
 }
 
 async function defaultPathExists(filePath: string): Promise<boolean> {
@@ -325,6 +333,74 @@ export async function collectDiagnostics(
     }
   }
 
+  if (!config) {
+    add(
+      "discord",
+      "Discord notifications",
+      "warn",
+      "configuration unavailable; connectivity not tested",
+    );
+  } else {
+    const webhook = validateDiscordWebhookUrl(config.discordWebhookUrl);
+    if (config.discordConfigurationIssues.length) {
+      add(
+        "discord",
+        "Discord notifications",
+        "warn",
+        `invalid setting(s): ${config.discordConfigurationIssues.join("; ")}; affected notifications are disabled; connectivity not tested`,
+      );
+    } else if (!config.discordNotificationsEnabled) {
+      add(
+        "discord",
+        "Discord notifications",
+        "warn",
+        `disabled; webhook ${webhook.valid ? "configured" : "not configured"}; connectivity not tested`,
+      );
+    } else if (!webhook.valid) {
+      add(
+        "discord",
+        "Discord notifications",
+        "warn",
+        "enabled; webhook not configured; connectivity not tested",
+      );
+    } else if (dependencies.checkDiscordAccess === true) {
+      try {
+        const result = dependencies.inspectDiscord
+          ? await dependencies.inspectDiscord(config)
+          : await validateDiscordWebhook(config);
+        if (result.connectivity === "ok") {
+          add(
+            "discord",
+            "Discord notifications",
+            "ok",
+            "enabled; webhook configured; connectivity verified; no notification sent",
+          );
+        } else {
+          add(
+            "discord",
+            "Discord notifications",
+            "warn",
+            `enabled; webhook configured; connectivity failed: ${safeDiscordError(new Error(result.reason ?? "inspection failed"), config.discordWebhookUrl)}`,
+          );
+        }
+      } catch (error) {
+        add(
+          "discord",
+          "Discord notifications",
+          "warn",
+          `enabled; webhook configured; connectivity failed: ${safeDiscordError(error, config.discordWebhookUrl)}`,
+        );
+      }
+    } else {
+      add(
+        "discord",
+        "Discord notifications",
+        "ok",
+        "enabled; webhook configured; connectivity not tested",
+      );
+    }
+  }
+
   const browserRuntime = await detectBrowserRuntime({
     platform,
     environment,
@@ -404,6 +480,9 @@ export function formatSetupInspection(report: DiagnosticReport): string {
         }
         return `${symbol} Google Drive configuration: needs attention`;
       }
+      if (check.id === "discord") {
+        return `${symbol} Discord notifications: ${check.detail}`;
+      }
       if (check.id === "browser-runtime") {
         return `${symbol} Browser runtime: ${friendlyBrowserRuntime(report)}`;
       }
@@ -427,6 +506,7 @@ export function formatSetupChecklist(report: DiagnosticReport): string {
   const npm = checkById(report, "npm");
   const environment = checkById(report, "env");
   const drive = checkById(report, "drive");
+  const discord = checkById(report, "discord");
   const browserRuntime = checkById(report, "browser-runtime");
   const lines = [
     successfulCheckLine(
@@ -481,6 +561,15 @@ export function formatSetupChecklist(report: DiagnosticReport): string {
     lines.push("! Google Drive access not checked; Drive is disabled");
   } else {
     lines.push("✗ Google Drive access not verified");
+  }
+  if (discord?.status === "ok" && /verified/i.test(discord.detail)) {
+    lines.push("✓ Discord webhook verified; no notification sent");
+  } else if (discord?.status === "ok") {
+    lines.push("✓ Discord webhook configured; connectivity not tested");
+  } else if (/disabled/i.test(discord?.detail ?? "")) {
+    lines.push("! Discord notifications disabled");
+  } else {
+    lines.push("! Discord notifications need attention");
   }
   if (browserRuntime?.status === "error") {
     lines.push("✗ Browser runtime unavailable");
