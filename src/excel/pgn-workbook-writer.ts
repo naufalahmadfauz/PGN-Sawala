@@ -100,9 +100,13 @@ function appendTechnicalNote(cell: Cell, note: string): void {
   cell.value = existing ? `${existing}\n${note}` : note;
 }
 
+function setNumberFormat(cell: Cell, numberFormat: string): void {
+  cell.style = { ...structuredClone(cell.style), numFmt: numberFormat };
+}
+
 function writeExecutionDate(cell: Cell, value: Date): void {
   cell.value = value;
-  cell.numFmt = "yyyy-mm-dd hh:mm:ss";
+  setNumberFormat(cell, "yyyy-mm-dd hh:mm:ss");
 }
 
 function secondsFromMilliseconds(milliseconds: number): number {
@@ -423,7 +427,7 @@ function applyKnowledgeBaseExecution(
     if (execution.totalResponseMs !== undefined) {
       const responseTime = worksheet.getCell(row, 10);
       responseTime.value = secondsFromMilliseconds(execution.totalResponseMs);
-      responseTime.numFmt = '0.00" s"';
+      setNumberFormat(responseTime, '0.00" s"');
     }
     writeExecutionDate(worksheet.getCell(row, 11), execution.completedAt);
     if (execution.evidenceUrl) {
@@ -482,12 +486,12 @@ function applyNegativeExecution(
             `Turn ${execution.turn.turnNumber}: ${execution.totalResponseMs} ms`,
         )
         .join("\n");
-      responseTime.numFmt = "@";
+      setNumberFormat(responseTime, "@");
     } else {
       responseTime.value = secondsFromMilliseconds(
         executions[0].totalResponseMs!,
       );
-      responseTime.numFmt = "0.00";
+      setNumberFormat(responseTime, "0.00");
     }
   }
 
@@ -742,6 +746,51 @@ export function appendPostResetDrainTranscript(
   ]);
   completionRow.alignment = { vertical: "top", wrapText: true };
   completionRow.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
+}
+
+export type RecoveryTranscriptEvent =
+  | "RUN_PREPARED"
+  | "RUN_RESUMED"
+  | "RUN_INTERRUPTED"
+  | "RUN_FAILED"
+  | "RUN_COMPLETED"
+  | "RUN_ABANDONED"
+  | "RECOVERY_RECONCILED"
+  | "SCENARIO_ATTEMPT_STARTED"
+  | "SCENARIO_ATTEMPT_COMPLETED"
+  | "SCENARIO_ATTEMPT_FAILED"
+  | "SCENARIO_SKIPPED_BY_OPERATOR";
+
+export function appendRecoveryTranscriptEvent(
+  workbook: ExcelJS.Workbook,
+  options: {
+    runId: string;
+    event: RecoveryTranscriptEvent;
+    message: string;
+    timestamp?: Date;
+    scenario?: PgnTestScenario;
+  },
+): void {
+  const worksheet = ensureTranscriptWorksheet(workbook);
+  const row = worksheet.addRow([
+    options.runId,
+    options.scenario?.testCaseId ?? "",
+    options.scenario?.sheetName ?? "",
+    options.scenario?.sourceRowNumber ?? null,
+    null,
+    "RECOVERY_SYSTEM",
+    options.message,
+    options.timestamp ?? new Date(),
+    null,
+    null,
+    options.event,
+    "",
+    "",
+    "",
+    "",
+  ]);
+  row.alignment = { vertical: "top", wrapText: true };
+  row.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
 }
 
 export async function saveExecutedPgnWorkbook(

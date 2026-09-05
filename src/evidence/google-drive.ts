@@ -24,6 +24,10 @@ export interface EvidenceDrivePublisher {
   readonly retestFolderPrefix: string;
   readonly serviceAccountEmail?: string;
   validateParentFolder(): Promise<DriveEvidenceItem>;
+  validateRunFolder(
+    folderId: string,
+    expectedFolderName?: string,
+  ): Promise<DriveEvidenceItem>;
   ensureRunFolder(
     runId: string,
     existingFolderId?: string,
@@ -114,6 +118,30 @@ export class GoogleDriveEvidencePublisher implements EvidenceDrivePublisher {
       );
     }
     return requireDriveItem(response.data, "configured parent folder");
+  }
+
+  async validateRunFolder(
+    folderId: string,
+    expectedFolderName?: string,
+  ): Promise<DriveEvidenceItem> {
+    const response = await this.drive.files.get({
+      fileId: folderId,
+      fields: "id,name,mimeType,parents,trashed,webViewLink",
+      supportsAllDrives: true,
+    });
+    if (
+      response.data.mimeType !== FOLDER_MIME_TYPE ||
+      response.data.trashed ||
+      !response.data.parents?.includes(this.parentFolderId)
+    ) {
+      throw new Error("Stored Google Drive run folder is unavailable or misplaced");
+    }
+    if (expectedFolderName && response.data.name !== expectedFolderName) {
+      throw new Error(
+        `Stored Google Drive run folder must be named ${expectedFolderName}`,
+      );
+    }
+    return requireDriveItem(response.data, "stored evidence folder", true);
   }
 
   async ensureRunFolder(

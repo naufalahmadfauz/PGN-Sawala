@@ -23,6 +23,17 @@ import {
   runSetupWizard,
 } from "./setup";
 import type { OperatorUi } from "./ui";
+import {
+  abandonRecoveryRun,
+  repairRecoveryProgress,
+  skipRecoveryScenario,
+  validateRecoveryRun,
+} from "../recovery/recovery-service";
+import {
+  assertRecoveryRunExecutable,
+  discoverRecoveryRun,
+  readRecoveryRun,
+} from "../recovery/run-state";
 
 const SAFE_TEST_FILES = [
   "scripts/response-collector.test.ts",
@@ -33,6 +44,8 @@ const SAFE_TEST_FILES = [
   "scripts/evidence-migration.test.ts",
   "scripts/operator.test.ts",
   "scripts/discord.test.ts",
+  "scripts/recovery.test.ts",
+  "scripts/recovery-demo.test.ts",
 ];
 
 function scriptPath(name: string): string {
@@ -61,6 +74,30 @@ export function createDefaultActions(ui: OperatorUi): OperatorActions {
     browserAction("whatsapp-login.ts", [], () => loginWhatsApp());
 
   return {
+    inspectRecovery: () => discoverRecoveryRun(loadConfig().projectRoot),
+    validateRecovery: (runId) => validateRecoveryRun(loadConfig(), runId),
+    resumeRecovery: async (runId, acceptSourceDrift = false) => {
+      const config = loadConfig();
+      const { state } = await readRecoveryRun(config.projectRoot, runId);
+      assertRecoveryRunExecutable(state);
+      const mode = state.mode;
+      const entrypoint = mode === "retest" ? "retest-pgn.ts" : "run-pgn.ts";
+      const args = [
+        "--resume",
+        runId,
+        ...(acceptSourceDrift ? ["--accept-source-drift"] : []),
+      ];
+      await browserAction(
+        entrypoint,
+        args,
+        () => runPgnWorkbook(args, mode),
+        async () => (await inspectPgnExecution(args, mode, config)).browserRequired,
+      );
+    },
+    skipRecoveryScenario: (runId) => skipRecoveryScenario(loadConfig(), runId),
+    repairRecovery: (runId, strategy) =>
+      repairRecoveryProgress(loadConfig(), runId, strategy),
+    abandonRecovery: (runId) => abandonRecoveryRun(loadConfig(), runId),
     validatePgn: validatePgnWorkbook,
     prepareFresh: prepareFreshPgnWorkbook,
     runPgn: (args) =>

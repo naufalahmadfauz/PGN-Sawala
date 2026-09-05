@@ -11,6 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import { isProcessAlive } from "../process-liveness";
 
 const ORPHANED_LOCK_AGE_MS = 30_000;
 
@@ -28,15 +29,6 @@ interface ExistingWorkbookLock {
   oldEnoughToRecover?: boolean;
   ownerPath?: string;
   record?: WorkbookLockRecord;
-}
-
-function processIsRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
 }
 
 async function oldEnoughToRecover(targetPath: string): Promise<boolean> {
@@ -171,7 +163,7 @@ export async function acquireWorkbookLock(
           existing.ownerPath &&
           existing.record &&
           Number.isInteger(existing.record.pid) &&
-          !processIsRunning(existing.record.pid)
+          !isProcessAlive(existing.record.pid)
         ) {
           await removeOwnedLock(lockPath, existing.ownerPath);
           continue;
@@ -198,7 +190,7 @@ export async function acquireWorkbookLock(
           !existing.directory &&
           existing.record &&
           Number.isInteger(existing.record.pid) &&
-          !processIsRunning(existing.record.pid);
+          !isProcessAlive(existing.record.pid);
         throw new Error(
           staleLegacyLock
             ? "Executed workbook has a stale legacy lock; remove it after confirming no workbook process is running"

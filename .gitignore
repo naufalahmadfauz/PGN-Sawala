@@ -9,6 +9,7 @@ node_modules/
 # WhatsApp authentication and test evidence
 /.whatsapp-profile/
 /artifacts/
+/.runtime/
 
 # Local configuration and generated reports
 .env

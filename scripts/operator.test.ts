@@ -14,6 +14,9 @@ import {
 } from "../src/operator/browser-runtime";
 import {
   collectDiagnostics,
+  formatDiagnosticReport,
+  formatSetupChecklist,
+  formatSetupInspection,
   type DiagnosticReport,
 } from "../src/operator/diagnostics";
 import {
@@ -28,6 +31,13 @@ import type {
   SelectPrompt,
   TextPrompt,
 } from "../src/operator/ui";
+import type { RecoveryValidation } from "../src/recovery/recovery-service";
+import {
+  RECOVERY_SCHEMA_VERSION,
+  type RecoveryDiscovery,
+  type RecoveryRunManifest,
+  type RecoveryRunState,
+} from "../src/recovery/run-state";
 
 class ScriptedUi implements OperatorUi {
   readonly events: string[] = [];
@@ -255,6 +265,118 @@ function stubActions(
     regressionTests: async () => undefined,
     createTemplate: async () => undefined,
     ...overrides,
+  };
+}
+
+function recoveryFixture(isDemo = false): {
+  discovery: RecoveryDiscovery;
+  validation: RecoveryValidation;
+} {
+  const state: RecoveryRunState = {
+    schemaVersion: RECOVERY_SCHEMA_VERSION,
+    ...(isDemo ? { isDemo: true as const } : {}),
+    runId: "RECOVERY-OPERATOR-001",
+    mode: "full",
+    status: "INTERRUPTED",
+    sourceWorkbookPath: "data/source.xlsx",
+    sourceWorkbookHash: "a".repeat(64),
+    executedWorkbookPath: "reports/executed.xlsx",
+    selectedScenarioIds: ["TC-001", "TC-002"],
+    completedScenarioIds: ["TC-001"],
+    skippedScenarioIds: [],
+    totalScenarios: 2,
+    lastCompletedScenarioId: "TC-001",
+    activeScenarioId: "TC-002",
+    activeScenarioAttempt: 1,
+    activeScenarioStartedAt: "2026-09-05T10:01:00.000Z",
+    scenarioAttempts: [
+      {
+        scenarioId: "TC-001",
+        attempt: 1,
+        status: "COMPLETED",
+        startedAt: "2026-09-05T10:00:00.000Z",
+        finishedAt: "2026-09-05T10:00:30.000Z",
+      },
+      {
+        scenarioId: "TC-002",
+        attempt: 1,
+        status: "INTERRUPTED",
+        startedAt: "2026-09-05T10:01:00.000Z",
+        finishedAt: "2026-09-05T10:01:30.000Z",
+      },
+    ],
+    reconciliationDecisions: [],
+    driveRunFolderId: "fixture-folder",
+    driveRunFolderUrl:
+      "https://drive.google.com/drive/folders/fixture-folder",
+    finalCleanupComplete: false,
+    workbookProgress: "Saved through TC-002 turn 1",
+    metrics: {
+      executedScenarios: 1,
+      capturedScenarios: 1,
+      timeouts: 0,
+      technicalErrors: 0,
+      evidenceCaptured: 2,
+      evidenceUploaded: 2,
+      evidenceUploadErrors: 0,
+    },
+    startedAt: "2026-09-05T10:00:00.000Z",
+    updatedAt: "2026-09-05T10:01:30.000Z",
+    heartbeatAt: "2026-09-05T10:01:30.000Z",
+    interruptedAt: "2026-09-05T10:01:30.000Z",
+    interruptionReason: isDemo
+      ? "Interrupted during Turn 2 of 2; demo only."
+      : "Process received SIGTERM",
+    resumeCount: 0,
+  };
+  const manifest: RecoveryRunManifest = {
+    schemaVersion: RECOVERY_SCHEMA_VERSION,
+    ...(isDemo ? { isDemo: true as const } : {}),
+    runId: state.runId,
+    sourceWorkbookHash: state.sourceWorkbookHash,
+    createdAt: state.startedAt,
+    scenarios: state.selectedScenarioIds.map((testCaseId, order) => ({
+      testCaseId,
+      sheetKind: "kb",
+      sheetName: "Test Case Knowledge Base",
+      sourceRowNumber: order + 2,
+      order,
+      turnCount: testCaseId === "TC-002" ? 2 : 1,
+      inputHash: String(order + 1).repeat(64),
+    })),
+  };
+  const discovery: RecoveryDiscovery = {
+    kind: "recoverable",
+    state,
+    manifest,
+    lock: { status: "unlocked" },
+  };
+  return {
+    discovery,
+    validation: {
+      runId: state.runId,
+      mode: state.mode,
+      state,
+      manifest,
+      lock: { status: "unlocked" },
+      sourceDrift: "unchanged",
+      reconciliation: {
+        checkpointCompletedIds: ["TC-001"],
+        workbookCompletedIds: ["TC-001"],
+        transcriptCompletedIds: ["TC-001"],
+        artifactConfirmedIds: ["TC-001"],
+        safeCompletedIds: ["TC-001"],
+        reconciledScenarioIds: [],
+        mismatchedScenarioIds: [],
+        evidenceCapturedScenarioIds: ["TC-001"],
+        evidenceUploadedScenarioIds: ["TC-001"],
+        nextScenarioId: "TC-002",
+        interruptedScenarioId: "TC-002",
+        restartInterruptedScenarioFromTurnOne: true,
+      },
+      checks: [],
+      ready: true,
+    },
   };
 }
 
@@ -952,6 +1074,432 @@ test("explicit Discord diagnostics inspect safely and remain non-blocking on fai
   assert.equal(discord?.status, "warn");
   assert.equal((discord?.detail ?? "").includes(webhook), false);
   assert.equal(report.ready, true);
+});
+
+for (const kind of ["recoverable", "running"] as const) {
+  test(`diagnostics label ${kind} demos and skip enabled external checks`, async (context) => {
+    const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-demo-diagnostic-"));
+    context.after(() => rm(projectRoot, { recursive: true, force: true }));
+    const recovery = recoveryFixture(true);
+    const credential = JSON.stringify({
+      type: "service_account",
+      client_email: "demo@example.invalid",
+      private_key: "demo-private-key-must-not-be-displayed",
+    });
+    const webhook = "https://discord.com/api/webhooks/123456789/demo-secret-token";
+    const externalCalls: string[] = [];
+    const report = await collectDiagnostics({
+      projectRoot,
+      platform: "win32",
+      environment: {
+        PGN_WHATSAPP_PHONE: "628123456789",
+        GOOGLE_DRIVE_EVIDENCE_ENABLED: "true",
+        GOOGLE_DRIVE_EVIDENCE_PARENT_FOLDER: "abcdefghijklmno",
+        ...(kind === "recoverable"
+          ? { GOOGLE_SERVICE_ACCOUNT_JSON: credential }
+          : { GOOGLE_SERVICE_ACCOUNT_FILE: ".secrets/must-not-read.json" }),
+        DISCORD_NOTIFICATIONS_ENABLED: "true",
+        DISCORD_WEBHOOK_URL: webhook,
+      },
+      npmVersion: async () => "11.0.0",
+      packageVersion: async () => "1.0.0",
+      chromiumExecutablePath: async () => "/fixture/chromium",
+      pathExists: async () => true,
+      hasCommand: async () => false,
+      inspectRecovery: async () => ({
+        kind,
+        state: recovery.validation.state,
+        manifest: recovery.validation.manifest,
+        lock: { status: "unlocked" },
+      }),
+      checkDriveAccess: true,
+      validateDrive: async () => {
+        externalCalls.push("drive");
+      },
+      checkDiscordAccess: true,
+      inspectDiscord: async () => {
+        externalCalls.push("discord");
+        return {
+          enabled: true,
+          configured: true,
+          valid: true,
+          connectivity: "ok",
+          testNotificationSent: false,
+        };
+      },
+    });
+
+    assert.deepEqual(externalCalls, []);
+    assert.equal(report.ready, true);
+    const byId = new Map(report.checks.map((check) => [check.id, check]));
+    assert.match(byId.get("recovery")?.detail ?? "", /DEMO Run RECOVERY-OPERATOR-001/);
+    for (const id of ["drive", "discord"]) {
+      assert.equal(byId.get(id)?.status, "info");
+      assert.match(byId.get(id)?.detail ?? "", /DEMO: skipped/);
+    }
+    for (const format of [formatDiagnosticReport, formatSetupInspection, formatSetupChecklist]) {
+      const output = format(report);
+      assert.match(output, /Google Drive: DEMO: skipped/);
+      assert.match(output, /Discord notifications: DEMO: skipped/);
+      assert.doesNotMatch(output, /demo-private-key|demo-secret-token|must-not-read|628123456789/);
+    }
+  });
+}
+
+test("recoverable runs are surfaced before the main menu and never resume without confirmation", async () => {
+  const recovery = recoveryFixture();
+  let resumes = 0;
+  const ui = new ScriptedUi(["resume", false, "menu", "exit"]);
+  await runControlPanel(
+    ui,
+    stubActions({
+      inspectRecovery: async () => recovery.discovery,
+      validateRecovery: async () => recovery.validation,
+      resumeRecovery: async () => {
+        resumes += 1;
+      },
+      skipRecoveryScenario: async (runId) => ({ runId }),
+      repairRecovery: async (runId) => ({ runId }),
+      abandonRecovery: async (runId) => ({ runId }),
+    }),
+  );
+  assert.equal(resumes, 0);
+  assert.equal(ui.selectPrompts[0]?.message, "Recover interrupted Run RECOVERY-OPERATOR-001");
+  assert.deepEqual(
+    ui.selectPrompts[0]?.options.map((option) => option.label),
+    [
+      "Inspect recovery details",
+      "Resume safely",
+      "Skip current scenario and continue",
+      "Abandon recovery",
+      "Continue to main menu",
+      "Exit",
+    ],
+  );
+  const output = ui.events.join("\n");
+  assert.match(output, /Interrupted scenario: TC-002/);
+  assert.match(output, /Recovery execution cancelled/);
+});
+
+test("confirmed recovery keeps the Run ID and starts at the interrupted scenario", async () => {
+  const recovery = recoveryFixture();
+  let available = true;
+  const resumed: Array<{ runId: string; acceptSourceDrift?: boolean }> = [];
+  const ui = new ScriptedUi(["resume", true, "exit"]);
+  await runControlPanel(
+    ui,
+    stubActions({
+      inspectRecovery: async (): Promise<RecoveryDiscovery> =>
+        available
+          ? recovery.discovery
+          : { kind: "none", lock: { status: "unlocked" } },
+      validateRecovery: async () => recovery.validation,
+      resumeRecovery: async (runId, acceptSourceDrift) => {
+        resumed.push({ runId, acceptSourceDrift });
+        available = false;
+      },
+      skipRecoveryScenario: async (runId) => ({ runId }),
+      repairRecovery: async (runId) => ({ runId }),
+      abandonRecovery: async (runId) => ({ runId }),
+    }),
+  );
+  assert.deepEqual(resumed, [
+    { runId: "RECOVERY-OPERATOR-001", acceptSourceDrift: false },
+  ]);
+  assert(
+    ui.confirmPrompts.some((prompt) =>
+      prompt.message.includes("at TC-002 from Turn 1"),
+    ),
+  );
+});
+
+for (const mode of ["full", "retest"] as const) {
+  test(`${mode} demo resume and restart use the same recovery menu without execution or mutation`, async () => {
+    const recovery = recoveryFixture(true);
+    recovery.validation.mode = mode;
+    recovery.validation.state.mode = mode;
+    recovery.validation.sourceDrift = "formatting-only";
+    recovery.validation.checks = [
+      {
+        id: "source",
+        label: "Source workbook",
+        status: "warn",
+        detail: "file hash changed, but selected scenario inputs are unchanged",
+      },
+      {
+        id: "reconciliation",
+        label: "Progress reconciliation",
+        status: "ok",
+        detail: "fixture workbook and transcript agree with checkpoint",
+      },
+    ];
+    const before = structuredClone(recovery);
+    const calls: string[] = [];
+    const execute = async (): Promise<void> => { calls.push("execute"); };
+    const mutate = async (runId: string) => {
+      calls.push("mutate");
+      return { runId };
+    };
+    const ui = new ScriptedUi(["inspect", "resume", "restart", "menu", "exit"]);
+    await runControlPanel(
+      ui,
+      stubActions({
+        inspectRecovery: async () => recovery.discovery,
+        validateRecovery: async (runId) => {
+          calls.push(`validate:${runId}`);
+          const validation = structuredClone(recovery.validation);
+          // Discovery must keep the demo safe even if validation loses both flags.
+          delete validation.state.isDemo;
+          delete validation.manifest.isDemo;
+          return validation;
+        },
+        resumeRecovery: execute,
+        runPgn: execute,
+        runRetest: execute,
+        skipRecoveryScenario: mutate,
+        repairRecovery: mutate,
+        abandonRecovery: mutate,
+      }),
+    );
+
+    assert.deepEqual(calls, Array(3).fill("validate:RECOVERY-OPERATOR-001"));
+    assert.deepEqual(recovery, before);
+    assert.equal(ui.confirmPrompts.length, 0);
+    assert.equal(ui.selectPrompts.length, 5);
+    assert(
+      ui.selectPrompts.slice(0, -1).every(
+        (prompt) => prompt.message === "Recover interrupted Run RECOVERY-OPERATOR-001 [DEMO]",
+      ),
+    );
+    assert.deepEqual(
+      ui.selectPrompts[0]?.options.map((option) => option.label),
+      [
+        "Inspect recovery details",
+        "Resume safely",
+        "Restart interrupted scenario",
+        "Skip current scenario and continue",
+        "Abandon recovery",
+        "Continue to main menu",
+        "Exit",
+      ],
+    );
+    assert.equal(ui.selectPrompts.at(-1)?.message, "Choose an operation");
+    const output = ui.events.join("\n");
+    assert.match(output, /Recoverable run found \[DEMO\]/);
+    assert.match(output, /Source workbook: file hash changed, but selected scenario inputs are unchanged/);
+    assert.match(output, /Progress reconciliation: fixture workbook and transcript agree with checkpoint/);
+    assert.equal(output.match(/note:DEMO recovery preview:/g)?.length, 2);
+    assert.match(output, /1 completed, 0 skipped, 1 remaining/);
+    assert.match(output, /Previous interruption: Interrupted during Turn 2 of 2; demo only\./);
+    assert.match(output, /Restart interrupted scenario: TC-002 from Turn 1 of 2 \(preview only\)/);
+    assert.match(output, /Next scenario: TC-002 from Turn 1 \(preview only\)/);
+    assert.match(output, /DEMO: UI\/testing only; no live execution/);
+    assert.doesNotMatch(output, /This will open WhatsApp|How should recovery reconcile/);
+  });
+}
+
+test("declining or cancelling a demo skip does not mutate or validate recovery", async () => {
+  const recovery = recoveryFixture(true);
+  const before = structuredClone(recovery);
+  const calls: string[] = [];
+  const mutate = async (runId: string) => {
+    calls.push("mutate");
+    return { runId };
+  };
+  const ui = new ScriptedUi(["skip", false, "skip", undefined, "exit"]);
+  await runControlPanel(
+    ui,
+    stubActions({
+      inspectRecovery: async () => recovery.discovery,
+      validateRecovery: async () => {
+        calls.push("validate");
+        return recovery.validation;
+      },
+      resumeRecovery: async () => { calls.push("execute"); },
+      skipRecoveryScenario: mutate,
+      repairRecovery: mutate,
+      abandonRecovery: mutate,
+    }),
+  );
+  assert.deepEqual(calls, []);
+  assert.deepEqual(recovery, before);
+  assert.equal(ui.confirmPrompts.length, 2);
+  assert(ui.confirmPrompts.every((prompt) => prompt.initialValue === false));
+  assert.equal(
+    ui.confirmPrompts[0]?.message,
+    "Explicitly skip TC-002 in Run RECOVERY-OPERATOR-001? Existing evidence will be preserved.",
+  );
+});
+
+test("confirmed demo skip calls the existing action before preview without resuming or final cleanup", async () => {
+  const recovery = recoveryFixture(true);
+  const calls: string[] = [];
+  const execute = async (): Promise<void> => { calls.push("execute"); };
+  const ui = new ScriptedUi(["skip", true, "exit"]);
+  await runControlPanel(
+    ui,
+    stubActions({
+      inspectRecovery: async () => recovery.discovery,
+      skipRecoveryScenario: async (runId) => {
+        calls.push(`skip:${runId}`);
+        assert.equal(ui.confirmPrompts.length, 1);
+        const state = recovery.validation.state;
+        state.skippedScenarioIds.push("TC-002");
+        state.activeScenarioId = undefined;
+        state.activeScenarioAttempt = undefined;
+        state.activeScenarioStartedAt = undefined;
+        state.status = "RECOVERABLE";
+        state.interruptionReason = "Scenario TC-002 skipped by operator";
+        const reconciliation = recovery.validation.reconciliation!;
+        reconciliation.nextScenarioId = undefined;
+        reconciliation.interruptedScenarioId = undefined;
+        reconciliation.restartInterruptedScenarioFromTurnOne = false;
+        return { runId, scenarioId: "TC-002", warning: "fixture skip audit warning" };
+      },
+      validateRecovery: async (runId) => {
+        calls.push(`validate:${runId}`);
+        const validation = structuredClone(recovery.validation);
+        delete validation.state.isDemo;
+        delete validation.manifest.isDemo;
+        return validation;
+      },
+      resumeRecovery: execute,
+      runPgn: execute,
+      runRetest: execute,
+      repairRecovery: async (runId) => {
+        calls.push("repair");
+        return { runId };
+      },
+      abandonRecovery: async (runId) => {
+        calls.push("abandon");
+        return { runId };
+      },
+    }),
+  );
+  assert.deepEqual(calls, ["skip:RECOVERY-OPERATOR-001", "validate:RECOVERY-OPERATOR-001"]);
+  assert.equal(ui.confirmPrompts.length, 1);
+  assert.equal(recovery.validation.state.finalCleanupComplete, false);
+  assert.deepEqual(recovery.validation.state.completedScenarioIds, ["TC-001"]);
+  assert.deepEqual(recovery.validation.state.skippedScenarioIds, ["TC-002"]);
+  assert.equal(ui.selectPrompts[1]?.message, ui.selectPrompts[0]?.message);
+  const output = ui.events.join("\n");
+  assert.match(output, /fixture skip audit warning/);
+  assert.match(output, /1 completed, 1 skipped, 0 remaining/);
+  assert.match(output, /Next scenario: none; no remaining scenarios/);
+  assert.match(output, /note:DEMO recovery preview:/);
+  assert.doesNotMatch(output, /This will open WhatsApp/);
+});
+
+test("demo abandonment uses the existing confirmed action and preserves artifacts", async () => {
+  const recovery = recoveryFixture(true);
+  let available = true;
+  const calls: string[] = [];
+  const ui = new ScriptedUi(["abandon", false, "abandon", true, "exit"]);
+  await runControlPanel(
+    ui,
+    stubActions({
+      inspectRecovery: async () => available
+        ? recovery.discovery
+        : { kind: "none", lock: { status: "unlocked" } },
+      validateRecovery: async () => {
+        calls.push("validate");
+        return recovery.validation;
+      },
+      resumeRecovery: async () => { calls.push("execute"); },
+      skipRecoveryScenario: async (runId) => {
+        calls.push("skip");
+        return { runId };
+      },
+      repairRecovery: async (runId) => {
+        calls.push("repair");
+        return { runId };
+      },
+      abandonRecovery: async (runId) => {
+        calls.push(`abandon:${runId}`);
+        assert.equal(ui.confirmPrompts.length, 2);
+        available = false;
+        return { runId };
+      },
+    }),
+  );
+  assert.deepEqual(calls, ["abandon:RECOVERY-OPERATOR-001"]);
+  assert.equal(ui.confirmPrompts.length, 2);
+  assert(ui.confirmPrompts.every((prompt) => prompt.initialValue === false));
+  assert.match(ui.confirmPrompts[0]?.message ?? "", /keeps the workbook, transcript, evidence, and recovery history/);
+  assert.match(ui.events.join("\n"), /marked ABANDONED; artifacts were preserved/);
+  assert.equal(ui.selectPrompts.at(-1)?.message, "Choose an operation");
+});
+
+test("unknown recovery choices never fall through to abandonment in live or demo menus", async () => {
+  for (const isDemo of [false, true]) {
+    const recovery = recoveryFixture(isDemo);
+    const calls: string[] = [];
+    const mutate = async (runId: string) => {
+      calls.push("mutate");
+      return { runId };
+    };
+    const ui = new ScriptedUi([isDemo ? "unknown" : "restart", "exit"]);
+    await runControlPanel(
+      ui,
+      stubActions({
+        inspectRecovery: async () => recovery.discovery,
+        validateRecovery: async () => {
+          calls.push("validate");
+          return recovery.validation;
+        },
+        resumeRecovery: async () => { calls.push("execute"); },
+        skipRecoveryScenario: mutate,
+        repairRecovery: mutate,
+        abandonRecovery: mutate,
+      }),
+    );
+    assert.deepEqual(calls, []);
+    assert.equal(ui.confirmPrompts.length, 0);
+    assert.equal(ui.selectPrompts.length, 2);
+  }
+});
+
+test("demo mismatch validation remains visible without repair, mutation, or execution", async () => {
+  const recovery = recoveryFixture(true);
+  recovery.validation.ready = false;
+  recovery.validation.reconciliation!.mismatchedScenarioIds = ["TC-001"];
+  recovery.validation.reconciliation!.safeCompletedIds = [];
+  recovery.validation.checks = [{
+    id: "reconciliation",
+    label: "Progress reconciliation",
+    status: "error",
+    detail: "TC-001 disagrees across checkpoint, workbook, and transcript",
+  }];
+  const before = structuredClone(recovery);
+  const calls: string[] = [];
+  const mutate = async (runId: string) => {
+    calls.push("mutate");
+    return { runId };
+  };
+  const ui = new ScriptedUi(["resume", "restart", "exit"]);
+  await runControlPanel(
+    ui,
+    stubActions({
+      inspectRecovery: async () => recovery.discovery,
+      validateRecovery: async () => {
+        calls.push("validate");
+        return recovery.validation;
+      },
+      resumeRecovery: async () => { calls.push("execute"); },
+      skipRecoveryScenario: mutate,
+      repairRecovery: mutate,
+      abandonRecovery: mutate,
+    }),
+  );
+  assert.deepEqual(calls, ["validate", "validate"]);
+  assert.deepEqual(recovery, before);
+  assert.equal(ui.confirmPrompts.length, 0);
+  assert.equal(ui.selectPrompts.length, 3);
+  const output = ui.events.join("\n");
+  assert.match(output, /ERROR Progress reconciliation: TC-001 disagrees/);
+  assert.match(output, /DEMO validation remains BLOCKED; no repair or execution was attempted/);
+  assert.match(output, /Next scenario: TC-002 from Turn 1 \(preview only\)/);
+  assert.doesNotMatch(output, /How should recovery reconcile/);
 });
 
 test("fresh-run cancellation never invokes workbook preparation", async () => {

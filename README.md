@@ -228,6 +228,23 @@ npm run test:pgn -- --test PGN-KB-031 --rerun PGN-NEG-018
 
 `--rerun` without an ID reruns the selected set. `--rerun ID` selects and reruns that scenario. Without rerun, completed scenarios are skipped. A partially completed multi-turn scenario is skipped because continuing it later would not guarantee the original turn context.
 
+## Recovery Demo
+
+Create a safe local interrupted-run fixture, then use the same recovery menu as a real run:
+
+```bash
+npm run recovery:demo
+npm run pgn
+npm run test:pgn:resume:validate
+npm run recovery:demo:reset
+```
+
+The menu shows **Recoverable run found [DEMO]**. Resume and **Restart interrupted scenario** display validation, completed/remaining counts, and a Turn 1 restart preview without executing or changing progress. A confirmed skip uses the normal skip action on the demo checkpoint, then previews the remaining work; cancellation changes nothing. Abandon uses the normal action and preserves demo artifacts and recovery history.
+
+Demo workbooks are isolated in `.runtime/pgn/demos/<Run ID>/`; checkpoints use the normal `.runtime/pgn/runs/<Run ID>/` history. Demo generation, validation, and recovery previews do not launch WhatsApp or Playwright, contact Drive or Discord, or read/write the real workbooks. Main-menu actions outside demo recovery remain real, including WhatsApp, evidence, and notification actions.
+
+Use `npm run recovery:demo -- --mode=retest` for a retest fixture, `--source-drift` for formatting-only source drift, or `--mismatch` for conflicting recovery progress. Options may be combined. Duplicate demo generation refuses to overwrite an existing demo; run `npm run recovery:demo:reset` before generating another variant. Reset removes only demo fixtures/history, not real runs, real workbooks, credentials, or the WhatsApp profile.
+
 ## Full New Run
 
 Prepare, validate, and launch these as separate commands:

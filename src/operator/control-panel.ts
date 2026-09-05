@@ -5,6 +5,14 @@ import {
 } from "../notifications/discord";
 import type { SetupNextAction } from "./setup";
 import type { OperatorUi } from "./ui";
+import {
+  formatRecoveryDiscovery,
+  formatRecoveryValidation,
+  type RecoveryMutationResult,
+  type RecoveryRepairStrategy,
+  type RecoveryValidation,
+} from "../recovery/recovery-service";
+import type { RecoveryDiscovery } from "../recovery/run-state";
 
 export interface RetestReadiness {
   selectedCount: number;
@@ -14,6 +22,15 @@ export interface RetestReadiness {
 }
 
 export interface OperatorActions {
+  inspectRecovery?(): Promise<RecoveryDiscovery>;
+  validateRecovery?(runId: string): Promise<RecoveryValidation>;
+  resumeRecovery?(runId: string, acceptSourceDrift?: boolean): Promise<void>;
+  skipRecoveryScenario?(runId: string): Promise<RecoveryMutationResult>;
+  repairRecovery?(
+    runId: string,
+    strategy: RecoveryRepairStrategy,
+  ): Promise<RecoveryMutationResult>;
+  abandonRecovery?(runId: string): Promise<RecoveryMutationResult>;
   validatePgn(): Promise<boolean>;
   prepareFresh(): Promise<void>;
   runPgn(args: string[]): Promise<void>;
@@ -31,6 +48,24 @@ export interface OperatorActions {
   typecheck(): Promise<void>;
   regressionTests(): Promise<void>;
   createTemplate(): Promise<void>;
+}
+
+function recoveryActionsAvailable(actions: OperatorActions): actions is OperatorActions & {
+  inspectRecovery: NonNullable<OperatorActions["inspectRecovery"]>;
+  validateRecovery: NonNullable<OperatorActions["validateRecovery"]>;
+  resumeRecovery: NonNullable<OperatorActions["resumeRecovery"]>;
+  skipRecoveryScenario: NonNullable<OperatorActions["skipRecoveryScenario"]>;
+  repairRecovery: NonNullable<OperatorActions["repairRecovery"]>;
+  abandonRecovery: NonNullable<OperatorActions["abandonRecovery"]>;
+} {
+  return Boolean(
+    actions.inspectRecovery &&
+      actions.validateRecovery &&
+      actions.resumeRecovery &&
+      actions.skipRecoveryScenario &&
+      actions.repairRecovery &&
+      actions.abandonRecovery,
+  );
 }
 
 interface ActionSuccess<Value> {
@@ -88,6 +123,243 @@ async function confirmExecution(
     message: `${scope} will open WhatsApp, send reset and testcase messages, update the executed workbook, and may upload evidence. Continue?`,
     initialValue: false,
   });
+}
+
+async function repairRecoveryMismatch(
+  ui: OperatorUi,
+  actions: OperatorActions & {
+    repairRecovery: NonNullable<OperatorActions["repairRecovery"]>;
+  },
+  validation: RecoveryValidation,
+): Promise<boolean> {
+  const mismatches = validation.reconciliation?.mismatchedScenarioIds ?? [];
+  if (!mismatches.length) return true;
+  ui.warn(
+    `Recovery progress disagrees for: ${mismatches.join(", ")}. No scenario will be guessed as complete.`,
+  );
+  const strategy = await ui.select<RecoveryRepairStrategy | "back">({
+    message: "How should recovery reconcile this progress?",
+    options: [
+      {
+        value: "rerun",
+        label: "Re-run mismatched scenarios",
+        hint: "Safest; completed evidence is preserved",
+      },
+      { value: "artifacts", label: "Trust workbook and transcript" },
+      { value: "checkpoint", label: "Trust checkpoint records" },
+      { value: "back", label: "Back" },
+    ],
+    initialValue: "rerun",
+  });
+  if (strategy === undefined || strategy === "back") return false;
+  const confirmed = await ui.confirm({
+    message: `Apply the ${strategy} reconciliation strategy to Run ${validation.runId}?`,
+    initialValue: false,
+  });
+  if (!confirmed) return false;
+  const repaired = await attempt(ui, "Saving recovery reconciliation", () =>
+    actions.repairRecovery(validation.runId, strategy),
+  );
+  if (!repaired.ok) return false;
+  if (repaired.value.warning) ui.warn(repaired.value.warning);
+  return true;
+}
+
+async function resumeRecoveryFromMenu(
+  ui: OperatorUi,
+  actions: OperatorActions & {
+    validateRecovery: NonNullable<OperatorActions["validateRecovery"]>;
+    resumeRecovery: NonNullable<OperatorActions["resumeRecovery"]>;
+    repairRecovery: NonNullable<OperatorActions["repairRecovery"]>;
+  },
+  runId: string,
+  discoveredIsDemo: boolean,
+): Promise<void> {
+  let inspected = await attempt(ui, "Validating recovery without executing", () =>
+    actions.validateRecovery(runId),
+  );
+  if (!inspected.ok) return;
+  const isDemo =
+    discoveredIsDemo ||
+    inspected.value.state.isDemo === true ||
+    inspected.value.manifest.isDemo === true;
+  ui.note(
+    formatRecoveryValidation(inspected.value),
+    isDemo ? "DEMO recovery validation" : "Recovery validation",
+  );
+  if (isDemo) {
+    const { state, manifest, reconciliation } = inspected.value;
+    const finished = new Set([
+      ...state.completedScenarioIds,
+      ...state.skippedScenarioIds,
+    ]);
+    const remaining = state.selectedScenarioIds.filter((id) => !finished.has(id));
+    const nextScenario = reconciliation?.nextScenarioId ?? remaining[0];
+    const interruptedScenario =
+      reconciliation?.interruptedScenarioId ?? state.activeScenarioId;
+    const turnCount = manifest.scenarios.find(
+      (scenario) => scenario.testCaseId === interruptedScenario,
+    )?.turnCount;
+    ui.note(
+      [
+        "DEMO: UI/testing only; no live execution. No WhatsApp, Playwright, Drive, or Discord actions.",
+        `Checkpoint progress: ${state.completedScenarioIds.length} completed, ${state.skippedScenarioIds.length} skipped, ${remaining.length} remaining`,
+        `Previous interruption: ${state.interruptionReason ?? "not recorded"}`,
+        ...(interruptedScenario
+          ? [`Restart interrupted scenario: ${interruptedScenario} from Turn 1${turnCount ? ` of ${turnCount}` : ""} (preview only)`]
+          : []),
+        `Next scenario: ${nextScenario ? `${nextScenario} from Turn 1 (preview only)` : "none; no remaining scenarios"}`,
+        "This preview did not change recovery progress or artifacts.",
+      ].join("\n"),
+      "DEMO recovery preview",
+    );
+    if (!inspected.value.ready) {
+      ui.warn("DEMO validation remains BLOCKED; no repair or execution was attempted.");
+    }
+    return;
+  }
+  if (!(await repairRecoveryMismatch(ui, actions, inspected.value))) return;
+  if (inspected.value.reconciliation?.mismatchedScenarioIds.length) {
+    inspected = await attempt(ui, "Revalidating reconciled recovery", () =>
+      actions.validateRecovery(runId),
+    );
+    if (!inspected.ok) return;
+    ui.note(formatRecoveryValidation(inspected.value), "Recovery validation");
+  }
+  if (!inspected.value.ready) {
+    ui.warn("Recovery prerequisites are not ready. No testcase was executed.");
+    return;
+  }
+  let acceptSourceDrift = false;
+  if (inspected.value.sourceDrift === "formatting-only") {
+    const acceptDrift = await ui.confirm({
+      message: "The source file hash changed, but testcase inputs are unchanged. Continue with this formatting-only drift?",
+      initialValue: false,
+    });
+    if (!acceptDrift) return;
+    acceptSourceDrift = true;
+  }
+  const nextScenario = inspected.value.reconciliation?.nextScenarioId;
+  const confirmed = await ui.confirm({
+    message: `Resume Run ${runId}${nextScenario ? ` at ${nextScenario} from Turn 1` : ""}? This will open WhatsApp, send messages, update the workbook, and reuse existing Drive artifacts.`,
+    initialValue: false,
+  });
+  if (!confirmed) {
+    ui.info("Recovery execution cancelled");
+    return;
+  }
+  const resumed = await attempt(ui, `Resuming Run ${runId}`, () =>
+    actions.resumeRecovery(runId, acceptSourceDrift),
+  );
+  if (resumed.ok) ui.success(`Run ${runId} recovery finished`);
+}
+
+async function recoveryStartupMenu(
+  ui: OperatorUi,
+  actions: OperatorActions,
+): Promise<boolean> {
+  if (!recoveryActionsAvailable(actions)) return true;
+  while (true) {
+    const inspected = await attempt(ui, "Checking for interrupted PGN runs", () =>
+      actions.inspectRecovery(),
+    );
+    if (!inspected.ok) return true;
+    const recovery = inspected.value;
+    if (recovery.kind === "none") return true;
+    const isDemo =
+      recovery.kind !== "unreadable" &&
+      (recovery.state.isDemo === true || recovery.manifest.isDemo === true);
+    ui.note(
+      formatRecoveryDiscovery(recovery),
+      recovery.kind === "recoverable" && isDemo
+        ? "Recoverable run found [DEMO]"
+        : "PGN run recovery",
+    );
+    if (recovery.kind === "running" || recovery.kind === "unreadable") {
+      const choice = await ui.select({
+        message:
+          recovery.kind === "running"
+            ? `A PGN run is already active${isDemo ? " [DEMO]" : ""}`
+            : "Recovery state needs attention",
+        options: [
+          { value: "inspect", label: "Inspect again" },
+          { value: "menu", label: "Continue to main menu" },
+          { value: "exit", label: "Exit" },
+        ],
+      });
+      if (choice === undefined || choice === "exit") return false;
+      if (choice === "menu") return true;
+      continue;
+    }
+
+    const runId = recovery.state.runId;
+    const choice = await ui.select({
+      message: `Recover interrupted Run ${runId}${isDemo ? " [DEMO]" : ""}`,
+      options: [
+        { value: "inspect", label: "Inspect recovery details", hint: "No messages sent" },
+        { value: "resume", label: "Resume safely" },
+        ...(isDemo
+          ? [{ value: "restart", label: "Restart interrupted scenario", hint: "Preview Turn 1 only; no changes" }]
+          : []),
+        { value: "skip", label: "Skip current scenario and continue" },
+        { value: "abandon", label: "Abandon recovery", hint: "Preserves artifacts" },
+        { value: "menu", label: "Continue to main menu" },
+        { value: "exit", label: "Exit" },
+      ],
+    });
+    if (choice === undefined || choice === "exit") return false;
+    if (choice === "menu") return true;
+    if (choice === "inspect") {
+      const validation = await attempt(ui, "Inspecting recovery details", () =>
+        actions.validateRecovery(runId),
+      );
+      if (validation.ok) {
+        ui.note(
+          formatRecoveryValidation(validation.value),
+          isDemo ? "DEMO recovery details" : "Recovery details",
+        );
+      }
+      continue;
+    }
+    if (choice === "resume" || (isDemo && choice === "restart")) {
+      await resumeRecoveryFromMenu(ui, actions, runId, isDemo);
+      continue;
+    }
+    if (choice === "skip") {
+      const scenarioId =
+        recovery.state.activeScenarioId ??
+        recovery.state.selectedScenarioIds.find(
+          (id) =>
+            !recovery.state.completedScenarioIds.includes(id) &&
+            !recovery.state.skippedScenarioIds.includes(id),
+        );
+      const confirmed = await ui.confirm({
+        message: `Explicitly skip ${scenarioId ?? "the next incomplete scenario"} in Run ${runId}? Existing evidence will be preserved.`,
+        initialValue: false,
+      });
+      if (!confirmed) continue;
+      const skipped = await attempt(ui, "Saving operator skip", () =>
+        actions.skipRecoveryScenario(runId),
+      );
+      if (!skipped.ok) continue;
+      if (skipped.value.warning) ui.warn(skipped.value.warning);
+      await resumeRecoveryFromMenu(ui, actions, runId, isDemo);
+      continue;
+    }
+    if (choice !== "abandon") continue;
+    const confirmed = await ui.confirm({
+      message: `Abandon recovery for Run ${runId}? This keeps the workbook, transcript, evidence, and recovery history, but permits a fresh run.`,
+      initialValue: false,
+    });
+    if (!confirmed) continue;
+    const abandoned = await attempt(ui, `Abandoning Run ${runId}`, () =>
+      actions.abandonRecovery(runId),
+    );
+    if (abandoned.ok) {
+      if (abandoned.value.warning) ui.warn(abandoned.value.warning);
+      ui.success(`Run ${runId} marked ABANDONED; artifacts were preserved`);
+    }
+  }
 }
 
 export async function runConfirmedFullTest(
@@ -480,6 +752,10 @@ export async function runControlPanel(
   actions: OperatorActions,
 ): Promise<void> {
   ui.intro("PGN Sawala operator control panel");
+  if (!(await recoveryStartupMenu(ui, actions))) {
+    ui.cancel("Operator control panel closed");
+    return;
+  }
   while (true) {
     const choice = await ui.select({
       message: "Choose an operation",

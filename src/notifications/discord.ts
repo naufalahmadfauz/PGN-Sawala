@@ -35,6 +35,14 @@ export interface DiscordRunProgressEvent {
   updatedAt: Date;
 }
 
+export interface DiscordRunResumedEvent extends DiscordRunStartedEvent {
+  resumedAt: Date;
+  completedScenarios: number;
+  remainingScenarios: number;
+  interruptedScenarioId?: string;
+  reusedDriveFolder: boolean;
+}
+
 export interface DiscordRunCompletedEvent extends DiscordRunProgressEvent {
   completedAt: Date;
   checkpoint?: boolean;
@@ -61,6 +69,7 @@ export interface DiscordNotificationSettings {
 
 export interface DiscordNotifier {
   runStarted(event: DiscordRunStartedEvent): Promise<void>;
+  runResumed(event: DiscordRunResumedEvent): Promise<void>;
   runProgress(event: DiscordRunProgressEvent): Promise<void>;
   runCompleted(event: DiscordRunCompletedEvent): Promise<void>;
   runFailed(event: DiscordRunFailedEvent): Promise<void>;
@@ -629,6 +638,48 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
     }
   }
 
+  async runResumed(event: DiscordRunResumedEvent): Promise<void> {
+    this.run = event;
+    this.lastProgressCompleted = event.completedScenarios;
+    this.lastProgressAt = event.resumedAt.getTime();
+    if (!this.settings.discordNotifyStart) return;
+    const transport = this.availableTransport();
+    if (!transport) return;
+    const payload = embed(
+      event.mode === "retest" ? "PGN Retest Resumed" : "PGN Test Resumed",
+      0x3498db,
+      [
+        { name: "Run ID", value: event.runId, inline: true },
+        { name: "Mode", value: modeLabel(event.mode), inline: true },
+        {
+          name: "Completed",
+          value: String(event.completedScenarios),
+          inline: true,
+        },
+        {
+          name: "Remaining",
+          value: String(event.remainingScenarios),
+          inline: true,
+        },
+        {
+          name: "Interrupted scenario",
+          value: event.interruptedScenarioId ?? "Between scenarios",
+          inline: true,
+        },
+        {
+          name: "Drive folder",
+          value: event.reusedDriveFolder ? "Reusing existing folder" : "Not created before interruption",
+          inline: true,
+        },
+        { name: "Resumed", value: localDateTime(event.resumedAt), inline: true },
+      ],
+      event.resumedAt,
+    );
+    this.liveMessageCreationAttempted = true;
+    const messageId = await this.failOpen(() => transport.execute(payload));
+    if (messageId) this.liveMessageId = messageId;
+  }
+
   async runProgress(event: DiscordRunProgressEvent): Promise<void> {
     if (
       !this.run ||
@@ -812,10 +863,12 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
 
   private completedPayload(event: DiscordRunCompletedEvent): DiscordPayload {
     const run = this.run!;
-    const checkpoint = run.mode === "retest" && event.checkpoint;
+    const checkpoint = Boolean(event.checkpoint);
     return embed(
       checkpoint
-        ? "PGN Retest Checkpoint Saved"
+        ? run.mode === "retest"
+          ? "PGN Retest Checkpoint Saved"
+          : "PGN Recovery Checkpoint Saved"
         : run.mode === "retest"
           ? "PGN Retest Completed"
           : run.mode === "demo"
@@ -973,6 +1026,7 @@ export function createDiscordNotifier(
   };
   return {
     runStarted: (event) => guard(() => notifier.runStarted(event)),
+    runResumed: (event) => guard(() => notifier.runResumed(event)),
     runProgress: (event) => guard(() => notifier.runProgress(event)),
     runCompleted: (event) => guard(() => notifier.runCompleted(event)),
     runFailed: (event) => guard(() => notifier.runFailed(event)),
@@ -1077,8 +1131,12 @@ export interface InterruptionSignalSource {
 export function registerDiscordInterruptionHandlers(options: {
   notifier: DiscordNotifier;
   progress: () => DiscordRunProgressEvent;
-  settle?: () => Promise<void> | void;
-  cleanup?: () => Promise<void> | void;
+  onSignal?: (signal: "SIGINT" | "SIGTERM") => void;
+  details?: (
+    signal: "SIGINT" | "SIGTERM",
+  ) => DiscordInterruptionDetails | undefined;
+  settle?: (signal: "SIGINT" | "SIGTERM") => Promise<void> | void;
+  cleanup?: (signal: "SIGINT" | "SIGTERM") => Promise<void> | void;
   signalSource?: InterruptionSignalSource;
   terminate?: (signal: "SIGINT" | "SIGTERM") => void;
   notificationTimeoutMs?: number;
@@ -1105,15 +1163,26 @@ export function registerDiscordInterruptionHandlers(options: {
       if (handling) return;
       handling = true;
       remove();
+      try {
+        options.onSignal?.(signal);
+      } catch {
+        // Shutdown must continue even if synchronous state capture fails.
+      }
       let timeout: NodeJS.Timeout | undefined;
       const notification = Promise.resolve()
-        .then(() => options.notifier.runInterrupted(signal, options.progress()))
+        .then(() =>
+          options.notifier.runInterrupted(
+            signal,
+            options.progress(),
+            options.details?.(signal),
+          ),
+        )
         .catch(() => undefined);
       const settlement = Promise.resolve()
-        .then(() => options.settle?.())
+        .then(() => options.settle?.(signal))
         .catch(() => undefined);
       const cleanup = Promise.resolve()
-        .then(() => options.cleanup?.())
+        .then(() => options.cleanup?.(signal))
         .catch(() => undefined);
       const deadline = new Promise<void>((resolve) => {
         timeout = setTimeout(resolve, notificationTimeoutMs);

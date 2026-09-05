@@ -9,6 +9,8 @@
     "doctor": "tsx scripts/doctor.ts",
     "discord:demo": "tsx scripts/discord-demo.ts",
     "discord:validate": "tsx scripts/discord-validate.ts",
+    "recovery:demo": "tsx scripts/recovery-demo.ts",
+    "recovery:demo:reset": "tsx scripts/recovery-demo.ts --reset",
     "data:template": "tsx scripts/create-test-template.ts",
     "evidence:validate": "tsx scripts/evidence-validate.ts",
     "evidence:migrate": "tsx scripts/evidence-migrate.ts",
@@ -19,6 +21,7 @@
     "test:pgn:fresh": "tsx scripts/fresh-pgn.ts",
     "test:pgn:retest": "tsx scripts/retest-pgn.ts",
     "test:pgn:retest:validate": "tsx scripts/validate-retest.ts",
+    "test:pgn:resume:validate": "tsx scripts/validate-resume.ts",
     "test:pgn:validate": "tsx scripts/validate-pgn-workbook.ts",
     "test:response-collector": "tsx --test scripts/response-collector.test.ts",
     "test:session-reset": "tsx --test scripts/session-reset.test.ts",
@@ -27,7 +30,8 @@
     "test:retest": "tsx --test scripts/retest.test.ts",
     "test:evidence": "tsx --test scripts/evidence-migration.test.ts",
     "test:operator": "tsx --test scripts/operator.test.ts",
-    "test:discord": "tsx --test scripts/discord.test.ts"
+    "test:discord": "tsx --test scripts/discord.test.ts",
+    "test:recovery": "tsx --test scripts/recovery.test.ts scripts/recovery-demo.test.ts"
   },
   "repository": {
     "type": "git",

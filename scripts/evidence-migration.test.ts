@@ -81,6 +81,18 @@ class MockDrivePublisher implements EvidenceDrivePublisher {
     };
   }
 
+  async validateRunFolder(
+    folderId: string,
+    expectedFolderName?: string,
+  ): Promise<DriveEvidenceItem> {
+    return {
+      id: folderId,
+      name: expectedFolderName ?? `folder-${folderId}`,
+      webViewLink: `https://drive.google.com/drive/folders/${folderId}`,
+      reused: true,
+    };
+  }
+
   async ensureRunFolder(
     requestedRunId: string,
     existingFolderId?: string,

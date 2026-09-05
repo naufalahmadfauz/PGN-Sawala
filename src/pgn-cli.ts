@@ -7,6 +7,7 @@ export interface CliOptions {
   rerunAll: boolean;
   rerunIds: Set<string>;
   resumeRunId?: string;
+  acceptSourceDrift: boolean;
 }
 
 function parseIdList(value: string): string[] {
@@ -21,6 +22,7 @@ export function parseCliOptions(args: string[]): CliOptions {
     testIds: new Set(),
     rerunAll: false,
     rerunIds: new Set(),
+    acceptSourceDrift: false,
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -59,12 +61,32 @@ export function parseCliOptions(args: string[]): CliOptions {
     } else if (argument === "--resume") {
       const value = args[++index]?.trim();
       if (!value || value.startsWith("--")) {
-        throw new Error("--resume requires a Retest Run ID");
+        throw new Error("--resume requires a Run ID");
       }
       options.resumeRunId = value;
+    } else if (argument === "--accept-source-drift") {
+      options.acceptSourceDrift = true;
     } else {
       throw new Error(`Unknown argument: ${argument}`);
     }
   }
+  if (options.acceptSourceDrift && !options.resumeRunId) {
+    throw new Error("--accept-source-drift requires --resume");
+  }
   return options;
+}
+
+export function assertResumeOptionsCompatible(options: CliOptions): void {
+  if (
+    options.resumeRunId &&
+    (options.limit !== undefined ||
+      options.sheet !== undefined ||
+      options.testIds.size > 0 ||
+      options.rerunAll ||
+      options.rerunIds.size > 0)
+  ) {
+    throw new Error(
+      "--resume cannot be combined with --limit, --sheet, --test, or --rerun; recovery uses the original selection snapshot",
+    );
+  }
 }

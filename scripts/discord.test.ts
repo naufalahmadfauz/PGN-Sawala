@@ -511,6 +511,35 @@ test("labels Ready-for-Retest runs throughout their lifecycle", async () => {
   );
 });
 
+test("resumed notifications preserve the Run ID and report reused recovery context", async () => {
+  const transport = recordingFetch();
+  const notifier = createDiscordNotifier(settings(), { fetch: transport.fetch });
+  await notifier.runResumed({
+    ...startEvent(),
+    resumedAt: new Date("2026-09-03T12:03:00.000Z"),
+    completedScenarios: 4,
+    remainingScenarios: 6,
+    interruptedScenarioId: "TC-005",
+    reusedDriveFolder: true,
+  });
+  await notifier.runCompleted({
+    ...progressEvent({ completedScenarios: 10, currentScenarioId: "TC-010" }),
+    completedAt: new Date("2026-09-03T12:05:00.000Z"),
+  });
+
+  const resumed = payload(transport.calls[0]!);
+  assert.equal(embedTitle(resumed), "PGN Test Resumed");
+  assert.equal(embedField(resumed, "Run ID"), startEvent().runId);
+  assert.equal(embedField(resumed, "Completed"), "4");
+  assert.equal(embedField(resumed, "Remaining"), "6");
+  assert.equal(embedField(resumed, "Interrupted scenario"), "TC-005");
+  assert.equal(embedField(resumed, "Drive folder"), "Reusing existing folder");
+  assert.deepEqual(
+    transport.calls.map((call) => call.init?.method),
+    ["POST", "PATCH", "POST"],
+  );
+});
+
 test("throttles progress by count, elapsed time, and a minimum edit interval", async () => {
   const transport = recordingFetch();
   const notifier = createDiscordNotifier(settings(), { fetch: transport.fetch });
@@ -976,6 +1005,7 @@ test("interruption handlers notify once, remove listeners, and terminate", async
   const notifications: string[] = [];
   const notifier: DiscordNotifier = {
     runStarted: async () => undefined,
+    runResumed: async () => undefined,
     runProgress: async () => undefined,
     runCompleted: async () => undefined,
     runFailed: async () => undefined,
@@ -1019,6 +1049,7 @@ test("interruption waits for status settlement and browser cleanup before termin
   const calls: string[] = [];
   const notifier: DiscordNotifier = {
     runStarted: async () => undefined,
+    runResumed: async () => undefined,
     runProgress: async () => undefined,
     runCompleted: async () => undefined,
     runFailed: async () => undefined,
@@ -1065,6 +1096,7 @@ test("interruption still terminates when progress collection fails", async () =>
   let terminated = false;
   const notifier: DiscordNotifier = {
     runStarted: async () => undefined,
+    runResumed: async () => undefined,
     runProgress: async () => undefined,
     runCompleted: async () => undefined,
     runFailed: async () => undefined,
@@ -1096,6 +1128,7 @@ test("interruption termination has a hard deadline when notification hangs", asy
   });
   const notifier: DiscordNotifier = {
     runStarted: async () => undefined,
+    runResumed: async () => undefined,
     runProgress: async () => undefined,
     runCompleted: async () => undefined,
     runFailed: async () => undefined,

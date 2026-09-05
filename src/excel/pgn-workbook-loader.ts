@@ -13,7 +13,7 @@ import {
   type PgnWorkbookDocument,
 } from "./pgn-types";
 
-const KB_HEADERS = [
+export const KB_HEADERS = [
   "No.",
   "Knowledge Base Article",
   "Test Case ID",
@@ -29,7 +29,7 @@ const KB_HEADERS = [
   "Notes",
 ];
 
-const NEGATIVE_HEADERS = [
+export const NEGATIVE_HEADERS = [
   "No.",
   "Category",
   "Test Case ID",

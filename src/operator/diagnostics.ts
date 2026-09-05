@@ -15,6 +15,10 @@ import {
 } from "../notifications/discord";
 import { detectBrowserRuntime, type BrowserRuntimePlan } from "./browser-runtime";
 import { commandAvailable, runProcess } from "./process";
+import {
+  discoverRecoveryRun,
+  type RecoveryDiscovery,
+} from "../recovery/run-state";
 
 export type DiagnosticStatus = "ok" | "warn" | "error" | "info";
 
@@ -50,6 +54,7 @@ export interface DiagnosticDependencies {
   checkDriveAccess?: boolean;
   inspectDiscord?: (config: AppConfig) => Promise<DiscordValidationResult>;
   checkDiscordAccess?: boolean;
+  inspectRecovery?: (projectRoot: string) => Promise<RecoveryDiscovery>;
 }
 
 async function defaultPathExists(filePath: string): Promise<boolean> {
@@ -288,6 +293,54 @@ export async function collectDiagnostics(
     executedWorkbookPresent ? "found" : "not created yet",
   );
 
+  let recoveryIsDemo = false;
+  try {
+    const recovery = await (
+      dependencies.inspectRecovery ?? discoverRecoveryRun
+    )(projectRoot);
+    recoveryIsDemo =
+      (recovery.kind === "recoverable" || recovery.kind === "running") &&
+      (recovery.state.isDemo === true || recovery.manifest.isDemo === true);
+    if (recovery.kind === "recoverable") {
+      add(
+        "recovery",
+        "PGN recovery",
+        "warn",
+        `${recoveryIsDemo ? "DEMO " : ""}Run ${recovery.state.runId} is ${recovery.state.status}; ${recovery.state.completedScenarioIds.length}/${recovery.state.totalScenarios} scenarios completed`,
+      );
+    } else if (recovery.kind === "running") {
+      add(
+        "recovery",
+        "PGN recovery",
+        "info",
+        `${recoveryIsDemo ? "DEMO " : ""}Run ${recovery.state.runId} is active; it is not resumable while its process lock is healthy`,
+      );
+    } else if (recovery.kind === "unreadable") {
+      add(
+        "recovery",
+        "PGN recovery",
+        "error",
+        `state is unreadable${recovery.runId ? ` for ${recovery.runId}` : ""}: ${recovery.reason}`,
+      );
+    } else if (recovery.lock.status === "unreadable") {
+      add(
+        "recovery",
+        "PGN recovery",
+        "error",
+        `process lock is unreadable: ${recovery.lock.reason}`,
+      );
+    } else {
+      add("recovery", "PGN recovery", "ok", "no interrupted run found");
+    }
+  } catch (error) {
+    add(
+      "recovery",
+      "PGN recovery",
+      "error",
+      error instanceof Error ? error.message : "state inspection failed",
+    );
+  }
+
   const profilePath = config?.profileDir ?? path.join(projectRoot, ".whatsapp-profile");
   const profilePresent = await pathExists(profilePath);
   add(
@@ -303,7 +356,14 @@ export async function collectDiagnostics(
     config?.target ? `configured by ${config.target.kind}` : "not configured",
   );
 
-  if (!config) {
+  if (recoveryIsDemo) {
+    add(
+      "drive",
+      "Google Drive",
+      "info",
+      "DEMO: skipped; credentials and remote access are not inspected",
+    );
+  } else if (!config) {
     add("drive", "Google Drive", "error", "configuration is invalid");
   } else if (!config.googleDriveEvidenceEnabled) {
     add("drive", "Google Drive", "warn", "disabled");
@@ -333,7 +393,14 @@ export async function collectDiagnostics(
     }
   }
 
-  if (!config) {
+  if (recoveryIsDemo) {
+    add(
+      "discord",
+      "Discord notifications",
+      "info",
+      "DEMO: skipped; webhook and remote access are not inspected",
+    );
+  } else if (!config) {
     add(
       "discord",
       "Discord notifications",
@@ -472,6 +539,9 @@ export function formatSetupInspection(report: DiagnosticReport): string {
     .map((check) => {
       const symbol = diagnosticSymbol(check.status);
       if (check.id === "drive") {
+        if (check.status === "info") {
+          return `${symbol} Google Drive: ${check.detail}`;
+        }
         if (check.status === "ok") {
           return `${symbol} Google Drive configuration: detected`;
         }
@@ -555,14 +625,18 @@ export function formatSetupChecklist(report: DiagnosticReport): string {
   } else {
     lines.push("! .env not found; current environment settings are unchanged");
   }
-  if (drive?.status === "ok" && /verified/i.test(drive.detail)) {
+  if (drive?.status === "info") {
+    lines.push(`${diagnosticSymbol("info")} Google Drive: ${drive.detail}`);
+  } else if (drive?.status === "ok" && /verified/i.test(drive.detail)) {
     lines.push("✓ Google Drive access verified");
   } else if (drive?.status === "warn") {
     lines.push("! Google Drive access not checked; Drive is disabled");
   } else {
     lines.push("✗ Google Drive access not verified");
   }
-  if (discord?.status === "ok" && /verified/i.test(discord.detail)) {
+  if (discord?.status === "info") {
+    lines.push(`${diagnosticSymbol("info")} Discord notifications: ${discord.detail}`);
+  } else if (discord?.status === "ok" && /verified/i.test(discord.detail)) {
     lines.push("✓ Discord webhook verified; no notification sent");
   } else if (discord?.status === "ok") {
     lines.push("✓ Discord webhook configured; connectivity not tested");
