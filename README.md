@@ -1,10 +1,12 @@
-# PGN WhatsApp QA Harness
+# PGN Sawala
 
 This harness drives the consumer WhatsApp Web UI with Playwright. Messages follow the real route through the PGN WhatsApp Business number, LivePerson, and the PGN bot; no direct bot or messaging API is used.
 
+**v1.0.0** is the first stable release. See the [release notes](RELEASE_NOTES_v1.0.0.md) and [changelog](CHANGELOG.md) for the V1 overview and verification results.
+
 ## Getting Started
 
-Install the project, run the guided setup, and open the operator control panel:
+With Node.js 20.12 or newer and npm installed, run the guided setup and open the operator control panel:
 
 ```bash
 npm install
@@ -18,6 +20,8 @@ The setup wizard inspects Node.js, npm, dependencies, Playwright Chromium, the P
 
 - full and filtered PGN runs
 - approved retest validation, execution, and resume
+- interrupted-run discovery and guided recovery
+- header-based workbook schema inspection and mapping review
 - workbook, evidence, and Drive validation
 - evidence migration
 - Discord notification status, testing, and configuration
@@ -32,6 +36,8 @@ Run non-interactive prerequisite checks at any time:
 ```bash
 npm run doctor
 ```
+
+Doctor checks local prerequisites and may validate configured Google Drive access; it does not send WhatsApp testcases or Discord notifications. The control panel's recovery demo uses local synthetic artifacts and suppresses external checks.
 
 ### Browser Support
 
@@ -248,6 +254,14 @@ npm run test:pgn -- --test PGN-KB-031 --rerun PGN-NEG-018
 
 `--rerun` without an ID reruns the selected set. `--rerun ID` selects and reruns that scenario. Without rerun, completed scenarios are skipped. A partially completed multi-turn scenario is skipped because continuing it later would not guarantee the original turn context.
 
+## Interrupted Runs
+
+Open `npm run pgn` after an interruption to inspect the recoverable run before starting new work. The recovery menu offers validation, explicit resume confirmation, scenario skip, reconciliation of conflicting progress, and abandonment while preserving history. Atomic checkpoints, process locks, and heartbeats prevent concurrent runners from overwriting progress.
+
+Resume preserves the Run ID, completed scenarios, original selection, and existing Drive folder. An incomplete multi-turn scenario restarts from Turn 1 after session reset; it never resumes midway through an old conversation. Source-content and column-schema drift are checked before execution, and unsafe structural changes block resume.
+
+Use `npm run test:pgn:resume:validate` to inspect readiness without sending testcase messages. For real runs this can check Drive folder access; demo runs skip external checks. If no interrupted run exists, the command reports `No recoverable PGN run was found`. Recovery state is stored locally in the gitignored `.runtime/` directory and is not included in release archives.
+
 ## Recovery Demo
 
 Create a safe local interrupted-run fixture, then use the same recovery menu as a real run:
@@ -304,7 +318,7 @@ npm run test:pgn:retest -- --test PGN-KB-075
 npm run test:pgn:retest -- --resume RETEST-20260902T053000Z
 ```
 
-`--test` explicitly selects only the named scenario and prints a warning if its current Status is not `Ready for Re-test`. `--resume` reloads the immutable selected-ID set from `Retest Metadata`, skips scenarios already completed successfully in that same run, retries prior technical failures, reuses its Drive folder, and deduplicates history rows. If all scenarios were saved but final session cleanup failed, resume retries that cleanup before marking the run complete. `--resume` cannot be combined with `--test` or `--sheet`, though `--limit` can constrain the remaining resumed scenarios. If a new selection is empty, the retest command exits successfully before Drive setup or WhatsApp startup.
+`--test` explicitly selects only the named scenario and prints a warning if its current Status is not `Ready for Re-test`. `--resume` reloads the immutable selected-ID set from `Retest Metadata`, skips scenarios already completed successfully in that same run, retries prior technical failures, reuses its Drive folder, and deduplicates history rows. If all scenarios were saved but final session cleanup failed, resume retries that cleanup before marking the run complete. `--resume` cannot be combined with `--limit`, `--sheet`, `--test`, or `--rerun`: recovery preserves the original selection snapshot. If a new selection is empty, the retest command exits successfully before Drive setup or WhatsApp startup.
 
 Selected retests require Google Drive evidence to be configured. Parent-folder authentication and retest-folder creation are completed before WhatsApp opens; invalid or disabled Drive configuration aborts without sending a testcase message. Per-file upload failures after startup remain non-fatal and are recorded separately from chatbot technical status.
 
