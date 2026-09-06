@@ -1,7 +1,8 @@
 import { access, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import dotenv from "dotenv";
-import { normalizeGoogleDriveFolderId } from "../config";
+import { loadConfig, normalizeGoogleDriveFolderId } from "../config";
+import { reviewWorkbookMapping } from "./workbook-configuration";
 import {
   resolveGoogleServiceAccount,
   safeGoogleCredentialError,
@@ -62,6 +63,7 @@ export interface DiscordSetupDependencies {
 }
 
 export interface SetupDependencies extends DiscordSetupDependencies {
+  reviewWorkbookMapping?: () => Promise<boolean>;
   platform?: NodeJS.Platform;
   diagnose?: (checkDriveAccess: boolean) => Promise<DiagnosticReport>;
   installChromium?: (withDependencies: boolean) => Promise<void>;
@@ -758,6 +760,14 @@ export async function runSetupWizard(
   }
 
   report = await diagnose(false);
+  if (report.checks.some((check) => check.id === "workbook-schema")) {
+    const review = await ui.confirm({ message: "Review workbook column mapping? Confident header detection does not require manual column entry.", initialValue: false });
+    if (review === undefined) return cancelled(ui);
+    if (review) {
+      await (dependencies.reviewWorkbookMapping ?? (() => reviewWorkbookMapping(ui, loadConfig({ repositoryRoot: projectRoot, environment }))))();
+      report = await diagnose(false);
+    }
+  }
   let chromiumInstalled = false;
   if (!report.chromiumInstalled) {
     const installChoice = await ui.select({

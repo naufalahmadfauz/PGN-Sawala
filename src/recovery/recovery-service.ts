@@ -11,7 +11,6 @@ import {
   upsertRetestRunMetadata,
 } from "../excel/retest-workbook";
 import {
-  cellText,
   isScenarioComplete,
   loadPgnWorkbook,
 } from "../excel/pgn-workbook-loader";
@@ -32,6 +31,7 @@ import { safeGoogleCredentialError } from "../evidence/google-service-account";
 import { validateDiscordWebhookUrl } from "../notifications/discord";
 import { retestDriveFolderName } from "../retest/retest-run";
 import { recoveryDemoConfig } from "./demo-safety";
+import { fieldCell, optionalFieldCell, EVIDENCE_FILE_SCHEMA, getWorksheetSchema, normalizeWorkbookHeader } from "../excel/workbook-schema";
 import {
   acquireRunProcessLock,
   createRecoveryManifest,
@@ -151,6 +151,7 @@ function transcriptCompletedScenarioIds(
   workbook: Workbook,
   state: RecoveryRunState,
   manifest: RecoveryRunManifest,
+  technicalOnly = false,
 ): Set<string> {
   const transcript = workbook.getWorksheet(TRANSCRIPT_SHEET_NAME);
   if (!transcript) return new Set();
@@ -159,11 +160,10 @@ function transcriptCompletedScenarioIds(
   const hasAttemptMarker = new Set<string>();
   const explicitlyCompleted = new Set<string>();
   for (let rowNumber = 2; rowNumber <= transcript.rowCount; rowNumber += 1) {
-    const row = transcript.getRow(rowNumber);
-    if (row.getCell(1).text !== state.runId) continue;
-    const scenarioId = row.getCell(2).text;
+    if (fieldCell(transcript, rowNumber, "runId").text !== state.runId) continue;
+    const scenarioId = fieldCell(transcript, rowNumber, "testCaseId").text;
     if (!selected.has(scenarioId)) continue;
-    const event = row.getCell(11).text;
+    const event = fieldCell(transcript, rowNumber, "status").text;
     if (event === "SCENARIO_ATTEMPT_STARTED") {
       hasAttemptMarker.add(scenarioId);
       latestAttemptTurns.set(scenarioId, new Set());
@@ -171,20 +171,22 @@ function transcriptCompletedScenarioIds(
       continue;
     }
     if (event === "SCENARIO_ATTEMPT_COMPLETED") {
-      explicitlyCompleted.add(scenarioId);
+      if (technicalOnly) explicitlyCompleted.delete(scenarioId);
+      else explicitlyCompleted.add(scenarioId);
       continue;
     }
     if (event === "SCENARIO_ATTEMPT_FAILED" && state.mode === "full") {
       explicitlyCompleted.add(scenarioId);
       continue;
     }
-    if (row.getCell(6).text !== "USER" || event !== "CAPTURED") continue;
+    if (technicalOnly || fieldCell(transcript, rowNumber, "role").text !== "USER" || event !== "CAPTURED") continue;
     const turns = latestAttemptTurns.get(scenarioId) ?? new Set<number>();
-    const turn = Number(row.getCell(5).value);
+    const turn = Number(fieldCell(transcript, rowNumber, "turn").value);
     if (Number.isInteger(turn) && turn > 0) turns.add(turn);
     latestAttemptTurns.set(scenarioId, turns);
   }
   const completed = new Set(explicitlyCompleted);
+  if (technicalOnly) return completed;
   for (const item of manifest.scenarios) {
     const turns = latestAttemptTurns.get(item.testCaseId);
     if (
@@ -201,31 +203,36 @@ function workbookCompletedScenarioIds(
   workbook: Workbook,
   scenarios: readonly PgnTestScenario[],
   state: RecoveryRunState,
+  manifest: RecoveryRunManifest,
 ): Set<string> {
   if (state.mode === "retest") {
     return new Set(getRetestRunMetadata(workbook, state.runId)?.finishedIds ?? []);
   }
+  const technicalCompleted = transcriptCompletedScenarioIds(workbook, state, manifest, true);
   return new Set(
     scenarios
       .filter((scenario) => {
         if (isScenarioComplete(workbook, scenario)) return true;
         const worksheet = workbook.getWorksheet(scenario.sheetName);
         if (!worksheet) return false;
-        const noteColumn = scenario.sheetKind === "kb" ? 13 : 12;
-        const dateColumn = scenario.sheetKind === "kb" ? 11 : 10;
+        const mapping = getWorksheetSchema(worksheet);
+        if (!mapping.fields.notes || !mapping.fields.testDate) {
+          // Optional reporting fields cannot be required to recover a terminal technical attempt.
+          return technicalCompleted.has(scenario.testCaseId);
+        }
         const rows =
           scenario.sheetKind === "kb"
             ? scenario.turns.map((turn) => turn.rowNumber)
             : [scenario.sourceRowNumber];
         return rows.some((rowNumber) => {
-          const executedAt = worksheet.getCell(rowNumber, dateColumn).value;
+          const executedAt = optionalFieldCell(worksheet, rowNumber, "testDate")?.value;
           // Notes survive reruns; only the current execution's marker counts.
           return (
             executedAt instanceof Date &&
             !Number.isNaN(executedAt.getTime()) &&
-            cellText(worksheet.getCell(rowNumber, noteColumn)).includes(
+            Boolean(optionalFieldCell(worksheet, rowNumber, "notes")?.text.includes(
               `[Technical execution ${executedAt.toISOString()}]`,
-            )
+            ))
           );
         });
       })
@@ -244,13 +251,12 @@ function evidenceScenarioIds(
   const uploadedTurns = new Map<string, Set<number>>();
   const selected = new Set(state.selectedScenarioIds);
   for (let rowNumber = 2; rowNumber <= metadata.rowCount; rowNumber += 1) {
-    const row = metadata.getRow(rowNumber);
-    if (row.getCell(9).text !== state.runId) continue;
-    const scenarioId = row.getCell(10).text;
+    if (fieldCell(metadata, rowNumber, "runId", EVIDENCE_FILE_SCHEMA).text !== state.runId) continue;
+    const scenarioId = fieldCell(metadata, rowNumber, "testCaseId", EVIDENCE_FILE_SCHEMA).text;
     if (!selected.has(scenarioId)) continue;
-    const turn = Number(row.getCell(11).value);
+    const turn = Number(fieldCell(metadata, rowNumber, "turn", EVIDENCE_FILE_SCHEMA).value);
     if (!Number.isInteger(turn) || turn < 1) continue;
-    const status = row.getCell(16).text;
+    const status = fieldCell(metadata, rowNumber, "evidenceStatus", EVIDENCE_FILE_SCHEMA).text;
     if (
       status &&
       status !== "EVIDENCE_CAPTURE_ERROR" &&
@@ -291,7 +297,7 @@ export function reconcileRecoveryArtifacts(
   manifest: RecoveryRunManifest,
 ): RecoveryReconciliation {
   const checkpoint = new Set(state.completedScenarioIds);
-  const workbookCompleted = workbookCompletedScenarioIds(workbook, scenarios, state);
+  const workbookCompleted = workbookCompletedScenarioIds(workbook, scenarios, state, manifest);
   const transcriptCompleted = transcriptCompletedScenarioIds(workbook, state, manifest);
   const skipped = new Set(state.skippedScenarioIds);
   const artifactConfirmed = new Set(
@@ -361,6 +367,19 @@ function lockCheck(lock: RunLockInspection): RecoveryValidationCheck {
     };
   }
   return { id: "lock", label: "Process lock", status: "error", detail: lock.reason };
+}
+
+function legacyRecoverySchemasMatch(workbook: Workbook, manifest: RecoveryRunManifest): boolean {
+  // Shipped checkpoints without fingerprints came from the canonical fixed-layout engine.
+  return manifest.scenarios.filter((item) => !item.schemaFingerprint).every((item) => {
+    const sheet = workbook.getWorksheet(item.sheetName);
+    if (!sheet) return false;
+    const mapping = getWorksheetSchema(sheet);
+    return mapping.definition.fields.filter((field) => field.field !== "evidence").every((field, index) =>
+      mapping.fields[field.field]?.columnIndex === index + 1 &&
+      normalizeWorkbookHeader(mapping.fields[field.field]?.header ?? "") === normalizeWorkbookHeader(field.header),
+    );
+  });
 }
 
 export async function validateRecoveryRun(
@@ -448,7 +467,11 @@ export async function validateRecoveryRun(
         source.parsed.scenarios,
         state,
       );
-      if (sourceHash === state.sourceWorkbookHash) {
+      const currentManifest = createRecoveryManifest(
+        state.runId, sourceHash, currentSourceScenarios, new Date(manifest.createdAt),
+      );
+      const schemaMatches = legacyRecoverySchemasMatch(source.workbook, manifest) && recoveryManifestMatches(manifest, currentManifest);
+      if (sourceHash === state.sourceWorkbookHash && schemaMatches) {
         sourceDrift = "unchanged";
         checks.push({
           id: "source",
@@ -457,13 +480,7 @@ export async function validateRecoveryRun(
           detail: "hash and scenario manifest unchanged",
         });
       } else {
-        const currentManifest = createRecoveryManifest(
-          state.runId,
-          sourceHash,
-          currentSourceScenarios,
-          new Date(manifest.createdAt),
-        );
-        sourceDrift = recoveryManifestMatches(manifest, currentManifest)
+        sourceDrift = schemaMatches
           ? "formatting-only"
           : "structural";
         checks.push({
@@ -473,7 +490,7 @@ export async function validateRecoveryRun(
           detail:
             sourceDrift === "formatting-only"
               ? "file hash changed, but selected scenario inputs are unchanged"
-              : "selected scenario inputs, order, rows, or turns changed; resume is blocked",
+              : "selected scenario inputs, order, rows, turns, or column mapping changed; resume is blocked",
         });
       }
     } catch (error) {
@@ -506,6 +523,9 @@ export async function validateRecoveryRun(
     try {
       const executed = await loadPgnWorkbook(storedExecutedPath);
       const scenarios = selectedScenarios(executed.parsed.scenarios, state);
+      if (!legacyRecoverySchemasMatch(executed.workbook, manifest)) {
+        throw new Error("Older recovery checkpoint has no schema snapshot; changed column mapping requires explicit recovery review");
+      }
       const executedManifest = createRecoveryManifest(
         state.runId,
         state.sourceWorkbookHash,
@@ -514,7 +534,7 @@ export async function validateRecoveryRun(
       );
       if (!recoveryManifestMatches(manifest, executedManifest)) {
         throw new Error(
-          "Executed workbook scenario inputs, order, rows, or turns differ from the recovery manifest",
+          "Executed workbook scenario inputs, order, rows, turns, or column mapping differ from the recovery manifest",
         );
       }
       if (state.mode === "retest") {

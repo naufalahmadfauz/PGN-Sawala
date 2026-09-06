@@ -99,6 +99,7 @@ export interface RecoveryManifestScenario {
   order: number;
   turnCount: number;
   inputHash: string;
+  schemaFingerprint?: string;
 }
 
 export interface RecoveryRunManifest {
@@ -301,6 +302,7 @@ export function createRecoveryManifest(
       order,
       turnCount: scenario.turns.length,
       inputHash: scenarioInputHash(scenario),
+      ...(scenario.schemaFingerprint ? { schemaFingerprint: scenario.schemaFingerprint } : {}),
     })),
   };
 }
@@ -309,7 +311,13 @@ export function recoveryManifestMatches(
   expected: RecoveryRunManifest,
   current: RecoveryRunManifest,
 ): boolean {
-  return JSON.stringify(expected.scenarios) === JSON.stringify(current.scenarios);
+  return expected.scenarios.length === current.scenarios.length && expected.scenarios.every((scenario, index) => {
+    const actual = current.scenarios[index];
+    const { schemaFingerprint, ...identity } = scenario;
+    const { schemaFingerprint: currentSchema, ...currentIdentity } = actual;
+    return JSON.stringify(identity) === JSON.stringify(currentIdentity) &&
+      (schemaFingerprint === undefined || schemaFingerprint === currentSchema);
+  });
 }
 
 function stringArray(value: unknown, name: string): string[] {
@@ -558,6 +566,7 @@ function parseManifest(value: unknown): RecoveryRunManifest {
       !Number.isInteger(parsed.turnCount) ||
       parsed.turnCount < 1 ||
       !/^[a-f0-9]{64}$/.test(parsed.inputHash)
+      || (parsed.schemaFingerprint !== undefined && !/^[a-f0-9]{64}$/.test(parsed.schemaFingerprint))
     ) {
       throw new Error("Recovery manifest scenario is invalid");
     }

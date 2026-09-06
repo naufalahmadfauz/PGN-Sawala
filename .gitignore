@@ -10,6 +10,7 @@ node_modules/
 /.whatsapp-profile/
 /artifacts/
 /.runtime/
+/.workbook-mappings.json
 
 # Local configuration and generated reports
 .env

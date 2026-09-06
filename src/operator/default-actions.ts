@@ -23,6 +23,7 @@ import {
   runSetupWizard,
 } from "./setup";
 import type { OperatorUi } from "./ui";
+import { ensureReviewedWorkbookMapping, formatWorkbookMappings, inspectWorkbookMappings, reviewWorkbookMapping } from "./workbook-configuration";
 import {
   abandonRecoveryRun,
   repairRecoveryProgress,
@@ -46,6 +47,7 @@ const SAFE_TEST_FILES = [
   "scripts/discord.test.ts",
   "scripts/recovery.test.ts",
   "scripts/recovery-demo.test.ts",
+  "scripts/workbook-schema.test.ts",
 ];
 
 function scriptPath(name: string): string {
@@ -74,6 +76,12 @@ export function createDefaultActions(ui: OperatorUi): OperatorActions {
     browserAction("whatsapp-login.ts", [], () => loginWhatsApp());
 
   return {
+    workbookSchema: async (review, redetect = false) => {
+      const config = loadConfig();
+      if (review) { await reviewWorkbookMapping(ui, config); return; }
+      const inspection = await inspectWorkbookMappings(config, redetect);
+      ui.note(formatWorkbookMappings(inspection), "Workbook schema");
+    },
     inspectRecovery: () => discoverRecoveryRun(loadConfig().projectRoot),
     validateRecovery: (runId) => validateRecoveryRun(loadConfig(), runId),
     resumeRecovery: async (runId, acceptSourceDrift = false) => {
@@ -100,25 +108,33 @@ export function createDefaultActions(ui: OperatorUi): OperatorActions {
     abandonRecovery: (runId) => abandonRecoveryRun(loadConfig(), runId),
     validatePgn: validatePgnWorkbook,
     prepareFresh: prepareFreshPgnWorkbook,
-    runPgn: (args) =>
-      browserAction(
+    runPgn: async (args) => {
+      if (!(await ensureReviewedWorkbookMapping(ui, loadConfig()))) {
+        throw new Error("Workbook mapping review cancelled; no testcase was executed.");
+      }
+      await browserAction(
         "run-pgn.ts",
         args,
         () => runPgnWorkbook(args, "full"),
         async () =>
           (await inspectPgnExecution(args, "full", loadConfig()))
             .browserRequired,
-      ),
+      );
+    },
     validateRetest,
-    runRetest: (args) =>
-      browserAction(
+    runRetest: async (args) => {
+      if (!(await ensureReviewedWorkbookMapping(ui, loadConfig()))) {
+        throw new Error("Workbook mapping review cancelled; no testcase was executed.");
+      }
+      await browserAction(
         "retest-pgn.ts",
         args,
         () => runPgnWorkbook(args, "retest"),
         async () =>
           (await inspectPgnExecution(args, "retest", loadConfig()))
             .browserRequired,
-      ),
+      );
+    },
     validateEvidence,
     migrateEvidence,
     validateDiscord: (sendTest) =>

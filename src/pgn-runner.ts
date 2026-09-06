@@ -472,6 +472,9 @@ async function runPgnWorkbookLocked(
     config.pgnExecutedWorkbookPath,
   );
   assertPgnWorkbookValid(executed.parsed);
+  for (const issue of executed.parsed.issues.filter((issue) => issue.severity === "WARNING")) {
+    console.log(`[Workbook warning] ${issue.sheetName}: ${issue.message}`);
+  }
 
   console.log(
     `[Workbook] ${executed.resumed ? "Resuming" : "Created"}: ${relativeToProject(config, config.pgnExecutedWorkbookPath)}`,

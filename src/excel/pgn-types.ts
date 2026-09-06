@@ -1,5 +1,6 @@
 import type ExcelJS from "exceljs";
 import type { PgnTestStatus } from "./pgn-test-status";
+import type { ResolvedWorksheetSchema } from "./workbook-schema";
 
 export const KB_SHEET_NAME = "Test Case Knowledge Base";
 export const NEGATIVE_SHEET_NAME = "Negative Case";
@@ -38,6 +39,7 @@ export interface PgnTestScenario {
   rawStatus: string;
   status?: PgnTestStatus;
   turns: PgnTestTurn[];
+  schemaFingerprint?: string;
 }
 
 export type ValidationIssueCode =
@@ -67,6 +69,7 @@ export interface PgnSheetSummary {
 }
 
 export interface ParsedPgnWorkbook {
+  schemas?: ResolvedWorksheetSchema[];
   scenarios: PgnTestScenario[];
   issues: PgnValidationIssue[];
   summaries: Record<PgnSheetKind, PgnSheetSummary>;

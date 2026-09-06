@@ -18,6 +18,7 @@ import type {
 } from "../types";
 import {
   cellText,
+  loadPgnWorkbook,
   parsePgnWorkbook,
 } from "./pgn-workbook-loader";
 import {
@@ -25,13 +26,17 @@ import {
   writeEvidenceHyperlink,
 } from "./evidence-workbook";
 import {
-  KB_SHEET_NAME,
-  NEGATIVE_SHEET_NAME,
   TRANSCRIPT_SHEET_NAME,
   type ExecutedTurn,
   type PgnTestScenario,
   type PgnWorkbookDocument,
 } from "./pgn-types";
+import { attachWorkbookMappings } from "./workbook-mapping";
+import { assertPgnWorkbookValid } from "./pgn-workbook-validator";
+import {
+  KB_SCHEMA, NEGATIVE_SCHEMA, TRANSCRIPT_SCHEMA, appendSchemaRow,
+  fieldCell, fieldColumn, optionalFieldCell, getWorksheetSchema,
+} from "./workbook-schema";
 
 interface PreservedTablePart {
   partPath: string;
@@ -48,36 +53,19 @@ const expectedOutputHashes = new WeakMap<ExcelJS.Workbook, string>();
 const TABLE_CONTENT_TYPE =
   "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml";
 
-const TRANSCRIPT_HEADERS = [
-  "Run ID",
-  "Test Case ID",
-  "Sheet",
-  "Excel Row",
-  "Turn",
-  "Role",
-  "Message",
-  "Timestamp",
-  "First Response (ms)",
-  "Total Response (ms)",
-  "Status",
-  "Error",
-  "Evidence Path",
-  "Evidence URL",
-  "Evidence Status",
-];
-
 function ensureTranscriptWorksheet(workbook: ExcelJS.Workbook): Worksheet {
   const existing = workbook.getWorksheet(TRANSCRIPT_SHEET_NAME);
   if (existing) {
-    existing.getColumn(6).width = Math.max(
-      existing.getColumn(6).width ?? 0,
+    const role = fieldColumn(existing, "role");
+    existing.getColumn(role).width = Math.max(
+      existing.getColumn(role).width ?? 0,
       16,
     );
     return existing;
   }
 
   const worksheet = workbook.addWorksheet(TRANSCRIPT_SHEET_NAME);
-  const header = worksheet.addRow(TRANSCRIPT_HEADERS);
+  const header = worksheet.addRow(TRANSCRIPT_SCHEMA.fields.map((item) => item.header));
   header.font = { bold: true, color: { argb: "FFFFFFFF" } };
   header.fill = {
     type: "pattern",
@@ -303,18 +291,15 @@ async function restoreTableParts(
 }
 
 function sourceOwnedCells(workbook: ExcelJS.Workbook): string {
-  const definitions = [
-    { sheetName: KB_SHEET_NAME, columns: [1, 2, 3, 4, 5, 6, 7, 8] },
-    { sheetName: NEGATIVE_SHEET_NAME, columns: [1, 2, 3, 4, 5, 6, 7, 13] },
-  ];
+  const definitions = [KB_SCHEMA, NEGATIVE_SCHEMA];
   return JSON.stringify(
-    definitions.map(({ sheetName, columns }) => {
+    definitions.map(({ sheetName, fields }) => {
       const worksheet = workbook.getWorksheet(sheetName);
       if (!worksheet) {
         return { sheetName, missing: true };
       }
-      const rows = Array.from({ length: worksheet.rowCount }, (_, rowIndex) =>
-        columns.map((column) => cellText(worksheet.getCell(rowIndex + 1, column))),
+      const rows = Array.from({ length: worksheet.rowCount - 1 }, (_, rowIndex) =>
+        fields.filter((field) => !field.writable).map((field) => optionalFieldCell(worksheet, rowIndex + 2, field.field)?.text ?? ""),
       );
       return { sheetName, rows };
     }),
@@ -327,6 +312,7 @@ async function assertExecutedWorkbookMatchesSource(
 ): Promise<void> {
   const sourceWorkbook = new ExcelJS.Workbook();
   await sourceWorkbook.xlsx.readFile(sourcePath);
+  await attachWorkbookMappings(sourceWorkbook, sourcePath);
   if (sourceOwnedCells(sourceWorkbook) !== sourceOwnedCells(executedWorkbook)) {
     throw new Error(
       "Executed workbook inputs do not match the source workbook; use a new output path",
@@ -340,72 +326,44 @@ function appendTranscriptRows(
   scenario: PgnTestScenario,
   execution: ExecutedTurn,
 ): void {
-  const common = [
-    runId,
-    scenario.testCaseId,
-    scenario.sheetName,
-    execution.turn.rowNumber,
-    execution.turn.turnNumber,
-  ];
-  const userRow = worksheet.addRow([
-    ...common,
-    "USER",
-    execution.turn.userInput,
-    execution.sentAt ?? execution.completedAt,
-    null,
-    null,
-    execution.technicalStatus,
-    execution.error ?? "",
-    execution.evidencePath ?? "",
-    execution.evidenceUrl ? "View Evidence" : "",
-    execution.evidenceStatus ?? "",
-  ]);
+  const common = {
+    runId, testCaseId: scenario.testCaseId, sheet: scenario.sheetName,
+    excelRow: execution.turn.rowNumber, turn: execution.turn.turnNumber,
+    status: execution.technicalStatus, error: execution.error ?? "",
+    evidencePath: execution.evidencePath ?? "", evidenceStatus: execution.evidenceStatus ?? "",
+  };
+  const userRow = appendSchemaRow(worksheet, {
+    ...common, role: "USER", message: execution.turn.userInput,
+    timestamp: execution.sentAt ?? execution.completedAt,
+  });
   if (execution.evidenceUrl) {
-    writeEvidenceHyperlink(userRow.getCell(14), execution.evidenceUrl);
+    writeEvidenceHyperlink(fieldCell(worksheet, userRow.number, "evidenceUrl"), execution.evidenceUrl);
   }
   userRow.alignment = { vertical: "top", wrapText: true };
-  userRow.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
+  fieldCell(worksheet, userRow.number, "timestamp").numFmt = "yyyy-mm-dd hh:mm:ss";
 
   if (execution.botMessages.length > 0) {
     for (const botMessage of execution.botMessages) {
-      const botRow = worksheet.addRow([
-        ...common,
-        "BOT",
-        botMessage.message,
-        botMessage.timestamp,
-        execution.firstResponseMs ?? null,
-        execution.totalResponseMs ?? null,
-        execution.technicalStatus,
-        execution.error ?? "",
-        execution.evidencePath ?? "",
-        execution.evidenceUrl ? "View Evidence" : "",
-        execution.evidenceStatus ?? "",
-      ]);
+      const botRow = appendSchemaRow(worksheet, {
+        ...common, role: "BOT", message: botMessage.message, timestamp: botMessage.timestamp,
+        firstResponseMs: execution.firstResponseMs ?? null, totalResponseMs: execution.totalResponseMs ?? null,
+      });
       if (execution.evidenceUrl) {
-        writeEvidenceHyperlink(botRow.getCell(14), execution.evidenceUrl);
+        writeEvidenceHyperlink(fieldCell(worksheet, botRow.number, "evidenceUrl"), execution.evidenceUrl);
       }
       botRow.alignment = { vertical: "top", wrapText: true };
-      botRow.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
+      fieldCell(worksheet, botRow.number, "timestamp").numFmt = "yyyy-mm-dd hh:mm:ss";
     }
   } else if (execution.error) {
-    const errorRow = worksheet.addRow([
-      ...common,
-      "SYSTEM",
-      execution.error,
-      execution.completedAt,
-      execution.firstResponseMs ?? null,
-      execution.totalResponseMs ?? null,
-      execution.technicalStatus,
-      execution.error,
-      execution.evidencePath ?? "",
-      execution.evidenceUrl ? "View Evidence" : "",
-      execution.evidenceStatus ?? "",
-    ]);
+    const errorRow = appendSchemaRow(worksheet, {
+      ...common, role: "SYSTEM", message: execution.error, timestamp: execution.completedAt,
+      firstResponseMs: execution.firstResponseMs ?? null, totalResponseMs: execution.totalResponseMs ?? null,
+    });
     if (execution.evidenceUrl) {
-      writeEvidenceHyperlink(errorRow.getCell(14), execution.evidenceUrl);
+      writeEvidenceHyperlink(fieldCell(worksheet, errorRow.number, "evidenceUrl"), execution.evidenceUrl);
     }
     errorRow.alignment = { vertical: "top", wrapText: true };
-    errorRow.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
+    fieldCell(worksheet, errorRow.number, "timestamp").numFmt = "yyyy-mm-dd hh:mm:ss";
   }
 }
 
@@ -415,27 +373,31 @@ function applyKnowledgeBaseExecution(
   executions: ExecutedTurn[],
 ): void {
   for (const turn of scenario.turns) {
-    for (const column of [9, 10, 11, 14]) {
-      worksheet.getCell(turn.rowNumber, column).value = null;
+    for (const field of ["botResponse", "responseTime", "testDate", "evidence"] as const) {
+      const cell = optionalFieldCell(worksheet, turn.rowNumber, field);
+      if (cell) cell.value = null;
     }
   }
   for (const execution of executions) {
     const row = execution.turn.rowNumber;
     if (execution.combinedResponse) {
-      worksheet.getCell(row, 9).value = execution.combinedResponse;
+      fieldCell(worksheet, row, "botResponse").value = execution.combinedResponse;
     }
-    if (execution.totalResponseMs !== undefined) {
-      const responseTime = worksheet.getCell(row, 10);
+    const responseTime = optionalFieldCell(worksheet, row, "responseTime");
+    if (execution.totalResponseMs !== undefined && responseTime) {
       responseTime.value = secondsFromMilliseconds(execution.totalResponseMs);
       setNumberFormat(responseTime, '0.00" s"');
     }
-    writeExecutionDate(worksheet.getCell(row, 11), execution.completedAt);
-    if (execution.evidenceUrl) {
-      writeEvidenceHyperlink(worksheet.getCell(row, 14), execution.evidenceUrl);
+    const date = optionalFieldCell(worksheet, row, "testDate");
+    if (date) writeExecutionDate(date, execution.completedAt);
+    const evidence = optionalFieldCell(worksheet, row, "evidence");
+    if (execution.evidenceUrl && evidence) {
+      writeEvidenceHyperlink(evidence, execution.evidenceUrl);
     }
-    if (execution.technicalStatus !== "CAPTURED") {
+    const notes = optionalFieldCell(worksheet, row, "notes");
+    if (execution.technicalStatus !== "CAPTURED" && notes) {
       appendTechnicalNote(
-        worksheet.getCell(row, 13),
+        notes,
         `[Technical execution ${execution.completedAt.toISOString()}] Turn ${execution.turn.turnNumber}: ${execution.technicalStatus}${execution.error ? ` - ${execution.error}` : ""}`,
       );
     }
@@ -448,8 +410,9 @@ function applyNegativeExecution(
   executions: ExecutedTurn[],
 ): void {
   const row = scenario.sourceRowNumber;
-  for (const column of [8, 9, 10, 14]) {
-    worksheet.getCell(row, column).value = null;
+  for (const field of ["botResponse", "responseTime", "testDate", "evidence"] as const) {
+    const cell = optionalFieldCell(worksheet, row, field);
+    if (cell) cell.value = null;
   }
   const isMultiTurn = scenario.turns.length > 1;
   const allTurnsExecuted = executions.length === scenario.turns.length;
@@ -464,7 +427,7 @@ function applyNegativeExecution(
     allTurnsExecuted &&
     executions.every((execution) => Boolean(execution.combinedResponse));
   if (allTurnsHaveResponses) {
-    worksheet.getCell(row, 8).value = isMultiTurn
+    fieldCell(worksheet, row, "botResponse").value = isMultiTurn
       ? executions
           .map(
             (execution) =>
@@ -477,8 +440,8 @@ function applyNegativeExecution(
   const allTurnsHaveTiming =
     allTurnsExecuted &&
     executions.every((execution) => execution.totalResponseMs !== undefined);
-  if (allTurnsHaveTiming) {
-    const responseTime = worksheet.getCell(row, 9);
+  const responseTime = optionalFieldCell(worksheet, row, "responseTime");
+  if (allTurnsHaveTiming && responseTime) {
     if (isMultiTurn) {
       responseTime.value = executions
         .map(
@@ -496,23 +459,26 @@ function applyNegativeExecution(
   }
 
   const completedAt = executions.at(-1)?.completedAt ?? new Date();
-  writeExecutionDate(worksheet.getCell(row, 10), completedAt);
+  const date = optionalFieldCell(worksheet, row, "testDate");
+  if (date) writeExecutionDate(date, completedAt);
   const finalExecution = executions.at(-1);
   const expectedFinalTurn = scenario.turns.at(-1)?.turnNumber;
+  const evidence = optionalFieldCell(worksheet, row, "evidence");
   if (
     finalExecution &&
     finalExecution.turn.turnNumber === expectedFinalTurn &&
-    finalExecution.evidenceUrl
+    finalExecution.evidenceUrl && evidence
   ) {
     writeEvidenceHyperlink(
-      worksheet.getCell(row, 14),
+      evidence,
       finalExecution.evidenceUrl,
     );
   }
   for (const execution of executions) {
-    if (execution.technicalStatus !== "CAPTURED") {
+    const notes = optionalFieldCell(worksheet, row, "notes");
+    if (execution.technicalStatus !== "CAPTURED" && notes) {
       appendTechnicalNote(
-        worksheet.getCell(row, 12),
+        notes,
         `[Technical execution ${execution.completedAt.toISOString()}] Turn ${execution.turn.turnNumber}: ${execution.technicalStatus}${execution.error ? ` - ${execution.error}` : ""}`,
       );
     }
@@ -526,6 +492,7 @@ export async function openExecutedPgnWorkbook(
   if (path.resolve(sourcePath) === path.resolve(outputPath)) {
     throw new Error("Executed workbook path must differ from the immutable source");
   }
+  assertPgnWorkbookValid((await loadPgnWorkbook(sourcePath)).parsed);
   await mkdir(path.dirname(outputPath), { recursive: true });
   const tableParts = await readTableParts(sourcePath);
   const resumed = await access(outputPath)
@@ -542,6 +509,8 @@ export async function openExecutedPgnWorkbook(
   await workbook.xlsx.load(
     outputContents as unknown as Parameters<typeof workbook.xlsx.load>[0],
   );
+  await attachWorkbookMappings(workbook, outputPath, sourcePath);
+  assertPgnWorkbookValid(parsePgnWorkbook(workbook));
   expectedOutputHashes.set(workbook, bufferHash(outputContents));
   if (resumed) {
     await assertExecutedWorkbookMatchesSource(sourcePath, workbook);
@@ -584,6 +553,7 @@ export function applyScenarioResults(
   if (!worksheet) {
     throw new Error(`Worksheet "${scenario.sheetName}" was not found`);
   }
+  getWorksheetSchema(worksheet);
   if (scenario.sheetKind === "kb") {
     applyKnowledgeBaseExecution(worksheet, scenario, executions);
   } else {
@@ -616,13 +586,7 @@ export function appendSessionResetTranscript(
   attempt: BotSessionResetAttempt,
 ): void {
   const worksheet = ensureTranscriptWorksheet(workbook);
-  const common = [
-    runId,
-    scenario.testCaseId,
-    scenario.sheetName,
-    scenario.sourceRowNumber,
-    null,
-  ];
+  const common = { runId, testCaseId: scenario.testCaseId, sheet: scenario.sheetName, excelRow: scenario.sourceRowNumber };
   const appendRow = (
     role:
       | "CONTROL_USER"
@@ -634,21 +598,13 @@ export function appendSessionResetTranscript(
     firstResponseMs?: number,
     totalResponseMs?: number,
   ): void => {
-    const row = worksheet.addRow([
-      ...common,
-      role,
-      message,
-      timestamp,
-      firstResponseMs ?? null,
-      totalResponseMs ?? null,
-      attempt.status,
-      attempt.error ?? "",
-      attempt.evidencePath ?? "",
-      "",
-      "",
-    ]);
+    const row = appendSchemaRow(worksheet, {
+      ...common, role, message, timestamp,
+      firstResponseMs: firstResponseMs ?? null, totalResponseMs: totalResponseMs ?? null,
+      status: attempt.status, error: attempt.error ?? "", evidencePath: attempt.evidencePath ?? "",
+    });
     row.alignment = { vertical: "top", wrapText: true };
-    row.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
+    fieldCell(worksheet, row.number, "timestamp").numFmt = "yyyy-mm-dd hh:mm:ss";
   };
 
   if (attempt.sentAt) {
@@ -706,46 +662,20 @@ export function appendPostResetDrainTranscript(
   drain: PostResetDrainResult,
 ): void {
   const worksheet = ensureTranscriptWorksheet(workbook);
-  const common = [
-    runId,
-    scenario.testCaseId,
-    scenario.sheetName,
-    scenario.sourceRowNumber,
-    null,
-  ];
+  const common = { runId, testCaseId: scenario.testCaseId, sheet: scenario.sheetName, excelRow: scenario.sourceRowNumber };
   for (const staleMessage of drain.staleMessages) {
-    const row = worksheet.addRow([
-      ...common,
-      "STALE_BOT",
-      staleMessage.text,
-      staleMessage.observedAt,
-      null,
-      null,
-      "STALE_DRAINED",
-      "",
-      "",
-      "",
-      "",
-    ]);
+    const row = appendSchemaRow(worksheet, { ...common, role: "STALE_BOT", message: staleMessage.text, timestamp: staleMessage.observedAt, status: "STALE_DRAINED" });
     row.alignment = { vertical: "top", wrapText: true };
-    row.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
+    fieldCell(worksheet, row.number, "timestamp").numFmt = "yyyy-mm-dd hh:mm:ss";
   }
 
-  const completionRow = worksheet.addRow([
-    ...common,
-    "CONTROL_SYSTEM",
-    `Post-reset quiet period confirmed: ${drain.quietMs} ms${drain.staleMessages.length ? `; stale messages drained: ${drain.staleMessages.length}` : ""}`,
-    drain.completedAt,
-    null,
-    null,
-    "QUIET_CONFIRMED",
-    "",
-    "",
-    "",
-    "",
-  ]);
+  const completionRow = appendSchemaRow(worksheet, {
+    ...common, role: "CONTROL_SYSTEM",
+    message: `Post-reset quiet period confirmed: ${drain.quietMs} ms${drain.staleMessages.length ? `; stale messages drained: ${drain.staleMessages.length}` : ""}`,
+    timestamp: drain.completedAt, status: "QUIET_CONFIRMED",
+  });
   completionRow.alignment = { vertical: "top", wrapText: true };
-  completionRow.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
+  fieldCell(worksheet, completionRow.number, "timestamp").numFmt = "yyyy-mm-dd hh:mm:ss";
 }
 
 export type RecoveryTranscriptEvent =
@@ -772,25 +702,13 @@ export function appendRecoveryTranscriptEvent(
   },
 ): void {
   const worksheet = ensureTranscriptWorksheet(workbook);
-  const row = worksheet.addRow([
-    options.runId,
-    options.scenario?.testCaseId ?? "",
-    options.scenario?.sheetName ?? "",
-    options.scenario?.sourceRowNumber ?? null,
-    null,
-    "RECOVERY_SYSTEM",
-    options.message,
-    options.timestamp ?? new Date(),
-    null,
-    null,
-    options.event,
-    "",
-    "",
-    "",
-    "",
-  ]);
+  const row = appendSchemaRow(worksheet, {
+    runId: options.runId, testCaseId: options.scenario?.testCaseId ?? "",
+    sheet: options.scenario?.sheetName ?? "", excelRow: options.scenario?.sourceRowNumber ?? null,
+    role: "RECOVERY_SYSTEM", message: options.message, timestamp: options.timestamp ?? new Date(), status: options.event,
+  });
   row.alignment = { vertical: "top", wrapText: true };
-  row.getCell(8).numFmt = "yyyy-mm-dd hh:mm:ss";
+  fieldCell(worksheet, row.number, "timestamp").numFmt = "yyyy-mm-dd hh:mm:ss";
 }
 
 export async function saveExecutedPgnWorkbook(

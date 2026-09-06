@@ -1067,6 +1067,7 @@ test("explicit Discord diagnostics inspect safely and remain non-blocking on fai
         reason: `Could not inspect ${webhook}`,
       };
     },
+    inspectWorkbookSchema: async () => ({ ready: true, detail: "fixture mapping" }),
   });
 
   const discord = report.checks.find((check) => check.id === "discord");
@@ -1112,6 +1113,7 @@ for (const kind of ["recoverable", "running"] as const) {
         manifest: recovery.validation.manifest,
         lock: { status: "unlocked" },
       }),
+      inspectWorkbookSchema: async () => ({ ready: true, detail: "fixture mapping" }),
       checkDriveAccess: true,
       validateDrive: async () => {
         externalCalls.push("drive");

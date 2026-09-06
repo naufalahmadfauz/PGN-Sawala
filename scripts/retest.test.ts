@@ -8,7 +8,6 @@ import { promisify } from "node:util";
 import ExcelJS from "exceljs";
 import { loadConfig, type AppConfig } from "../src/config";
 import {
-  MAIN_EVIDENCE_COLUMN,
   readEvidenceHyperlink,
 } from "../src/excel/evidence-workbook";
 import { createFreshPgnWorkbook } from "../src/excel/fresh-workbook";

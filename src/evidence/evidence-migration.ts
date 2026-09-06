@@ -11,9 +11,6 @@ import ExcelJS from "exceljs";
 import type { AppConfig } from "../config";
 import {
   EVIDENCE_MIGRATION_VERSION,
-  MAIN_EVIDENCE_COLUMN,
-  TRANSCRIPT_EVIDENCE_STATUS_COLUMN,
-  TRANSCRIPT_EVIDENCE_URL_COLUMN,
   getEvidenceFileMetadata,
   getEvidenceRunMetadata,
   removeEvidenceFileMetadata,
@@ -23,6 +20,7 @@ import {
   writeEvidenceHyperlink,
   writeMainEvidenceHyperlink,
 } from "../excel/evidence-workbook";
+import { fieldCell, optionalFieldCell } from "../excel/workbook-schema";
 import { cellText, parsePgnWorkbook } from "../excel/pgn-workbook-loader";
 import { updateRetestHistoryEvidence } from "../excel/retest-workbook";
 import {
@@ -158,15 +156,14 @@ export function discoverEvidenceInventory(
   >();
 
   for (let rowNumber = 2; rowNumber <= transcript.rowCount; rowNumber += 1) {
-    const row = transcript.getRow(rowNumber);
-    if (!MIGRATABLE_ROLES.has(row.getCell(6).text)) {
+    if (!MIGRATABLE_ROLES.has(fieldCell(transcript, rowNumber, "role").text)) {
       continue;
     }
-    const runId = row.getCell(1).text.trim();
-    const testCaseId = row.getCell(2).text.trim();
-    const sheetName = row.getCell(3).text.trim();
-    const excelRow = numericCell(row.getCell(4).value);
-    const turnNumber = numericCell(row.getCell(5).value);
+    const runId = fieldCell(transcript, rowNumber, "runId").text.trim();
+    const testCaseId = fieldCell(transcript, rowNumber, "testCaseId").text.trim();
+    const sheetName = fieldCell(transcript, rowNumber, "sheet").text.trim();
+    const excelRow = numericCell(fieldCell(transcript, rowNumber, "excelRow").value);
+    const turnNumber = numericCell(fieldCell(transcript, rowNumber, "turn").value);
     if (!runId || !testCaseId || !sheetName || !excelRow || !turnNumber) {
       continue;
     }
@@ -185,11 +182,11 @@ export function discoverEvidenceInventory(
     };
     group.transcriptRows.push(rowNumber);
     group.locations.add(`${sheetName}|${excelRow}`);
-    const localPath = row.getCell(13).text.trim();
+    const localPath = fieldCell(transcript, rowNumber, "evidencePath").text.trim();
     const url = readEvidenceHyperlink(
-      row.getCell(TRANSCRIPT_EVIDENCE_URL_COLUMN),
+      optionalFieldCell(transcript, rowNumber, "evidenceUrl"),
     );
-    const status = row.getCell(TRANSCRIPT_EVIDENCE_STATUS_COLUMN).text.trim();
+    const status = optionalFieldCell(transcript, rowNumber, "evidenceStatus")?.text.trim() ?? "";
     if (localPath) {
       group.paths.add(localPath);
     }
@@ -263,12 +260,12 @@ export function discoverEvidenceInventory(
       continue;
     }
     const scenarioComplete = scenario.sheetKind === "negative"
-      ? Boolean(cellText(worksheet.getCell(scenario.sourceRowNumber, 8)).trim())
+      ? Boolean(cellText(fieldCell(worksheet, scenario.sourceRowNumber, "botResponse")).trim())
       : undefined;
     for (const turn of scenario.turns) {
       const completed =
         scenarioComplete ??
-        Boolean(cellText(worksheet.getCell(turn.rowNumber, 9)).trim());
+        Boolean(cellText(fieldCell(worksheet, turn.rowNumber, "botResponse")).trim());
       const turnKey = `${scenario.testCaseId}|${turn.turnNumber}`;
       if (completed && !coveredTurns.has(turnKey)) {
         missingCompletedTurns.push({
@@ -460,19 +457,18 @@ function writeTranscriptEvidence(
   const transcript = workbook.getWorksheet(TRANSCRIPT_SHEET_NAME)!;
   let changed = false;
   for (const rowNumber of record.transcriptRows) {
-    const row = transcript.getRow(rowNumber);
     if (url) {
       changed =
         writeEvidenceHyperlink(
-          row.getCell(TRANSCRIPT_EVIDENCE_URL_COLUMN),
+           fieldCell(transcript, rowNumber, "evidenceUrl"),
           url,
         ) || changed;
-    } else if (row.getCell(TRANSCRIPT_EVIDENCE_URL_COLUMN).value) {
-      row.getCell(TRANSCRIPT_EVIDENCE_URL_COLUMN).value = null;
+    } else if (fieldCell(transcript, rowNumber, "evidenceUrl").value) {
+      fieldCell(transcript, rowNumber, "evidenceUrl").value = null;
       changed = true;
     }
-    if (row.getCell(TRANSCRIPT_EVIDENCE_STATUS_COLUMN).text !== status) {
-      row.getCell(TRANSCRIPT_EVIDENCE_STATUS_COLUMN).value = status;
+    if (fieldCell(transcript, rowNumber, "evidenceStatus").text !== status) {
+      fieldCell(transcript, rowNumber, "evidenceStatus").value = status;
       changed = true;
     }
   }
@@ -531,7 +527,8 @@ function clearMainEvidence(
   if (!worksheet) {
     throw new Error(`Worksheet "${record.sheetName}" was not found`);
   }
-  worksheet.getCell(record.rowNumber, MAIN_EVIDENCE_COLUMN).value = null;
+  const cell = optionalFieldCell(worksheet, record.rowNumber, "evidence");
+  if (cell) cell.value = null;
 }
 
 function recordLabel(record: TranscriptEvidenceRecord): string {

@@ -46,8 +46,8 @@ export async function migrateEvidence(
   console.log(
     `Workbook updated: ${path.relative(config.projectRoot, config.pgnExecutedWorkbookPath)}`,
   );
-  console.log("Evidence column used: N");
-  console.log("Transcript Evidence URL column: N");
+    console.log("Evidence columns: resolved from each worksheet's headers");
+    console.log("Transcript Evidence URL: resolved from its header");
   console.log(
     `Backup path: ${path.relative(config.projectRoot, summary.backupPath)}`,
   );

@@ -22,6 +22,7 @@ export interface RetestReadiness {
 }
 
 export interface OperatorActions {
+  workbookSchema?(review: boolean, redetect?: boolean): Promise<void>;
   inspectRecovery?(): Promise<RecoveryDiscovery>;
   validateRecovery?(runId: string): Promise<RecoveryValidation>;
   resumeRecovery?(runId: string, acceptSourceDrift?: boolean): Promise<void>;
@@ -763,6 +764,7 @@ export async function runControlPanel(
         { value: "run", label: "Run tests" },
         { value: "retest", label: "Retest fixed cases" },
         { value: "validate", label: "Validate" },
+        ...(actions.workbookSchema ? [{ value: "workbook", label: "Workbook" }] : []),
         { value: "evidence", label: "Evidence" },
         { value: "notifications", label: "Notifications" },
         { value: "whatsapp", label: "WhatsApp" },
@@ -784,6 +786,19 @@ export async function runControlPanel(
     if (choice === "run") keepRunning = await runTestsMenu(ui, actions);
     if (choice === "retest") keepRunning = await retestMenu(ui, actions);
     if (choice === "validate") keepRunning = await validationMenu(ui, actions);
+    if (choice === "workbook" && actions.workbookSchema) {
+      while (true) {
+        const operation = await ui.select({ message: "Workbook", options: [
+          { value: "status", label: "Schema status" },
+          { value: "review", label: "Review column mapping" },
+          { value: "redetect", label: "Re-detect columns" },
+          { value: "back", label: "Back" },
+        ] });
+        if (!operation) { keepRunning = false; break; }
+        if (operation === "back") break;
+        await attempt(ui, "Inspecting workbook schema without live execution", () => actions.workbookSchema!(operation === "review", operation === "redetect"));
+      }
+    }
     if (choice === "evidence") keepRunning = await evidenceMenu(ui, actions);
     if (choice === "notifications") {
       keepRunning = await notificationsMenu(ui, actions);

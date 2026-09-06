@@ -2,10 +2,13 @@ import { loadConfig, type AppConfig } from "../src/config";
 import { isEntrypoint, runCliMain } from "../src/cli-entrypoint";
 import { loadPgnWorkbook } from "../src/excel/pgn-workbook-loader";
 import { formatPgnValidation } from "../src/excel/pgn-workbook-validator";
+import { formatWorkbookMappings, inspectWorkbookMappings } from "../src/operator/workbook-configuration";
 
 export async function validatePgnWorkbook(
   config: AppConfig = loadConfig(),
 ): Promise<boolean> {
+  const inspection = await inspectWorkbookMappings(config, true);
+  console.log(formatWorkbookMappings(inspection));
   const { parsed } = await loadPgnWorkbook(config.pgnSourceWorkbookPath);
   console.log(
     formatPgnValidation(parsed, {
@@ -17,7 +20,7 @@ export async function validatePgnWorkbook(
       postResetQuietMs: config.postResetQuietMs,
     }),
   );
-  return !parsed.issues.some((issue) => issue.severity === "ERROR");
+  return inspection.ready && !parsed.issues.some((issue) => issue.severity === "ERROR");
 }
 
 if (isEntrypoint(import.meta.url)) {

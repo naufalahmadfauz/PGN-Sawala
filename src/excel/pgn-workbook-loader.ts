@@ -2,6 +2,12 @@ import { access } from "node:fs/promises";
 import ExcelJS, { type Cell, type Worksheet } from "exceljs";
 import { parseTurnsFromCell } from "./multi-turn-parser";
 import { normalizeTestStatus } from "./pgn-test-status";
+import { attachWorkbookMappings } from "./workbook-mapping";
+import {
+  KB_SCHEMA, NEGATIVE_SCHEMA, WORKBOOK_SCHEMAS, fieldCell, optionalFieldCell,
+  resolveWorksheetSchema, mainSchemaFingerprint,
+} from "./workbook-schema";
+export { KB_HEADERS, NEGATIVE_HEADERS } from "./workbook-schema";
 import {
   KB_SHEET_NAME,
   NEGATIVE_SHEET_NAME,
@@ -12,38 +18,6 @@ import {
   type PgnValidationIssue,
   type PgnWorkbookDocument,
 } from "./pgn-types";
-
-export const KB_HEADERS = [
-  "No.",
-  "Knowledge Base Article",
-  "Test Case ID",
-  "Role Pengujian",
-  "Scenario / Test Objective",
-  "Expected Bot Response",
-  "Turn",
-  "User Input",
-  "Bot Response",
-  "Response Time",
-  "Test Date",
-  "Status",
-  "Notes",
-];
-
-export const NEGATIVE_HEADERS = [
-  "No.",
-  "Category",
-  "Test Case ID",
-  "Scenario / Test Objective",
-  "User Input / Test Steps",
-  "Negative Condition",
-  "Expected Handling",
-  "Bot Response",
-  "Response Time",
-  "Test Date",
-  "Status",
-  "Notes",
-  "Reference",
-];
 
 export function cellText(cell: Cell): string {
   return String(cell.text ?? "").replace(/\r\n/g, "\n");
@@ -73,32 +47,12 @@ function parseTurnNumber(
   return turnNumber;
 }
 
-function validateHeaders(
-  worksheet: Worksheet,
-  expected: string[],
-  issues: PgnValidationIssue[],
-): void {
-  expected.forEach((header, index) => {
-    const actual = cellText(worksheet.getCell(1, index + 1)).trim();
-    if (actual !== header) {
-      issues.push({
-        code: "INVALID_HEADER",
-        severity: "ERROR",
-        sheetName: worksheet.name,
-        rowNumber: 1,
-        message: `Column ${worksheet.getColumn(index + 1).letter} must be "${header}"; found "${actual}".`,
-      });
-    }
-  });
-}
-
 function readScenarioStatus(
   worksheet: Worksheet,
   rowNumber: number,
-  columnNumber: number,
   issues: PgnValidationIssue[],
 ): { rawStatus: string; status: PgnTestScenario["status"] } {
-  const rawStatus = cellText(worksheet.getCell(rowNumber, columnNumber)).trim();
+  const rawStatus = cellText(fieldCell(worksheet, rowNumber, "status")).trim();
   const status = normalizeTestStatus(rawStatus);
   if (rawStatus && !status) {
     issues.push({
@@ -117,14 +71,13 @@ function parseKnowledgeBaseSheet(
   issues: PgnValidationIssue[],
   testIdRows: Map<string, { sheetName: string; rowNumber: number }>,
 ): PgnTestScenario[] {
-  validateHeaders(worksheet, KB_HEADERS, issues);
   const scenarios: PgnTestScenario[] = [];
   let currentScenario: PgnTestScenario | undefined;
 
   for (let rowNumber = 2; rowNumber <= worksheet.rowCount; rowNumber += 1) {
-    const testCaseId = cellText(worksheet.getCell(rowNumber, 3)).trim();
-    const rawTurn = cellText(worksheet.getCell(rowNumber, 7));
-    const userInput = cellText(worksheet.getCell(rowNumber, 8));
+    const testCaseId = cellText(fieldCell(worksheet, rowNumber, "testCaseId")).trim();
+    const rawTurn = cellText(fieldCell(worksheet, rowNumber, "turn"));
+    const userInput = cellText(fieldCell(worksheet, rowNumber, "userInput"));
     const hasTurn = Boolean(rawTurn.trim());
     const hasInput = Boolean(userInput.trim());
     if (!testCaseId && !hasTurn && !hasInput) {
@@ -150,7 +103,6 @@ function parseKnowledgeBaseSheet(
       const scenarioStatus = readScenarioStatus(
         worksheet,
         rowNumber,
-        12,
         issues,
       );
       currentScenario = {
@@ -158,7 +110,8 @@ function parseKnowledgeBaseSheet(
         sheetKind: "kb",
         sheetName: worksheet.name,
         sourceRowNumber: rowNumber,
-        category: cellText(worksheet.getCell(rowNumber, 2)).trim(),
+        category: optionalFieldCell(worksheet, rowNumber, "knowledgeBaseArticle")?.text.trim() ?? "",
+        schemaFingerprint: mainSchemaFingerprint(worksheet),
         ...scenarioStatus,
         turns: [],
       };
@@ -169,7 +122,7 @@ function parseKnowledgeBaseSheet(
           severity: "ERROR",
           sheetName: worksheet.name,
           rowNumber,
-          message: "User Input in column H is empty.",
+          message: "User Input is empty.",
         });
       } else {
         currentScenario.turns.push({
@@ -188,7 +141,7 @@ function parseKnowledgeBaseSheet(
         severity: "ERROR",
         sheetName: worksheet.name,
         rowNumber,
-        message: "A row without Test Case ID must provide Turn in column G.",
+        message: "A row without Test Case ID must provide Turn.",
       });
       continue;
     }
@@ -215,7 +168,7 @@ function parseKnowledgeBaseSheet(
         severity: "ERROR",
         sheetName: worksheet.name,
         rowNumber,
-        message: "User Input in column H is empty.",
+        message: "User Input is empty.",
       });
     } else if (turnNumber !== undefined) {
       currentScenario.turns.push({
@@ -250,12 +203,11 @@ function parseNegativeSheet(
   issues: PgnValidationIssue[],
   testIdRows: Map<string, { sheetName: string; rowNumber: number }>,
 ): PgnTestScenario[] {
-  validateHeaders(worksheet, NEGATIVE_HEADERS, issues);
   const scenarios: PgnTestScenario[] = [];
 
   for (let rowNumber = 2; rowNumber <= worksheet.rowCount; rowNumber += 1) {
-    const testCaseId = cellText(worksheet.getCell(rowNumber, 3)).trim();
-    const userInput = cellText(worksheet.getCell(rowNumber, 5));
+    const testCaseId = cellText(fieldCell(worksheet, rowNumber, "testCaseId")).trim();
+    const userInput = cellText(fieldCell(worksheet, rowNumber, "userInput"));
     if (!testCaseId && !userInput.trim()) {
       continue;
     }
@@ -265,7 +217,7 @@ function parseNegativeSheet(
         severity: "ERROR",
         sheetName: worksheet.name,
         rowNumber,
-        message: "Test Case ID in column C is empty.",
+        message: "Test Case ID is empty.",
       });
       continue;
     }
@@ -289,7 +241,7 @@ function parseNegativeSheet(
         severity: "ERROR",
         sheetName: worksheet.name,
         rowNumber,
-        message: "User Input / Test Steps in column E is empty.",
+        message: "User Input / Test Steps is empty.",
       });
     }
     const parsedTurns = parseTurnsFromCell(
@@ -301,7 +253,6 @@ function parseNegativeSheet(
     const scenarioStatus = readScenarioStatus(
       worksheet,
       rowNumber,
-      11,
       issues,
     );
     scenarios.push({
@@ -309,7 +260,8 @@ function parseNegativeSheet(
       sheetKind: "negative",
       sheetName: worksheet.name,
       sourceRowNumber: rowNumber,
-      category: cellText(worksheet.getCell(rowNumber, 2)).trim(),
+      category: optionalFieldCell(worksheet, rowNumber, "category")?.text.trim() ?? "",
+      schemaFingerprint: mainSchemaFingerprint(worksheet),
       ...scenarioStatus,
       turns: parsedTurns.turns.map((turn) => ({
         sheetName: worksheet.name,
@@ -343,11 +295,11 @@ export function isScenarioComplete(
   }
   if (scenario.sheetKind === "negative") {
     return Boolean(
-      cellText(worksheet.getCell(scenario.sourceRowNumber, 8)).trim(),
+      cellText(fieldCell(worksheet, scenario.sourceRowNumber, "botResponse")).trim(),
     );
   }
   return scenario.turns.every((turn) =>
-    Boolean(cellText(worksheet.getCell(turn.rowNumber, 9)).trim()),
+    Boolean(cellText(fieldCell(worksheet, turn.rowNumber, "botResponse")).trim()),
   );
 }
 
@@ -363,7 +315,7 @@ export function isScenarioPartiallyComplete(
     return false;
   }
   const completedTurns = scenario.turns.filter((turn) =>
-    Boolean(cellText(worksheet.getCell(turn.rowNumber, 9)).trim()),
+    Boolean(cellText(fieldCell(worksheet, turn.rowNumber, "botResponse")).trim()),
   ).length;
   return completedTurns > 0 && completedTurns < scenario.turns.length;
 }
@@ -377,6 +329,13 @@ export function parsePgnWorkbook(workbook: ExcelJS.Workbook): ParsedPgnWorkbook 
   const scenarios: PgnTestScenario[] = [];
   const kbSheet = workbook.getWorksheet(KB_SHEET_NAME);
   const negativeSheet = workbook.getWorksheet(NEGATIVE_SHEET_NAME);
+  const schemas = WORKBOOK_SCHEMAS.flatMap((definition) => {
+    const worksheet = workbook.getWorksheet(definition.sheetName);
+    return worksheet ? [resolveWorksheetSchema(worksheet, definition)] : [];
+  });
+  for (const mapping of schemas) {
+    for (const issue of mapping.issues) issues.push({ code: "INVALID_HEADER", severity: issue.severity, sheetName: mapping.sheetName, rowNumber: mapping.headerRow, message: issue.message });
+  }
 
   if (!kbSheet) {
     issues.push({
@@ -385,7 +344,7 @@ export function parsePgnWorkbook(workbook: ExcelJS.Workbook): ParsedPgnWorkbook 
       sheetName: KB_SHEET_NAME,
       message: `Worksheet "${KB_SHEET_NAME}" was not found.`,
     });
-  } else {
+  } else if (resolveWorksheetSchema(kbSheet, KB_SCHEMA).valid) {
     scenarios.push(...parseKnowledgeBaseSheet(kbSheet, issues, testIdRows));
   }
   if (!negativeSheet) {
@@ -395,7 +354,7 @@ export function parsePgnWorkbook(workbook: ExcelJS.Workbook): ParsedPgnWorkbook 
       sheetName: NEGATIVE_SHEET_NAME,
       message: `Worksheet "${NEGATIVE_SHEET_NAME}" was not found.`,
     });
-  } else {
+  } else if (resolveWorksheetSchema(negativeSheet, NEGATIVE_SCHEMA).valid) {
     scenarios.push(...parseNegativeSheet(negativeSheet, issues, testIdRows));
   }
 
@@ -427,6 +386,7 @@ export function parsePgnWorkbook(workbook: ExcelJS.Workbook): ParsedPgnWorkbook 
   }
 
   return {
+    schemas,
     scenarios,
     issues,
     summaries,
@@ -449,5 +409,6 @@ export async function loadPgnWorkbook(
   });
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(filePath);
+  await attachWorkbookMappings(workbook, filePath);
   return { workbook, parsed: parsePgnWorkbook(workbook) };
 }

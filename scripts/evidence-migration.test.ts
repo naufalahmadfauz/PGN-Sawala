@@ -21,10 +21,7 @@ import {
   type AppConfig,
 } from "../src/config";
 import {
-  MAIN_EVIDENCE_COLUMN,
   EVIDENCE_MIGRATION_VERSION,
-  TRANSCRIPT_EVIDENCE_STATUS_COLUMN,
-  TRANSCRIPT_EVIDENCE_URL_COLUMN,
   getEvidenceFileMetadata,
   getEvidenceRunMetadata,
   readEvidenceHyperlink,
@@ -53,6 +50,11 @@ import type {
   EvidenceDrivePublisher,
 } from "../src/evidence/google-drive";
 import { GoogleDriveEvidencePublisher } from "../src/evidence/google-drive";
+
+// Coordinates asserted by this unchanged legacy workbook fixture, not runtime schema.
+const MAIN_EVIDENCE_COLUMN = 14;
+const TRANSCRIPT_EVIDENCE_STATUS_COLUMN = 15;
+const TRANSCRIPT_EVIDENCE_URL_COLUMN = 14;
 
 const sourcePath = path.resolve(
   "data/PGN AI Assistant - Knowledge Base Testing Report - User Inputs.xlsx",

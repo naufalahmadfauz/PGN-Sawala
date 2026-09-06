@@ -14,6 +14,7 @@ import {
   RETEST_METADATA_SHEET_NAME,
 } from "./retest-workbook";
 import { TRANSCRIPT_SHEET_NAME } from "./pgn-types";
+import { optionalFieldCell } from "./workbook-schema";
 import {
   openExecutedPgnWorkbook,
   saveExecutedPgnWorkbook,
@@ -61,15 +62,11 @@ export async function createFreshPgnWorkbook(
     );
     for (const scenario of fresh.parsed.scenarios) {
       const worksheet = fresh.workbook.getWorksheet(scenario.sheetName)!;
-      if (scenario.sheetKind === "kb") {
-        for (const turn of scenario.turns) {
-          for (const column of [9, 10, 11, 14]) {
-            worksheet.getCell(turn.rowNumber, column).value = null;
-          }
-        }
-      } else {
-        for (const column of [8, 9, 10, 14]) {
-          worksheet.getCell(scenario.sourceRowNumber, column).value = null;
+      const rows = scenario.sheetKind === "kb" ? scenario.turns.map((turn) => turn.rowNumber) : [scenario.sourceRowNumber];
+      for (const row of rows) {
+        for (const field of ["botResponse", "responseTime", "testDate", "evidence"] as const) {
+          const cell = optionalFieldCell(worksheet, row, field);
+          if (cell) cell.value = null;
         }
       }
     }

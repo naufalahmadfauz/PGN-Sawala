@@ -4,6 +4,7 @@ import {
   type ParsedPgnWorkbook,
   type PgnValidationIssue,
 } from "./pgn-types";
+import { formatWorksheetSchema } from "./workbook-schema";
 
 export interface PgnSessionIsolationConfig {
   command: string;
@@ -42,6 +43,8 @@ export function formatPgnValidation(
 ): string {
   const lines = [
     "PGN workbook validation",
+    "Workbook schema",
+    ...(parsed.schemas ?? []).map(formatWorksheetSchema),
     "",
     ...formatSheetSummary(KB_SHEET_NAME, parsed.summaries.kb),
     "",
@@ -85,7 +88,7 @@ export function assertPgnWorkbookValid(parsed: ParsedPgnWorkbook): void {
   const errors = parsed.issues.filter((issue) => issue.severity === "ERROR");
   if (errors.length > 0) {
     throw new Error(
-      `PGN workbook validation failed with ${errors.length} error(s). Run npm run test:pgn:validate.`,
+      `PGN workbook validation failed with ${errors.length} error(s). ${errors.map((issue) => `${issue.sheetName}: ${issue.message}`).join(" ")} Run npm run test:pgn:validate or review column mapping in npm run pgn.`,
     );
   }
 }

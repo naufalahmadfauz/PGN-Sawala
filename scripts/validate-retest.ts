@@ -3,10 +3,10 @@ import path from "node:path";
 import { loadConfig, type AppConfig } from "../src/config";
 import { isEntrypoint, runCliMain } from "../src/cli-entrypoint";
 import {
-  MAIN_EVIDENCE_COLUMN,
   readEvidenceHyperlink,
 } from "../src/excel/evidence-workbook";
 import { loadPgnWorkbook } from "../src/excel/pgn-workbook-loader";
+import { fieldCell, optionalFieldCell } from "../src/excel/workbook-schema";
 import { assertPgnWorkbookValid } from "../src/excel/pgn-workbook-validator";
 import { getRetestRunMetadata } from "../src/excel/retest-workbook";
 import type { PgnTestScenario } from "../src/excel/pgn-types";
@@ -29,9 +29,9 @@ function hasExistingResponse(
   const worksheet = workbook.getWorksheet(scenario.sheetName)!;
   return scenario.sheetKind === "kb"
     ? scenario.turns.some((turn) =>
-        Boolean(worksheet.getCell(turn.rowNumber, 9).text.trim()),
+        Boolean(fieldCell(worksheet, turn.rowNumber, "botResponse").text.trim()),
       )
-    : Boolean(worksheet.getCell(scenario.sourceRowNumber, 8).text.trim());
+    : Boolean(fieldCell(worksheet, scenario.sourceRowNumber, "botResponse").text.trim());
 }
 
 function hasExistingEvidence(
@@ -46,7 +46,7 @@ function hasExistingEvidence(
   return rows.some((rowNumber) =>
     Boolean(
       readEvidenceHyperlink(
-        worksheet.getCell(rowNumber, MAIN_EVIDENCE_COLUMN),
+        optionalFieldCell(worksheet, rowNumber, "evidence"),
       ),
     ),
   );

@@ -1,366 +1,146 @@
-import ExcelJS, { type Cell, type Worksheet } from "exceljs";
-import {
-  KB_SHEET_NAME,
-  NEGATIVE_SHEET_NAME,
-  TRANSCRIPT_SHEET_NAME,
-  type EvidenceStatus,
-} from "./pgn-types";
+import type { Workbook, Cell, Worksheet } from "exceljs";
+import { KB_SHEET_NAME, NEGATIVE_SHEET_NAME, TRANSCRIPT_SHEET_NAME, type EvidenceStatus } from "./pgn-types";
+import { EVIDENCE_RUN_SCHEMA, EVIDENCE_FILE_SCHEMA, ensureEvidenceField, fieldCell, getWorksheetSchema } from "./workbook-schema";
 
 export const EXECUTION_METADATA_SHEET_NAME = "Execution Metadata";
 export const EVIDENCE_MIGRATION_VERSION = "1";
-export const MAIN_EVIDENCE_COLUMN = 14;
-export const TRANSCRIPT_EVIDENCE_URL_COLUMN = 14;
-export const TRANSCRIPT_EVIDENCE_STATUS_COLUMN = 15;
-
-const RUN_HEADERS = [
-  "Run ID",
-  "Evidence Drive Folder ID",
-  "Evidence Drive Folder URL",
-  "Evidence Migration Version",
-  "Migration Timestamp",
-  "Mode",
-];
-
-const FILE_HEADERS = [
-  "Evidence Key",
-  "Run ID",
-  "Test Case ID",
-  "Turn",
-  "Drive File ID",
-  "Drive File Name",
-  "Evidence URL",
-  "Local Clean Path",
-  "Evidence Status",
-];
-
 export interface EvidenceRunMetadata {
-  runId: string;
-  folderId: string;
-  folderUrl: string;
-  migrationVersion: string;
-  timestamp: Date;
-  mode: "MIGRATION" | "FUTURE" | "RETEST";
+  runId: string; folderId: string; folderUrl: string; migrationVersion: string;
+  timestamp: Date; mode: "MIGRATION" | "FUTURE" | "RETEST";
 }
-
 export interface EvidenceFileMetadata {
-  evidenceKey: string;
-  runId: string;
-  testCaseId: string;
-  turnNumber: number;
-  driveFileId?: string;
-  driveFileName: string;
-  evidenceUrl?: string;
-  localCleanPath?: string;
+  evidenceKey: string; runId: string; testCaseId: string; turnNumber: number;
+  driveFileId?: string; driveFileName: string; evidenceUrl?: string; localCleanPath?: string;
   status: EvidenceStatus;
 }
 
-function cloneStyle(source: Cell, target: Cell): void {
-  target.style = structuredClone(source.style);
-}
-
-function styleHeaderCell(cell: Cell): void {
-  cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
-  cell.fill = {
-    type: "pattern",
-    pattern: "solid",
-    fgColor: { argb: "FF1F4E78" },
-  };
-  cell.alignment = { vertical: "middle", wrapText: true };
-}
-
-function ensureMainEvidenceColumn(worksheet: Worksheet): boolean {
-  const header = worksheet.getCell(1, MAIN_EVIDENCE_COLUMN);
-  if (header.text && header.text !== "Evidence") {
-    throw new Error(
-      `${worksheet.name}!N1 is already used by "${header.text}"; cannot add Evidence`,
-    );
-  }
-  let changed = false;
-  if (header.text !== "Evidence") {
-    header.value = "Evidence";
-    cloneStyle(worksheet.getCell(1, MAIN_EVIDENCE_COLUMN - 1), header);
-    changed = true;
-  }
-  if ((worksheet.getColumn(MAIN_EVIDENCE_COLUMN).width ?? 0) < 18) {
-    worksheet.getColumn(MAIN_EVIDENCE_COLUMN).width = 18;
-    changed = true;
-  }
-  return changed;
-}
-
-function ensureTranscriptEvidenceColumns(worksheet: Worksheet): boolean {
-  const urlHeader = worksheet.getCell(1, TRANSCRIPT_EVIDENCE_URL_COLUMN);
-  const statusHeader = worksheet.getCell(1, TRANSCRIPT_EVIDENCE_STATUS_COLUMN);
-  if (urlHeader.text && urlHeader.text !== "Evidence URL") {
-    throw new Error(
-      `${worksheet.name}!N1 is already used by "${urlHeader.text}"`,
-    );
-  }
-  if (statusHeader.text && statusHeader.text !== "Evidence Status") {
-    throw new Error(
-      `${worksheet.name}!O1 is already used by "${statusHeader.text}"`,
-    );
-  }
-  let changed = false;
-  if (urlHeader.text !== "Evidence URL") {
-    urlHeader.value = "Evidence URL";
-    cloneStyle(worksheet.getCell(1, 13), urlHeader);
-    changed = true;
-  }
-  if (statusHeader.text !== "Evidence Status") {
-    statusHeader.value = "Evidence Status";
-    cloneStyle(worksheet.getCell(1, 13), statusHeader);
-    changed = true;
-  }
-  if ((worksheet.getColumn(TRANSCRIPT_EVIDENCE_URL_COLUMN).width ?? 0) < 20) {
-    worksheet.getColumn(TRANSCRIPT_EVIDENCE_URL_COLUMN).width = 20;
-    changed = true;
-  }
-  if ((worksheet.getColumn(TRANSCRIPT_EVIDENCE_STATUS_COLUMN).width ?? 0) < 24) {
-    worksheet.getColumn(TRANSCRIPT_EVIDENCE_STATUS_COLUMN).width = 24;
-    changed = true;
-  }
-  return changed;
-}
-
-function ensureMetadataWorksheet(workbook: ExcelJS.Workbook): {
-  worksheet: Worksheet;
-  changed: boolean;
-} {
+function ensureMetadataWorksheet(workbook: Workbook): Worksheet {
   let worksheet = workbook.getWorksheet(EXECUTION_METADATA_SHEET_NAME);
-  let changed = false;
   if (!worksheet) {
     worksheet = workbook.addWorksheet(EXECUTION_METADATA_SHEET_NAME);
+    worksheet.addRow([
+      ...EVIDENCE_RUN_SCHEMA.fields.map((item) => item.header), null,
+      ...EVIDENCE_FILE_SCHEMA.fields.map((item) => item.header),
+    ]);
+    worksheet.getRow(1).font = { bold: true };
     worksheet.views = [{ state: "frozen", ySplit: 1 }];
-    changed = true;
+    worksheet.columns.forEach((column) => { column.width = 24; });
   }
-  RUN_HEADERS.forEach((header, index) => {
-    const cell = worksheet!.getCell(1, index + 1);
-    if (!cell.text) {
-      cell.value = header;
-      styleHeaderCell(cell);
-      changed = true;
-    } else if (cell.text !== header) {
-      throw new Error(
-        `${EXECUTION_METADATA_SHEET_NAME}!${cell.address} must be "${header}"`,
-      );
-    }
-  });
-  FILE_HEADERS.forEach((header, index) => {
-    const cell = worksheet!.getCell(1, index + 8);
-    if (!cell.text) {
-      cell.value = header;
-      styleHeaderCell(cell);
-      changed = true;
-    } else if (cell.text !== header) {
-      throw new Error(
-        `${EXECUTION_METADATA_SHEET_NAME}!${cell.address} must be "${header}"`,
-      );
-    }
-  });
-  [24, 30, 45, 28, 24, 14, 3, 55, 24, 18, 10, 28, 30, 20, 55, 24].forEach(
-    (width, index) => {
-      if ((worksheet!.getColumn(index + 1).width ?? 0) < width) {
-        worksheet!.getColumn(index + 1).width = width;
-        changed = true;
-      }
-    },
-  );
-  return { worksheet, changed };
+  getWorksheetSchema(worksheet, EVIDENCE_RUN_SCHEMA);
+  getWorksheetSchema(worksheet, EVIDENCE_FILE_SCHEMA);
+  return worksheet;
 }
 
-export function ensureEvidenceWorkbookSchema(workbook: ExcelJS.Workbook): boolean {
-  const kb = workbook.getWorksheet(KB_SHEET_NAME);
-  const negative = workbook.getWorksheet(NEGATIVE_SHEET_NAME);
-  const transcript = workbook.getWorksheet(TRANSCRIPT_SHEET_NAME);
-  if (!kb || !negative || !transcript) {
-    throw new Error("PGN workbook evidence schema requires both result sheets and transcript");
+export function ensureEvidenceWorkbookSchema(workbook: Workbook): boolean {
+  const sheets = [KB_SHEET_NAME, NEGATIVE_SHEET_NAME, TRANSCRIPT_SHEET_NAME].map((name) => workbook.getWorksheet(name));
+  if (sheets.some((sheet) => !sheet)) throw new Error("PGN workbook evidence schema requires both result sheets and transcript");
+  sheets.forEach((sheet) => getWorksheetSchema(sheet!));
+  let changed = !workbook.getWorksheet(EXECUTION_METADATA_SHEET_NAME);
+  ensureMetadataWorksheet(workbook);
+  for (const worksheet of sheets) {
+    const names = worksheet!.name === TRANSCRIPT_SHEET_NAME ? ["evidenceUrl", "evidenceStatus"] as const : ["evidence"] as const;
+    for (const name of names) changed = ensureEvidenceField(worksheet!, name) || changed;
   }
-  const metadata = ensureMetadataWorksheet(workbook);
-  const kbChanged = ensureMainEvidenceColumn(kb);
-  const negativeChanged = ensureMainEvidenceColumn(negative);
-  const transcriptChanged = ensureTranscriptEvidenceColumns(transcript);
-  return kbChanged || negativeChanged || transcriptChanged || metadata.changed;
+  return changed;
 }
 
-export function readEvidenceHyperlink(cell: Cell): string | undefined {
-  const value = cell.value;
-  if (
-    value &&
-    typeof value === "object" &&
-    "hyperlink" in value &&
-    typeof value.hyperlink === "string"
-  ) {
-    return value.hyperlink;
-  }
-  return undefined;
+export function readEvidenceHyperlink(cell: Cell | undefined): string | undefined {
+  const value = cell?.value;
+  return value && typeof value === "object" && "hyperlink" in value && typeof value.hyperlink === "string" ? value.hyperlink : undefined;
 }
-
 export function writeEvidenceHyperlink(cell: Cell, url: string): boolean {
-  if (readEvidenceHyperlink(cell) === url) {
-    return false;
-  }
+  if (readEvidenceHyperlink(cell) === url) return false;
   cell.value = { text: "View Evidence", hyperlink: url };
-  cell.font = {
-    ...cell.font,
-    color: { argb: "FF0563C1" },
-    underline: true,
-  };
+  cell.style = structuredClone(cell.style);
+  cell.font = { ...cell.font, color: { argb: "FF0563C1" }, underline: true };
   cell.alignment = { ...cell.alignment, vertical: "top", wrapText: true };
   return true;
 }
-
-export function writeMainEvidenceHyperlink(
-  workbook: ExcelJS.Workbook,
-  sheetName: string,
-  rowNumber: number,
-  url: string,
-): boolean {
+export function writeMainEvidenceHyperlink(workbook: Workbook, sheetName: string, rowNumber: number, url: string): boolean {
   const worksheet = workbook.getWorksheet(sheetName);
-  if (!worksheet) {
-    throw new Error(`Worksheet "${sheetName}" was not found`);
-  }
-  return writeEvidenceHyperlink(
-    worksheet.getCell(rowNumber, MAIN_EVIDENCE_COLUMN),
-    url,
-  );
+  if (!worksheet) throw new Error(`Worksheet "${sheetName}" was not found`);
+  return writeEvidenceHyperlink(fieldCell(worksheet, rowNumber, "evidence"), url);
 }
 
-export function getEvidenceRunMetadata(
-  workbook: ExcelJS.Workbook,
-  runId: string,
-): EvidenceRunMetadata | undefined {
-  const worksheet = workbook.getWorksheet(EXECUTION_METADATA_SHEET_NAME);
-  if (!worksheet) {
-    return undefined;
-  }
-  for (let rowNumber = 2; rowNumber <= worksheet.rowCount; rowNumber += 1) {
-    const row = worksheet.getRow(rowNumber);
-    if (row.getCell(1).text !== runId) {
-      continue;
-    }
-    const folderUrl = readEvidenceHyperlink(row.getCell(3));
-    const timestampValue = row.getCell(5).value;
+export function getEvidenceRunMetadata(workbook: Workbook, runId: string): EvidenceRunMetadata | undefined {
+  const sheet = workbook.getWorksheet(EXECUTION_METADATA_SHEET_NAME);
+  if (!sheet) return undefined;
+  for (let row = 2; row <= sheet.rowCount; row += 1) {
+    const cell = (field: Parameters<typeof fieldCell>[2]) => fieldCell(sheet, row, field, EVIDENCE_RUN_SCHEMA);
+    if (cell("runId").text !== runId) continue;
+    const date = cell("timestamp");
+    const mode = cell("mode").text;
     return {
-      runId,
-      folderId: row.getCell(2).text,
-      folderUrl: folderUrl ?? "",
-      migrationVersion: row.getCell(4).text,
-      timestamp:
-        timestampValue instanceof Date ? timestampValue : new Date(row.getCell(5).text),
-      mode:
-        row.getCell(6).text === "FUTURE"
-          ? "FUTURE"
-          : row.getCell(6).text === "RETEST"
-            ? "RETEST"
-            : "MIGRATION",
+      runId, folderId: cell("folderId").text, folderUrl: readEvidenceHyperlink(cell("folderUrl")) ?? "",
+      migrationVersion: cell("migrationVersion").text,
+      timestamp: date.value instanceof Date ? date.value : new Date(date.text),
+      mode: mode === "FUTURE" || mode === "RETEST" ? mode : "MIGRATION",
     };
   }
   return undefined;
 }
-
-export function upsertEvidenceRunMetadata(
-  workbook: ExcelJS.Workbook,
-  metadata: EvidenceRunMetadata,
-): void {
-  const worksheet = ensureMetadataWorksheet(workbook).worksheet;
-  let rowNumber = 2;
-  while (rowNumber <= worksheet.rowCount && worksheet.getCell(rowNumber, 1).text) {
-    if (worksheet.getCell(rowNumber, 1).text === metadata.runId) {
-      break;
-    }
-    rowNumber += 1;
+export function upsertEvidenceRunMetadata(workbook: Workbook, metadata: EvidenceRunMetadata): void {
+  const sheet = ensureMetadataWorksheet(workbook);
+  let row = 2;
+  while (row <= sheet.rowCount && fieldCell(sheet, row, "runId", EVIDENCE_RUN_SCHEMA).text) {
+    if (fieldCell(sheet, row, "runId", EVIDENCE_RUN_SCHEMA).text === metadata.runId) break;
+    row += 1;
   }
-  const row = worksheet.getRow(rowNumber);
-  row.getCell(1).value = metadata.runId;
-  row.getCell(2).value = metadata.folderId;
-  if (metadata.folderUrl) {
-    writeEvidenceHyperlink(row.getCell(3), metadata.folderUrl);
-  } else {
-    row.getCell(3).value = null;
-  }
-  row.getCell(4).value = metadata.migrationVersion;
-  row.getCell(5).value = metadata.timestamp;
-  row.getCell(5).numFmt = "yyyy-mm-dd hh:mm:ss";
-  row.getCell(6).value = metadata.mode;
+  const cell = (field: Parameters<typeof fieldCell>[2]) => fieldCell(sheet, row, field, EVIDENCE_RUN_SCHEMA);
+  cell("runId").value = metadata.runId;
+  cell("folderId").value = metadata.folderId;
+  if (metadata.folderUrl) writeEvidenceHyperlink(cell("folderUrl"), metadata.folderUrl);
+  else cell("folderUrl").value = null;
+  cell("migrationVersion").value = metadata.migrationVersion;
+  cell("timestamp").value = metadata.timestamp;
+  cell("timestamp").numFmt = "yyyy-mm-dd hh:mm:ss";
+  cell("mode").value = metadata.mode;
 }
-
-export function getEvidenceFileMetadata(
-  workbook: ExcelJS.Workbook,
-  evidenceKey: string,
-): EvidenceFileMetadata | undefined {
-  const worksheet = workbook.getWorksheet(EXECUTION_METADATA_SHEET_NAME);
-  if (!worksheet) {
-    return undefined;
-  }
-  for (let rowNumber = 2; rowNumber <= worksheet.rowCount; rowNumber += 1) {
-    const row = worksheet.getRow(rowNumber);
-    if (row.getCell(8).text !== evidenceKey) {
-      continue;
-    }
+export function getEvidenceFileMetadata(workbook: Workbook, evidenceKey: string): EvidenceFileMetadata | undefined {
+  const sheet = workbook.getWorksheet(EXECUTION_METADATA_SHEET_NAME);
+  if (!sheet) return undefined;
+  for (let row = 2; row <= sheet.rowCount; row += 1) {
+    const cell = (field: Parameters<typeof fieldCell>[2]) => fieldCell(sheet, row, field, EVIDENCE_FILE_SCHEMA);
+    if (cell("evidenceKey").text !== evidenceKey) continue;
     return {
-      evidenceKey,
-      runId: row.getCell(9).text,
-      testCaseId: row.getCell(10).text,
-      turnNumber: Number(row.getCell(11).value),
-      driveFileId: row.getCell(12).text || undefined,
-      driveFileName: row.getCell(13).text,
-      evidenceUrl: readEvidenceHyperlink(row.getCell(14)),
-      localCleanPath: row.getCell(15).text || undefined,
-      status: (row.getCell(16).text || "EVIDENCE_PENDING") as EvidenceStatus,
+      evidenceKey, runId: cell("runId").text, testCaseId: cell("testCaseId").text,
+      turnNumber: Number(cell("turn").value), driveFileId: cell("driveFileId").text || undefined,
+      driveFileName: cell("driveFileName").text, evidenceUrl: readEvidenceHyperlink(cell("evidenceUrl")),
+      localCleanPath: cell("localCleanPath").text || undefined,
+      status: (cell("evidenceStatus").text || "EVIDENCE_PENDING") as EvidenceStatus,
     };
   }
   return undefined;
 }
-
-export function upsertEvidenceFileMetadata(
-  workbook: ExcelJS.Workbook,
-  metadata: EvidenceFileMetadata,
-): void {
-  const worksheet = ensureMetadataWorksheet(workbook).worksheet;
-  let rowNumber: number | undefined;
-  let firstEmptyRow: number | undefined;
-  for (let candidate = 2; candidate <= worksheet.rowCount; candidate += 1) {
-    if (!worksheet.getCell(candidate, 8).text && firstEmptyRow === undefined) {
-      firstEmptyRow = candidate;
-    }
-    if (worksheet.getCell(candidate, 8).text === metadata.evidenceKey) {
-      rowNumber = candidate;
-      break;
-    }
+export function upsertEvidenceFileMetadata(workbook: Workbook, metadata: EvidenceFileMetadata): void {
+  const sheet = ensureMetadataWorksheet(workbook);
+  let row: number | undefined;
+  let empty: number | undefined;
+  for (let candidate = 2; candidate <= sheet.rowCount; candidate += 1) {
+    const key = fieldCell(sheet, candidate, "evidenceKey", EVIDENCE_FILE_SCHEMA).text;
+    if (!key && empty === undefined) empty = candidate;
+    if (key === metadata.evidenceKey) { row = candidate; break; }
   }
-  rowNumber ??= firstEmptyRow ?? worksheet.rowCount + 1;
-  const row = worksheet.getRow(rowNumber);
-  row.getCell(8).value = metadata.evidenceKey;
-  row.getCell(9).value = metadata.runId;
-  row.getCell(10).value = metadata.testCaseId;
-  row.getCell(11).value = metadata.turnNumber;
-  row.getCell(12).value = metadata.driveFileId ?? "";
-  row.getCell(13).value = metadata.driveFileName;
-  if (metadata.evidenceUrl) {
-    writeEvidenceHyperlink(row.getCell(14), metadata.evidenceUrl);
-  } else {
-    row.getCell(14).value = "";
-  }
-  row.getCell(15).value = metadata.localCleanPath ?? "";
-  row.getCell(16).value = metadata.status;
+  row ??= empty ?? sheet.rowCount + 1;
+  const cell = (field: Parameters<typeof fieldCell>[2]) => fieldCell(sheet, row!, field, EVIDENCE_FILE_SCHEMA);
+  cell("evidenceKey").value = metadata.evidenceKey;
+  cell("runId").value = metadata.runId;
+  cell("testCaseId").value = metadata.testCaseId;
+  cell("turn").value = metadata.turnNumber;
+  cell("driveFileId").value = metadata.driveFileId ?? "";
+  cell("driveFileName").value = metadata.driveFileName;
+  if (metadata.evidenceUrl) writeEvidenceHyperlink(cell("evidenceUrl"), metadata.evidenceUrl);
+  else cell("evidenceUrl").value = "";
+  cell("localCleanPath").value = metadata.localCleanPath ?? "";
+  cell("evidenceStatus").value = metadata.status;
 }
-
-export function removeEvidenceFileMetadata(
-  workbook: ExcelJS.Workbook,
-  evidenceKey: string,
-): boolean {
-  const worksheet = workbook.getWorksheet(EXECUTION_METADATA_SHEET_NAME);
-  if (!worksheet) {
-    return false;
-  }
-  for (let rowNumber = 2; rowNumber <= worksheet.rowCount; rowNumber += 1) {
-    if (worksheet.getCell(rowNumber, 8).text === evidenceKey) {
-      for (let column = 8; column <= 16; column += 1) {
-        worksheet.getCell(rowNumber, column).value = null;
-      }
-      return true;
-    }
+export function removeEvidenceFileMetadata(workbook: Workbook, evidenceKey: string): boolean {
+  const sheet = workbook.getWorksheet(EXECUTION_METADATA_SHEET_NAME);
+  if (!sheet) return false;
+  for (let row = 2; row <= sheet.rowCount; row += 1) {
+    if (fieldCell(sheet, row, "evidenceKey", EVIDENCE_FILE_SCHEMA).text !== evidenceKey) continue;
+    for (const item of EVIDENCE_FILE_SCHEMA.fields) fieldCell(sheet, row, item.field, EVIDENCE_FILE_SCHEMA).value = null;
+    return true;
   }
   return false;
 }

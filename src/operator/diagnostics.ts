@@ -19,6 +19,7 @@ import {
   discoverRecoveryRun,
   type RecoveryDiscovery,
 } from "../recovery/run-state";
+import { inspectWorkbookMappings } from "./workbook-configuration";
 
 export type DiagnosticStatus = "ok" | "warn" | "error" | "info";
 
@@ -55,6 +56,7 @@ export interface DiagnosticDependencies {
   inspectDiscord?: (config: AppConfig) => Promise<DiscordValidationResult>;
   checkDiscordAccess?: boolean;
   inspectRecovery?: (projectRoot: string) => Promise<RecoveryDiscovery>;
+  inspectWorkbookSchema?: (config: AppConfig) => Promise<{ ready: boolean; detail: string }>;
 }
 
 async function defaultPathExists(filePath: string): Promise<boolean> {
@@ -292,6 +294,21 @@ export async function collectDiagnostics(
     executedWorkbookPresent ? "ok" : "warn",
     executedWorkbookPresent ? "found" : "not created yet",
   );
+  if (config && sourceWorkbookPresent) {
+    try {
+      const schema = dependencies.inspectWorkbookSchema
+        ? await dependencies.inspectWorkbookSchema(config)
+        : await inspectWorkbookMappings(config).then((inspection) => ({
+            ready: inspection.ready,
+            detail: inspection.ready
+              ? `required fields resolved; mapping overrides: ${inspection.documents.reduce((count, doc) => count + doc.overrides.length, 0)}`
+              : inspection.documents.flatMap((doc) => doc.schemas.flatMap((schema) => schema.issues.filter((issue) => issue.severity === "ERROR").map((issue) => issue.message))).join("; "),
+          }));
+      add("workbook-schema", "Workbook schema", schema.ready ? "ok" : "error", schema.ready ? `valid; ${schema.detail}` : `needs review; ${schema.detail}`);
+    } catch {
+      add("workbook-schema", "Workbook schema", "error", "could not inspect safely; run npm run workbook:schema");
+    }
+  }
 
   let recoveryIsDemo = false;
   try {

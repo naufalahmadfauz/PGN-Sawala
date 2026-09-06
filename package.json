@@ -11,6 +11,8 @@
     "discord:validate": "tsx scripts/discord-validate.ts",
     "recovery:demo": "tsx scripts/recovery-demo.ts",
     "recovery:demo:reset": "tsx scripts/recovery-demo.ts --reset",
+    "workbook:schema": "tsx scripts/workbook-schema.ts",
+    "test:workbook-schema": "tsx --test scripts/workbook-schema.test.ts",
     "data:template": "tsx scripts/create-test-template.ts",
     "evidence:validate": "tsx scripts/evidence-validate.ts",
     "evidence:migrate": "tsx scripts/evidence-migrate.ts",
