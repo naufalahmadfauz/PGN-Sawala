@@ -49,6 +49,7 @@
   },
   "homepage": "https://github.com/naufalahmadfauz/PGN-Sawala#readme",
   "devDependencies": {
+    "@biomejs/biome": "2.5.12",
     "@playwright/test": "^1.62.1",
     "@types/node": "^26.4.0",
     "playwright": "^1.62.1",
