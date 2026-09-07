@@ -1,14 +1,16 @@
 import type { Workbook, Cell, Worksheet } from "exceljs";
 import { KB_SHEET_NAME, NEGATIVE_SHEET_NAME, TRANSCRIPT_SHEET_NAME, type EvidenceStatus } from "./pgn-types";
 import { EVIDENCE_RUN_SCHEMA, EVIDENCE_FILE_SCHEMA, ensureEvidenceField, fieldCell, getWorksheetSchema } from "./workbook-schema";
+import { runExecutionContext } from "./run-configuration";
+import type { RunExecutionContext } from "../session-mode";
 
 export const EXECUTION_METADATA_SHEET_NAME = "Execution Metadata";
 export const EVIDENCE_MIGRATION_VERSION = "1";
-export interface EvidenceRunMetadata {
+export interface EvidenceRunMetadata extends Partial<RunExecutionContext> {
   runId: string; folderId: string; folderUrl: string; migrationVersion: string;
   timestamp: Date; mode: "MIGRATION" | "FUTURE" | "RETEST";
 }
-export interface EvidenceFileMetadata {
+export interface EvidenceFileMetadata extends Partial<RunExecutionContext> {
   evidenceKey: string; runId: string; testCaseId: string; turnNumber: number;
   driveFileId?: string; driveFileName: string; evidenceUrl?: string; localCleanPath?: string;
   status: EvidenceStatus;
@@ -71,6 +73,7 @@ export function getEvidenceRunMetadata(workbook: Workbook, runId: string): Evide
     const date = cell("timestamp");
     const mode = cell("mode").text;
     return {
+      ...runExecutionContext(workbook, runId),
       runId, folderId: cell("folderId").text, folderUrl: readEvidenceHyperlink(cell("folderUrl")) ?? "",
       migrationVersion: cell("migrationVersion").text,
       timestamp: date.value instanceof Date ? date.value : new Date(date.text),
@@ -103,6 +106,7 @@ export function getEvidenceFileMetadata(workbook: Workbook, evidenceKey: string)
     const cell = (field: Parameters<typeof fieldCell>[2]) => fieldCell(sheet, row, field, EVIDENCE_FILE_SCHEMA);
     if (cell("evidenceKey").text !== evidenceKey) continue;
     return {
+      ...runExecutionContext(workbook, cell("runId").text),
       evidenceKey, runId: cell("runId").text, testCaseId: cell("testCaseId").text,
       turnNumber: Number(cell("turn").value), driveFileId: cell("driveFileId").text || undefined,
       driveFileName: cell("driveFileName").text, evidenceUrl: readEvidenceHyperlink(cell("evidenceUrl")),

@@ -12,6 +12,7 @@ import { selectScenarios } from "../pgn-selection";
 import { needsFinalRetestCleanup } from "../retest/retest-run";
 import { selectRetestScenarios } from "../retest/retest-selection";
 import { selectRecoveryScenarios } from "../recovery/recovery-service";
+import { CONTINUOUS_RECOVERY_WARNING, readSessionMode } from "../session-mode";
 import {
   assertRecoveryRunExecutable,
   readRecoveryRun,
@@ -42,22 +43,29 @@ export async function inspectPgnExecution(
   }
 
   let resumedState: RecoveryRunState | undefined;
-  if (options.resumeRunId) {
+  const recoveryRunId = options.resumeRunId ?? options.restartRunId;
+  if (recoveryRunId) {
     try {
       resumedState = (await readRecoveryRun(
         config.projectRoot,
-        options.resumeRunId,
+        recoveryRunId,
       )).state;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        assertRecoveryRunExecutable({ runId: options.resumeRunId });
+        assertRecoveryRunExecutable({ runId: recoveryRunId });
       }
-      if (mode === "full") throw error;
+      if (mode === "full" || options.restartRunId) throw error;
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       // Retest runs created before filesystem checkpoints retain legacy resume support.
     }
     if (resumedState) {
       assertRecoveryRunExecutable(resumedState);
+      const sessionMode = readSessionMode(resumedState.sessionMode);
+      if (options.sessionModeExplicit && options.sessionMode !== sessionMode) {
+        throw new Error("Session mode conflicts with the stored run; recovery cannot change isolation semantics");
+      }
+      if (options.resumeRunId && sessionMode === "continuous") throw new Error(CONTINUOUS_RECOVERY_WARNING);
+      if (options.restartRunId && sessionMode !== "continuous") throw new Error("--restart-run is only for interrupted continuous runs");
       if (resumedState.mode !== mode) {
         throw new Error(
           `Run ${resumedState.runId} is a ${resumedState.mode} run, not a ${mode} run`,
@@ -73,7 +81,13 @@ export async function inspectPgnExecution(
   assertPgnWorkbookValid(loaded.parsed);
 
   if (resumedState) {
-    const selected = selectRecoveryScenarios(loaded.parsed.scenarios, resumedState);
+    const selected = options.restartRunId
+      ? resumedState.selectedScenarioIds.map((id) => {
+          const scenario = loaded.parsed.scenarios.find((scenario) => scenario.testCaseId === id);
+          if (!scenario) throw new Error(`Restart scenario was not found: ${id}`);
+          return scenario;
+        })
+      : selectRecoveryScenarios(loaded.parsed.scenarios, resumedState);
     const finalCleanupOnly =
       selected.length === 0 && !resumedState.finalCleanupComplete;
     return {
@@ -102,6 +116,10 @@ export async function inspectPgnExecution(
   if (options.resumeRunId && !resumedRun) {
     throw new Error(`Retest Run was not found: ${options.resumeRunId}`);
   }
+  if (resumedRun && options.sessionModeExplicit && options.sessionMode !== readSessionMode(resumedRun.sessionMode)) {
+    throw new Error("Session mode conflicts with the stored retest; recovery cannot change isolation semantics");
+  }
+  if (resumedRun && readSessionMode(resumedRun.sessionMode) === "continuous") throw new Error(CONTINUOUS_RECOVERY_WARNING);
   const selection = selectRetestScenarios(loaded.parsed.scenarios, {
     testIds: options.testIds,
     sheet: options.sheet,

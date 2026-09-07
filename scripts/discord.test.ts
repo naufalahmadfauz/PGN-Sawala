@@ -14,6 +14,7 @@ import {
   type DiscordRunProgressEvent,
   type InterruptionSignalSource,
 } from "../src/notifications/discord";
+import type { SessionMode } from "../src/session-mode";
 
 const webhookUrl = "https://discord.com/api/webhooks/123456789/test-token";
 
@@ -71,10 +72,11 @@ function payload(call: RequestRecord): Record<string, unknown> {
   return JSON.parse(body as string) as Record<string, unknown>;
 }
 
-function startEvent(mode: "full" | "retest" = "full") {
+function startEvent(mode: "full" | "retest" = "full", sessionMode?: SessionMode) {
   return {
     runId: "PGN-20260903-120000",
     mode,
+    ...(sessionMode ? { sessionMode, transport: "whatsapp" as const } : {}),
     selectedScenarios: 10,
     startedAt: new Date("2026-09-03T12:00:00.000Z"),
     googleDriveEvidenceEnabled: true,
@@ -118,6 +120,12 @@ function assertSafeMentions(body: Record<string, unknown>): void {
     roles: [],
     replied_user: false,
   });
+}
+
+function assertExecutionContext(body: Record<string, unknown>, sessionMode: SessionMode = "isolated"): void {
+  assert.equal(embedField(body, "Transport"), "WhatsApp");
+  assert.equal(embedField(body, "Session Mode"), sessionMode === "isolated" ? "Isolated" : "Continuous");
+  assert.equal(embedField(body, "Context isolation"), sessionMode === "isolated" ? "Enabled" : "Disabled");
 }
 
 test("validates only Discord Incoming Webhook URL shapes", () => {
@@ -262,7 +270,10 @@ test("normal demo creates and edits one live message before completion", async (
     "PGN Discord Demo Completed",
   );
   assert.deepEqual(payload(transport.calls[3]!), payload(transport.calls[4]!));
-  for (const call of transport.calls) assertSafeMentions(payload(call));
+  for (const call of transport.calls) {
+    assertSafeMentions(payload(call));
+    assertExecutionContext(payload(call));
+  }
   assert.equal(warnings.length, 0);
   assert.match(logs.join("\n"), /Demo event: STARTED/);
   assert.match(logs.join("\n"), /Demo event: RUNNING 1 \/ 10/);
@@ -486,6 +497,8 @@ test("creates one live message, edits it for progress, then finalizes and posts 
   for (const call of transport.calls) {
     const body = payload(call);
     assertSafeMentions(body);
+    assertExecutionContext(body);
+    assert.equal(embedField(body, "Session reset attempts"), "");
     assert(!JSON.stringify(body).includes(webhookUrl));
     assert(!JSON.stringify(body).includes("/private/reports"));
   }
@@ -509,7 +522,37 @@ test("labels Ready-for-Retest runs throughout their lifecycle", async () => {
     embedTitle(payload(transport.calls[2]!)),
     "PGN Retest Completed",
   );
+  for (const call of transport.calls) assertExecutionContext(payload(call));
 });
+
+for (const mode of ["full", "retest"] as const) {
+  for (const sessionMode of ["isolated", "continuous"] as const) {
+    test(`${mode} ${sessionMode} lifecycle adds context without changing requests or result counts`, async () => {
+      const transport = recordingFetch();
+      const notifier = createDiscordNotifier(settings(), { fetch: transport.fetch });
+      await notifier.runStarted(startEvent(mode, sessionMode));
+      await notifier.runProgress(progressEvent());
+      const sessionResetAttempts = sessionMode === "continuous" ? 1 : 11;
+      await notifier.runCompleted({
+        ...progressEvent({ completedScenarios: 10, sessionResetAttempts }),
+        completedAt: new Date("2026-09-03T12:02:00.000Z"),
+      });
+      assert.deepEqual(transport.calls.map((call) => call.init?.method), ["POST", "PATCH", "PATCH", "POST"]);
+      for (const call of transport.calls) assertExecutionContext(payload(call), sessionMode);
+      const started = payload(transport.calls[0]!);
+      const completed = payload(transport.calls[3]!);
+      assert.equal(embedField(started, "Mode"), mode === "full" ? "Full Test" : "Ready-for-Retest");
+      assert.equal(embedField(completed, "Mode"), embedField(started, "Mode"));
+      assert.equal(embedField(completed, "Selected"), "10");
+      assert.equal(embedField(completed, "Executed"), "10");
+      assert.equal(embedField(completed, "Captured"), "4");
+      assert.equal(embedField(completed, "Timeouts"), "1");
+      assert.equal(embedField(completed, "Evidence uploaded"), "4");
+      assert.equal(embedField(completed, "Session reset attempts"), String(sessionResetAttempts));
+      assert.deepEqual(payload(transport.calls[2]!), completed);
+    });
+  }
+}
 
 test("resumed notifications preserve the Run ID and report reused recovery context", async () => {
   const transport = recordingFetch();
@@ -538,6 +581,25 @@ test("resumed notifications preserve the Run ID and report reused recovery conte
     transport.calls.map((call) => call.init?.method),
     ["POST", "PATCH", "POST"],
   );
+  for (const call of transport.calls) assertExecutionContext(payload(call));
+});
+
+test("resumed event context is retained across running and interrupted cards", async () => {
+  const transport = recordingFetch();
+  const notifier = createDiscordNotifier(settings(), { fetch: transport.fetch });
+  await notifier.runResumed({
+    ...startEvent("retest", "continuous"),
+    resumedAt: new Date("2026-09-03T12:00:00.000Z"),
+    completedScenarios: 0,
+    remainingScenarios: 10,
+    reusedDriveFolder: true,
+  });
+  await notifier.runProgress(progressEvent());
+  await notifier.runInterrupted("SIGTERM", progressEvent({ sessionResetAttempts: 1 }));
+  assert.deepEqual(transport.calls.map((call) => call.init?.method), ["POST", "PATCH", "PATCH", "POST"]);
+  assert.equal(embedTitle(payload(transport.calls[0]!)), "PGN Retest Resumed");
+  for (const call of transport.calls) assertExecutionContext(payload(call), "continuous");
+  assert.equal(embedField(payload(transport.calls.at(-1)!), "Session reset attempts"), "1");
 });
 
 test("throttles progress by count, elapsed time, and a minimum edit interval", async () => {
@@ -597,7 +659,36 @@ test("failure messages are fresh, operational, redacted, and mode-specific", asy
   assert(!serialized.includes("bearer-secret"));
   assert(!serialized.includes("stack details"));
   assertSafeMentions(failure);
+  for (const call of transport.calls) assertExecutionContext(payload(call));
 });
+
+for (const mode of ["full", "retest"] as const) {
+  for (const outcome of ["failure", "SIGINT", "SIGTERM"] as const) {
+    test(`${mode} continuous ${outcome} retains session context and zero reset attempts`, async () => {
+      const transport = recordingFetch();
+      const notifier = createDiscordNotifier(settings(), { fetch: transport.fetch });
+      await notifier.runStarted(startEvent(mode, "continuous"));
+      const progress = progressEvent({ sessionResetAttempts: 0 });
+      if (outcome === "failure") {
+        await notifier.runFailed({
+          ...progress,
+          failedAt: progress.updatedAt,
+          reason: "Initial setup failed",
+          workbookProgress: "Saved progressively",
+          evidenceProgress: "0 uploaded",
+        });
+      } else {
+        await notifier.runInterrupted(outcome, progress);
+      }
+      assert.deepEqual(transport.calls.map((call) => call.init?.method), ["POST", "PATCH", "POST"]);
+      for (const call of transport.calls) assertExecutionContext(payload(call), "continuous");
+      const terminal = payload(transport.calls.at(-1)!);
+      assert.equal(embedField(terminal, "Mode"), mode === "full" ? "Full Test" : "Ready-for-Retest");
+      assert.equal(embedField(terminal, "Session reset attempts"), "0");
+      assert.deepEqual(payload(transport.calls[1]!), terminal);
+    });
+  }
+}
 
 test("respects disabled and per-event notification switches", async () => {
   const disabledTransport = recordingFetch();
@@ -650,6 +741,42 @@ test("respects disabled and per-event notification switches", async () => {
     embedTitle(payload(progressOnlyTransport.calls[0]!)),
     "PGN Test Running",
   );
+  for (const call of [...finalOnlyTransport.calls, ...progressOnlyTransport.calls]) {
+    assertExecutionContext(payload(call));
+  }
+});
+
+test("continuous context survives disabled starts for progress-only and terminal-only notifications", async () => {
+  for (const mode of ["full", "retest"] as const) {
+    for (const outcome of ["progress", "complete", "failure", "interruption"] as const) {
+      const transport = recordingFetch();
+      const notifier = createDiscordNotifier(settings({
+        discordNotifyStart: false,
+        discordNotifyProgress: outcome === "progress",
+      }), { fetch: transport.fetch });
+      await notifier.runStarted(startEvent(mode, "continuous"));
+      assert.equal(transport.calls.length, 0);
+      const progress = progressEvent({ sessionResetAttempts: 1 });
+      await notifier.runProgress(progress);
+      if (outcome === "complete") {
+        await notifier.runCompleted({ ...progress, completedAt: progress.updatedAt });
+      } else if (outcome === "failure") {
+        await notifier.runFailed({
+          ...progress,
+          failedAt: progress.updatedAt,
+          reason: "Technical failure",
+          workbookProgress: "Saved progressively",
+          evidenceProgress: "4 uploaded",
+        });
+      } else if (outcome === "interruption") {
+        await notifier.runInterrupted("SIGINT", progress);
+      }
+      assert.deepEqual(transport.calls.map((call) => call.init?.method), ["POST"]);
+      const body = payload(transport.calls[0]!);
+      assertExecutionContext(body, "continuous");
+      if (outcome !== "progress") assert.equal(embedField(body, "Session reset attempts"), "1");
+    }
+  }
 });
 
 test("terminal flags suppress fresh events while still finalizing a live card", async () => {

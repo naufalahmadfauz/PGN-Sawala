@@ -39,6 +39,7 @@ import {
 const SAFE_TEST_FILES = [
   "scripts/response-collector.test.ts",
   "scripts/session-reset.test.ts",
+  "scripts/session-mode.test.ts",
   "scripts/workbook-writer.test.ts",
   "scripts/config.test.ts",
   "scripts/retest.test.ts",
@@ -97,6 +98,23 @@ export function createDefaultActions(ui: OperatorUi): OperatorActions {
       ];
       await browserAction(
         entrypoint,
+        args,
+        () => runPgnWorkbook(args, mode),
+        async () => (await inspectPgnExecution(args, mode, config)).browserRequired,
+      );
+    },
+    restartRecovery: async (runId, acceptSourceDrift = false) => {
+      const config = loadConfig();
+      const { state } = await readRecoveryRun(config.projectRoot, runId);
+      assertRecoveryRunExecutable(state);
+      const mode = state.mode;
+      const args = [
+        "--restart-run",
+        runId,
+        ...(acceptSourceDrift ? ["--accept-source-drift"] : []),
+      ];
+      await browserAction(
+        mode === "retest" ? "retest-pgn.ts" : "run-pgn.ts",
         args,
         () => runPgnWorkbook(args, mode),
         async () => (await inspectPgnExecution(args, mode, config)).browserRequired,

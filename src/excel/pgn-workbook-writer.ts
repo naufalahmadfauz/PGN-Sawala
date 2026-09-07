@@ -36,7 +36,9 @@ import { assertPgnWorkbookValid } from "./pgn-workbook-validator";
 import {
   KB_SCHEMA, NEGATIVE_SCHEMA, TRANSCRIPT_SCHEMA, appendSchemaRow,
   fieldCell, fieldColumn, optionalFieldCell, getWorksheetSchema,
+  ensureOptionalSchemaField,
 } from "./workbook-schema";
+import { runExecutionContext } from "./run-configuration";
 
 interface PreservedTablePart {
   partPath: string;
@@ -56,6 +58,9 @@ const TABLE_CONTENT_TYPE =
 function ensureTranscriptWorksheet(workbook: ExcelJS.Workbook): Worksheet {
   const existing = workbook.getWorksheet(TRANSCRIPT_SHEET_NAME);
   if (existing) {
+    for (const field of ["evidenceUrl", "evidenceStatus", "transport", "sessionMode"] as const) {
+      ensureOptionalSchemaField(existing, field);
+    }
     const role = fieldColumn(existing, "role");
     existing.getColumn(role).width = Math.max(
       existing.getColumn(role).width ?? 0,
@@ -75,7 +80,7 @@ function ensureTranscriptWorksheet(workbook: ExcelJS.Workbook): Worksheet {
   header.alignment = { vertical: "middle", wrapText: true };
   worksheet.views = [{ state: "frozen", ySplit: 1 }];
   const widths = [
-    24, 18, 28, 12, 9, 16, 70, 24, 20, 20, 18, 45, 55, 20, 24,
+    24, 18, 28, 12, 9, 16, 70, 24, 20, 20, 18, 45, 55, 20, 24, 16, 18,
   ];
   widths.forEach((width, index) => {
     worksheet.getColumn(index + 1).width = width;
@@ -327,6 +332,7 @@ function appendTranscriptRows(
   execution: ExecutedTurn,
 ): void {
   const common = {
+    ...runExecutionContext(worksheet.workbook, runId),
     runId, testCaseId: scenario.testCaseId, sheet: scenario.sheetName,
     excelRow: execution.turn.rowNumber, turn: execution.turn.turnNumber,
     status: execution.technicalStatus, error: execution.error ?? "",
@@ -519,10 +525,14 @@ export async function openExecutedPgnWorkbook(
   const hadTranscript = Boolean(
     workbook.getWorksheet(TRANSCRIPT_SHEET_NAME),
   );
+  const previousTranscriptSchema = hadTranscript
+    ? getWorksheetSchema(workbook.getWorksheet(TRANSCRIPT_SHEET_NAME)!).fingerprint
+    : undefined;
   ensureTranscriptWorksheet(workbook);
   const evidenceSchemaChanged = ensureEvidenceWorkbookSchema(workbook);
   if (
     !hadTranscript ||
+    previousTranscriptSchema !== getWorksheetSchema(workbook.getWorksheet(TRANSCRIPT_SHEET_NAME)!).fingerprint ||
     evidenceSchemaChanged ||
     !(await tablePartsMatch(outputPath, tableParts))
   ) {
@@ -586,7 +596,7 @@ export function appendSessionResetTranscript(
   attempt: BotSessionResetAttempt,
 ): void {
   const worksheet = ensureTranscriptWorksheet(workbook);
-  const common = { runId, testCaseId: scenario.testCaseId, sheet: scenario.sheetName, excelRow: scenario.sourceRowNumber };
+  const common = { ...runExecutionContext(workbook, runId), runId, testCaseId: scenario.testCaseId, sheet: scenario.sheetName, excelRow: scenario.sourceRowNumber };
   const appendRow = (
     role:
       | "CONTROL_USER"
@@ -662,7 +672,7 @@ export function appendPostResetDrainTranscript(
   drain: PostResetDrainResult,
 ): void {
   const worksheet = ensureTranscriptWorksheet(workbook);
-  const common = { runId, testCaseId: scenario.testCaseId, sheet: scenario.sheetName, excelRow: scenario.sourceRowNumber };
+  const common = { ...runExecutionContext(workbook, runId), runId, testCaseId: scenario.testCaseId, sheet: scenario.sheetName, excelRow: scenario.sourceRowNumber };
   for (const staleMessage of drain.staleMessages) {
     const row = appendSchemaRow(worksheet, { ...common, role: "STALE_BOT", message: staleMessage.text, timestamp: staleMessage.observedAt, status: "STALE_DRAINED" });
     row.alignment = { vertical: "top", wrapText: true };
@@ -685,6 +695,7 @@ export type RecoveryTranscriptEvent =
   | "RUN_FAILED"
   | "RUN_COMPLETED"
   | "RUN_ABANDONED"
+  | "RUN_RESTARTED"
   | "RECOVERY_RECONCILED"
   | "SCENARIO_ATTEMPT_STARTED"
   | "SCENARIO_ATTEMPT_COMPLETED"
@@ -703,6 +714,7 @@ export function appendRecoveryTranscriptEvent(
 ): void {
   const worksheet = ensureTranscriptWorksheet(workbook);
   const row = appendSchemaRow(worksheet, {
+    ...runExecutionContext(workbook, options.runId),
     runId: options.runId, testCaseId: options.scenario?.testCaseId ?? "",
     sheet: options.scenario?.sheetName ?? "", excelRow: options.scenario?.sourceRowNumber ?? null,
     role: "RECOVERY_SYSTEM", message: options.message, timestamp: options.timestamp ?? new Date(), status: options.event,

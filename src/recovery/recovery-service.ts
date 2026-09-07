@@ -31,6 +31,8 @@ import { safeGoogleCredentialError } from "../evidence/google-service-account";
 import { validateDiscordWebhookUrl } from "../notifications/discord";
 import { retestDriveFolderName } from "../retest/retest-run";
 import { recoveryDemoConfig } from "./demo-safety";
+import { getRunConfiguration } from "../excel/run-configuration";
+import { CONTINUOUS_RECOVERY_WARNING, readSessionMode, readExecutionTransport, sessionModeLabel } from "../session-mode";
 import { fieldCell, optionalFieldCell, EVIDENCE_FILE_SCHEMA, getWorksheetSchema, normalizeWorkbookHeader } from "../excel/workbook-schema";
 import {
   acquireRunProcessLock,
@@ -87,6 +89,7 @@ export interface RecoveryValidation {
   reconciliation?: RecoveryReconciliation;
   checks: RecoveryValidationCheck[];
   ready: boolean;
+  restartReady?: boolean;
 }
 
 export interface RecoveryValidationDependencies {
@@ -400,6 +403,7 @@ export async function validateRecoveryRun(
   }
   const { state, manifest } = recovered;
   config = await recoveryDemoConfig(config, state);
+  const sessionMode = readSessionMode(state.sessionMode);
   const checks: RecoveryValidationCheck[] = [];
   const lock = await inspectRunProcessLock(config.projectRoot);
   checks.push(lockCheck(lock));
@@ -410,6 +414,9 @@ export async function validateRecoveryRun(
       state.status === "COMPLETED" || state.status === "ABANDONED" ? "error" : "ok",
     detail: `${state.status}; updated ${state.updatedAt}`,
   });
+  if (sessionMode === "continuous") {
+    checks.push({ id: "session-continuity", label: "Continuous recovery", status: "error", detail: CONTINUOUS_RECOVERY_WARNING });
+  }
   if (state.mode !== "full" && state.mode !== "retest") {
     checks.push({ id: "mode", label: "Run mode", status: "error", detail: "invalid" });
   }
@@ -522,6 +529,10 @@ export async function validateRecoveryRun(
   } else {
     try {
       const executed = await loadPgnWorkbook(storedExecutedPath);
+      const executionContext = getRunConfiguration(executed.workbook, state.runId);
+      if (executionContext && (executionContext.sessionMode !== sessionMode || executionContext.transport !== readExecutionTransport(state.transport))) {
+        throw new Error("Session mode or transport differs between workbook and recovery checkpoint");
+      }
       const scenarios = selectedScenarios(executed.parsed.scenarios, state);
       if (!legacyRecoverySchemasMatch(executed.workbook, manifest)) {
         throw new Error("Older recovery checkpoint has no schema snapshot; changed column mapping requires explicit recovery review");
@@ -742,6 +753,9 @@ export async function validateRecoveryRun(
     reconciliation,
     checks,
     ready: !checks.some((check) => check.status === "error"),
+    restartReady: sessionMode === "continuous" && !checks.some((check) =>
+      check.status === "error" && check.id !== "session-continuity" && check.id !== "reconciliation",
+    ),
   };
 }
 
@@ -772,6 +786,9 @@ export function formatRecoveryDiscovery(discovery: RecoveryDiscovery): string {
     `Run ID: ${state.runId}`,
     ...(state.isDemo ? ["Recovery type: DEMO (local UI/testing only; live execution disabled)"] : []),
     `Mode: ${state.mode}`,
+    "Transport: WhatsApp",
+    `Session Mode: ${sessionModeLabel(readSessionMode(state.sessionMode))}`,
+    ...(readSessionMode(state.sessionMode) === "continuous" ? [CONTINUOUS_RECOVERY_WARNING] : []),
     `State: ${discovery.kind === "running" ? "RUNNING" : state.status}`,
     `Progress: ${state.completedScenarioIds.length} completed, ${state.skippedScenarioIds.length} skipped, ${state.totalScenarios - finished} remaining`,
     `Last completed: ${state.lastCompletedScenarioId ?? "none"}`,
@@ -799,6 +816,8 @@ export function formatRecoveryValidation(validation: RecoveryValidation): string
     `Run ID: ${validation.runId}`,
     ...(validation.state.isDemo ? ["Recovery type: DEMO"] : []),
     `Mode: ${validation.mode}`,
+    "Transport: WhatsApp",
+    `Session Mode: ${sessionModeLabel(readSessionMode(validation.state.sessionMode))}`,
     ...validation.checks.map(
       (check) => `${labels[check.status].padEnd(5)} ${check.label}: ${check.detail}`,
     ),
@@ -809,10 +828,13 @@ export function formatRecoveryValidation(validation: RecoveryValidation): string
       "Recommended: re-run uncertain scenarios from Turn 1 after reconciliation (preview only).",
     );
   }
-  if (validation.reconciliation?.nextScenarioId) {
+  if (validation.reconciliation?.nextScenarioId && readSessionMode(validation.state.sessionMode) === "isolated") {
     lines.push(`Resume at: ${validation.reconciliation.nextScenarioId} from Turn 1`);
   }
   lines.push(`Resume readiness: ${validation.ready ? "READY" : "BLOCKED"}${validation.state.isDemo ? " (preview only)" : ""}`);
+  if (readSessionMode(validation.state.sessionMode) === "continuous") {
+    lines.push(`Full restart readiness: ${validation.restartReady ? "READY" : "BLOCKED"}; all ${validation.state.totalScenarios} original scenarios, new Run ID and clean initial reset`);
+  }
   if (validation.state.isDemo) {
     lines.push("DEMO MODE: Real WhatsApp execution is disabled. No testcase messages were sent.");
   }
@@ -919,6 +941,9 @@ export async function skipRecoveryScenario(
   config: AppConfig,
   runId: string,
 ): Promise<RecoveryMutationResult> {
+  if (readSessionMode((await readRecoveryRun(config.projectRoot, runId)).state.sessionMode) === "continuous") {
+    throw new Error(CONTINUOUS_RECOVERY_WARNING);
+  }
   return withRecoveryOwnership(
     config,
     runId,
@@ -974,6 +999,9 @@ export async function repairRecoveryProgress(
   runId: string,
   strategy: RecoveryRepairStrategy,
 ): Promise<RecoveryMutationResult> {
+  if (readSessionMode((await readRecoveryRun(config.projectRoot, runId)).state.sessionMode) === "continuous") {
+    throw new Error(CONTINUOUS_RECOVERY_WARNING);
+  }
   return withRecoveryOwnership(
     config,
     runId,

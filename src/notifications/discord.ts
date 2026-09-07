@@ -1,4 +1,10 @@
 import path from "node:path";
+import {
+  readSessionMode,
+  sessionModeLabel,
+  type ExecutionTransport,
+  type SessionMode,
+} from "../session-mode";
 
 const SAFE_ALLOWED_MENTIONS = {
   parse: [] as string[],
@@ -17,6 +23,8 @@ export type DiscordRunMode = "full" | "retest" | "demo";
 export interface DiscordRunStartedEvent {
   runId: string;
   mode: DiscordRunMode;
+  sessionMode?: SessionMode;
+  transport?: ExecutionTransport;
   selectedScenarios: number;
   startedAt: Date;
   googleDriveEvidenceEnabled: boolean;
@@ -32,6 +40,7 @@ export interface DiscordRunProgressEvent {
   technicalErrors: number;
   evidenceUploaded: number;
   evidenceUploadErrors: number;
+  sessionResetAttempts?: number;
   updatedAt: Date;
 }
 
@@ -515,6 +524,15 @@ function modeLabel(mode: DiscordRunMode): string {
   return "Full Test";
 }
 
+function sessionContextFields(run: DiscordRunStartedEvent): DiscordEmbedField[] {
+  const sessionMode = readSessionMode(run.sessionMode);
+  return [
+    { name: "Transport", value: "WhatsApp", inline: true },
+    { name: "Session Mode", value: sessionModeLabel(sessionMode), inline: true },
+    { name: "Context isolation", value: sessionMode === "isolated" ? "Enabled" : "Disabled", inline: true },
+  ];
+}
+
 function embed(
   title: string,
   color: number,
@@ -599,6 +617,7 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
       [
         { name: "Run ID", value: event.runId, inline: true },
         { name: "Mode", value: modeLabel(event.mode), inline: true },
+        ...sessionContextFields(event),
         {
           name:
             event.mode === "retest"
@@ -651,6 +670,7 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
       [
         { name: "Run ID", value: event.runId, inline: true },
         { name: "Mode", value: modeLabel(event.mode), inline: true },
+        ...sessionContextFields(event),
         {
           name: "Completed",
           value: String(event.completedScenarios),
@@ -825,6 +845,7 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
       0xf1c40f,
       [
         { name: "Run ID", value: run.runId, inline: true },
+        ...sessionContextFields(run),
         {
           name: "Progress",
           value: `${event.completedScenarios} / ${event.totalScenarios}`,
@@ -878,6 +899,7 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
       [
         { name: "Run ID", value: run.runId, inline: true },
         { name: "Mode", value: modeLabel(run.mode), inline: true },
+        ...sessionContextFields(run),
         {
           name: "Selected",
           value: String(run.selectedScenarios),
@@ -909,6 +931,11 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
           value: String(event.evidenceUploadErrors),
           inline: true,
         },
+        ...(event.sessionResetAttempts !== undefined ? [{
+          name: "Session reset attempts",
+          value: String(event.sessionResetAttempts),
+          inline: true,
+        }] : []),
         {
           name: "Duration",
           value: duration(run.startedAt, event.completedAt),
@@ -935,6 +962,7 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
       [
         { name: "Run ID", value: run.runId, inline: true },
         { name: "Mode", value: modeLabel(run.mode), inline: true },
+        ...sessionContextFields(run),
         {
           name: "Last scenario",
           value: event.currentScenarioId ?? "Not started",
@@ -960,6 +988,11 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
           value: event.evidenceProgress,
           inline: true,
         },
+        ...(event.sessionResetAttempts !== undefined ? [{
+          name: "Session reset attempts",
+          value: String(event.sessionResetAttempts),
+          inline: true,
+        }] : []),
         {
           name: "Duration",
           value: duration(run.startedAt, event.failedAt),

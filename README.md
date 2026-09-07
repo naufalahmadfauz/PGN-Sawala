@@ -31,6 +31,8 @@ The setup wizard inspects Node.js, npm, dependencies, Playwright Chromium, the P
 
 Execution, fresh-run preparation, evidence migration, and authentication recreation require explicit confirmation. Cancelling a prompt or selecting Back does not launch the selected action.
 
+Each new full, filtered, or retest execution asks for a Session Mode, defaulting to **Isolated**, including full tests launched after Setup. **Continuous** requires an explicit per-run choice, displays the shared-context warning, and keeps execution confirmation defaulted to No. The choice is not a permanent setting or an environment variable. Preparing a fresh workbook remains a separate action and never starts execution.
+
 Run non-interactive prerequisite checks at any time:
 
 ```bash
@@ -99,6 +101,8 @@ DISCORD_NOTIFY_FAILURE=true
 ```
 
 An active full or Ready-for-Retest run creates one live status message, edits it at the configured scenario or time interval, finalizes it, and posts a fresh completion or technical-failure event. An incomplete retest batch is labeled as a checkpoint instead of a completed retest. Setup offers progress every 5 scenarios, every 10 scenarios, final only, or a custom scenario/time cadence; the final-only preset disables start and progress messages. Start, progress, completion, and failure events can also be controlled independently with the advanced flags above.
+
+Start, resume, running, completion, failure, and interruption cards include **Transport: WhatsApp**, **Session Mode: Isolated/Continuous**, and **Context isolation: Enabled/Disabled**. Final and failed/interrupted cards include session reset attempts when supplied by the runner. This context is retained even with start notifications disabled; it adds fields to the existing cards, not extra posts. Full/Ready-for-Retest/Discord Demo remains a separate run classification.
 
 Notification delivery is fail-open. Timeouts, rate limits, deleted webhooks, malformed responses, and other Discord failures produce a redacted warning but never stop execution or alter workbook results. Discord payloads contain only operational identifiers, counts, timing, technical status, evidence counts, and the executed workbook basename. They never include WhatsApp messages, bot responses, phone numbers, screenshots, credentials, semantic Pass/Fail decisions, or automatic mentions.
 
@@ -194,7 +198,9 @@ Later runs resume from that executed copy. Existing Bot Response cells are skipp
 
 `Negative Case` independently resolves `User Input / Test Steps` and its result fields. Explicit `Turn 1:`, `Turn 2:`, and later markers inside one cell execute sequentially in the same scenario context. Their responses and timings are combined with turn labels.
 
-The executed copy adds `Execution Transcript` with per-turn user and bot messages, timestamps, first-response timing, total timing, technical status, and evidence paths. Every bot bubble has its own transcript row. Multiple bubbles are labeled `Message 1:`, `Message 2:`, and later in the logical Bot Response cell. The workbook is atomically replaced after every attempted turn.
+The executed copy adds `Execution Transcript` with per-turn user and bot messages, timestamps, first-response timing, total timing, technical status, and evidence paths. Every bot bubble has its own transcript row. Multiple bubbles are labeled `Message 1:`, `Message 2:`, and later in the logical Bot Response cell. New transcript rows can include optional `Session Mode` and `Transport` columns; legacy transcripts without them remain readable. The workbook is atomically replaced after every attempted turn.
+
+The new `Run Configuration` metadata sheet records per-run execution context, including Run ID, Session Mode, and Transport, separately from evidence metadata and the full/retest classification. New runs persist `sessionMode` and `transport` in their recovery state and manifest as well. Missing context on legacy runs means isolated WhatsApp execution; the metadata does not create a persistent default for later runs.
 
 Evidence hyperlinks use the detected `Evidence` or `Evidence URL` header. When absent, preparing the executed workbook appends the Evidence column beyond all used columns and Excel tables; validation alone never adds it. `Execution Transcript` resolves `Evidence Path`, `Evidence URL`, and `Evidence Status` from its controlled schema. `Execution Metadata` stores run-folder and Drive file IDs in separate run/file groups without storing credentials.
 
@@ -256,9 +262,22 @@ npm run test:pgn -- --test PGN-KB-031 --rerun PGN-NEG-018
 
 ## Interrupted Runs
 
-Open `npm run pgn` after an interruption to inspect the recoverable run before starting new work. The recovery menu offers validation, explicit resume confirmation, scenario skip, reconciliation of conflicting progress, and abandonment while preserving history. Atomic checkpoints, process locks, and heartbeats prevent concurrent runners from overwriting progress.
+Open `npm run pgn` after an interruption to inspect the recoverable run before starting new work. For isolated runs, the recovery menu offers validation, explicit resume confirmation, scenario skip, reconciliation of conflicting progress, and abandonment while preserving history. Atomic checkpoints, process locks, and heartbeats prevent concurrent runners from overwriting progress.
 
-Resume preserves the Run ID, completed scenarios, original selection, and existing Drive folder. An incomplete multi-turn scenario restarts from Turn 1 after session reset; it never resumes midway through an old conversation. Source-content and column-schema drift are checked before execution, and unsafe structural changes block resume.
+Isolated resume preserves the Run ID, completed scenarios, original selection, and existing Drive folder. An incomplete multi-turn scenario restarts from Turn 1 after session reset; it never resumes midway through an old conversation. Source-content and column-schema drift are checked before execution, and unsafe structural changes block resume.
+
+**Continuous runs cannot resume mid-stream.** After an interruption, the original shared conversation context may no longer be reliable. The same recovery menu instead offers **Inspect details**, **Restart continuous run from beginning**, **Abandon**, **Main menu**, and **Exit**. Partial resume, skip, and progress repair are disabled. Any continuous demo encountered here is preview-only and can never reach a live executor.
+
+A full continuous restart validates the original inputs and requires full-restart readiness, explicit acceptance of formatting-only source drift when present, and a strong default-No execution confirmation. It reruns **all originally selected scenarios, in their original order**, including previously completed or skipped scenarios, and preserves the original full/retest and session modes. It creates a **new Run ID and new evidence/Drive folder**, not a continuation of the old conversation. Only after the new checkpoint exists is the old run marked `ABANDONED` with a link to its replacement; old checkpoints, workbook history, transcripts, and evidence remain preserved.
+
+The direct equivalents are:
+
+```bash
+npm run test:pgn -- --restart-run PGN-ORIGINAL-RUN-ID
+npm run test:pgn:retest -- --restart-run RETEST-ORIGINAL-RUN-ID
+```
+
+`--restart-run` is for a full continuous restart, not partial recovery or a fresh selection. It cannot be combined with `--resume` or selection filters. Use `--accept-source-drift` only after explicitly reviewing a formatting-only drift warning; it does not permit changed testcase inputs or unsafe schema drift. Recovery restores the recorded session mode rather than switching modes.
 
 Use `npm run test:pgn:resume:validate` to inspect readiness without sending testcase messages. For real runs this can check Drive folder access; demo runs skip external checks. If no interrupted run exists, the command reports `No recoverable PGN run was found`. Recovery state is stored locally in the gitignored `.runtime/` directory and is not included in release archives.
 
@@ -304,7 +323,7 @@ Retest selection is trimmed and case-insensitive. It accepts only `Ready for Re-
 
 The complete selection is frozen before execution starts. A positive multi-turn scenario selected from its primary row executes every continuation turn, and a negative multi-turn scenario executes every parsed turn without a reset between turns. Unselected result rows are not changed.
 
-Before the first reset for each selected scenario, the runner appends an idempotent snapshot to `Retest History`. Positive multi-turn scenarios receive one history row per result row. The snapshot retains the previous transcript Run ID, semantic Status, Bot Response, Response Time, Test Date, and Evidence URL. New results and evidence are written back to the same history row as the retest progresses, while the active report points to the latest execution.
+Before executing each selected scenario, the runner appends an idempotent snapshot to `Retest History`. Positive multi-turn scenarios receive one history row per result row. The snapshot retains the previous transcript Run ID, semantic Status, Bot Response, Response Time, Test Date, and Evidence URL. New results and evidence are written back to the same history row as the retest progresses, while the active report points to the latest execution.
 
 Every batch receives a new ID such as `RETEST-20260902T053000Z`. The ID is used by `Execution Transcript`, `Retest Metadata`, evidence metadata, and the dedicated Drive folder `PGN-WhatsApp-Retest-20260902T053000Z`. Previous Drive files and folders are never deleted or replaced by another run.
 
@@ -318,7 +337,16 @@ npm run test:pgn:retest -- --test PGN-KB-075
 npm run test:pgn:retest -- --resume RETEST-20260902T053000Z
 ```
 
-`--test` explicitly selects only the named scenario and prints a warning if its current Status is not `Ready for Re-test`. `--resume` reloads the immutable selected-ID set from `Retest Metadata`, skips scenarios already completed successfully in that same run, retries prior technical failures, reuses its Drive folder, and deduplicates history rows. If all scenarios were saved but final session cleanup failed, resume retries that cleanup before marking the run complete. `--resume` cannot be combined with `--limit`, `--sheet`, `--test`, or `--rerun`: recovery preserves the original selection snapshot. If a new selection is empty, the retest command exits successfully before Drive setup or WhatsApp startup.
+`--test` explicitly selects only the named scenario and prints a warning if its current Status is not `Ready for Re-test`. For isolated retests, `--resume` reloads the immutable selected-ID set from `Retest Metadata`, skips scenarios already completed successfully in that same run, retries prior technical failures, reuses its Drive folder, and deduplicates history rows. If all scenarios were saved but final session cleanup failed, isolated resume retries that cleanup before marking the run complete. `--resume` cannot be combined with `--limit`, `--sheet`, `--test`, or `--rerun`: recovery preserves the original selection snapshot. If a new selection is empty, the retest command exits successfully before Drive setup or WhatsApp startup.
+
+Fresh retest runs default to isolated even when the previous full run or retest used continuous mode. Continuous retesting is opt-in for each new run via the selector or `--session=continuous`/`--fast`. Use the same mode when validating and executing:
+
+```bash
+npm run test:pgn:retest:validate -- --session=continuous
+npm run test:pgn:retest -- --session=continuous
+```
+
+Continuous retests share context across selected scenarios, perform no final cleanup reset, and follow the full-restart-only recovery policy above. Retest approval, history, evidence requirements, and semantic evaluation rules are otherwise unchanged.
 
 Selected retests require Google Drive evidence to be configured. Parent-folder authentication and retest-folder creation are completed before WhatsApp opens; invalid or disabled Drive configuration aborts without sending a testcase message. Per-file upload failures after startup remain non-fatal and are recorded separately from chatbot technical status.
 
@@ -328,11 +356,35 @@ The runner identifies response ownership from the confirmed outgoing message ID,
 
 `firstResponseMs` ends at the first captured bubble. `totalResponseMs` ends at the last captured bubble and excludes the final idle confirmation period. Each turn in a multi-turn scenario independently waits for complete response settlement before the next turn is sent.
 
-## Session Isolation
+## Session Modes
 
-Independent scenarios are isolated with the deployed Conversation Builder debug command `reset`. Before every runnable scenario, including the first remaining scenario after resume, the runner snapshots WhatsApp, sends `reset`, and waits only for a new incoming response containing `Session deleted`. `PGN_RESET_COMMAND`, `PGN_RESET_CONFIRMATION`, and `PGN_RESET_TIMEOUT_MS` configure this contract and default to `reset`, `Session deleted`, and 30000 ms.
+WhatsApp Web is the only execution transport. Session Mode controls reset boundaries, not the transport, response timing, or the separate full/retest run classification. The default is **Isolated**. Select the mode per invocation, not through `.env` or another persistent setting:
 
-After reset confirmation, the runner requires `POST_RESET_QUIET_MS` of silence, defaulting to 10000 ms. Any new or changed incoming message is recorded as `STALE_BOT` and restarts that timer, so it cannot be assigned to the next testcase. A visible typing state also holds the drain and restarts the quiet timer when it clears, but message arrival remains authoritative. The reset occurs outside the scenario turn loop. Multi-turn scenarios therefore retain context across every turn, and the next reset is attempted only after the completed scenario has been written and atomically saved. A final reset and drain also run after the last selected scenario.
+```bash
+npm run test:pgn:validate -- --session=isolated
+npm run test:pgn -- --session isolated
+npm run test:pgn:validate -- --session=continuous
+npm run test:pgn -- --session continuous
+npm run test:pgn -- --fast
+```
+
+`--session=isolated` and `--session isolated` are equivalent; likewise for continuous. `--fast` is an alias for `--session=continuous`, not a shortcut around reset confirmation, response settlement, or evidence checks. Conflicting session flags are rejected. `test:pgn:validate` accepts only these session-related flags, rejects execution/recovery filters, and only describes the selected policy; it never opens WhatsApp or sends a reset.
+
+| Policy | Isolated (Default) | Continuous (Opt-In) |
+| --- | --- | --- |
+| Initial reset and quiet drain | Required | Required |
+| Between-scenario reset | Enabled | Disabled |
+| Final cleanup reset and drain | Enabled | Disabled |
+| Context across scenarios | Independent after reset | Shared across the whole selection |
+| Interrupted-run recovery | Safe scenario-level resume | Full restart under a new Run ID or abandon |
+
+**Continuous Session Mode warning:** exactly one clean initial reset is required before the first scenario. There are no resets between scenarios and **no final reset**. All scenarios share the same bot conversation, so previous testcase context may influence later responses. Results are context-dependent, not independent testcase outcomes. This mode is useful for rapid development checks, exploratory testing, and context-stress testing, but is not recommended as the only final acceptance run.
+
+### Reset Safety
+
+In isolated mode, independent scenarios are isolated with the deployed Conversation Builder debug command `reset`. Before every runnable scenario, including the first remaining scenario after isolated resume, the runner snapshots WhatsApp, sends `reset`, and waits only for a new incoming response containing `Session deleted`. Continuous mode uses this same contract exactly once at the beginning. `PGN_RESET_COMMAND`, `PGN_RESET_CONFIRMATION`, and `PGN_RESET_TIMEOUT_MS` configure the reset contract, not the session mode, and default to `reset`, `Session deleted`, and 30000 ms.
+
+After reset confirmation, the runner requires `POST_RESET_QUIET_MS` of silence, defaulting to 10000 ms. Any new or changed incoming message is recorded as `STALE_BOT` and restarts that timer, so it cannot be assigned to the next testcase. A visible typing state also holds the drain and restarts the quiet timer when it clears, but message arrival remains authoritative. Resets occur outside the scenario turn loop, so both modes retain context within a multi-turn scenario. In isolated mode, the next reset is attempted only after the completed scenario has been written and atomically saved, and a final reset and drain run after the last selected scenario. Continuous mode retains the initial reset/drain safety but skips all between-scenario and final cleanup resets.
 
 Reset traffic never enters User Input, Bot Response, expected handling, or semantic Status cells. It is recorded in `Execution Transcript` as `CONTROL_USER`, `CONTROL_BOT`, `CONTROL_SYSTEM`, or `STALE_BOT`.
 

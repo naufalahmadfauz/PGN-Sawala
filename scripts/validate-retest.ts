@@ -10,7 +10,8 @@ import { fieldCell, optionalFieldCell } from "../src/excel/workbook-schema";
 import { assertPgnWorkbookValid } from "../src/excel/pgn-workbook-validator";
 import { getRetestRunMetadata } from "../src/excel/retest-workbook";
 import type { PgnTestScenario } from "../src/excel/pgn-types";
-import { parseCliOptions } from "../src/pgn-cli";
+import { assertResumeOptionsCompatible, parseCliOptions } from "../src/pgn-cli";
+import { CONTINUOUS_RECOVERY_WARNING, readSessionMode, sessionModeLabel } from "../src/session-mode";
 import { createGoogleDriveEvidencePublisher } from "../src/evidence/google-drive";
 import { safeGoogleCredentialError } from "../src/evidence/google-service-account";
 import { needsFinalRetestCleanup } from "../src/retest/retest-run";
@@ -84,6 +85,8 @@ export async function validateRetest(
   config: AppConfig = loadConfig(),
 ): Promise<RetestValidationResult> {
   const options = parseCliOptions(args);
+  assertResumeOptionsCompatible(options);
+  if (options.restartRunId) throw new Error("Use test:pgn:resume:validate to inspect full continuous restart readiness");
   if (options.rerunAll || options.rerunIds.size) {
     throw new Error("--rerun is not used in retest mode; use --test instead");
   }
@@ -101,6 +104,11 @@ export async function validateRetest(
   const resumedRun = options.resumeRunId
     ? getRetestRunMetadata(loaded.workbook, options.resumeRunId)
     : undefined;
+  if (resumedRun && options.sessionModeExplicit && options.sessionMode !== readSessionMode(resumedRun.sessionMode)) {
+    throw new Error("Session mode conflicts with the stored retest; recovery cannot change isolation semantics");
+  }
+  if (resumedRun && readSessionMode(resumedRun.sessionMode) === "continuous") throw new Error(CONTINUOUS_RECOVERY_WARNING);
+  console.log(`Transport: WhatsApp; Session Mode: ${sessionModeLabel(options.sessionMode)}`);
   if (options.resumeRunId && !resumedRun) {
     throw new Error(`Retest Run was not found: ${options.resumeRunId}`);
   }

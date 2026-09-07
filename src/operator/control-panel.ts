@@ -13,6 +13,12 @@ import {
   type RecoveryValidation,
 } from "../recovery/recovery-service";
 import type { RecoveryDiscovery } from "../recovery/run-state";
+import {
+  CONTINUOUS_RECOVERY_WARNING,
+  CONTINUOUS_SESSION_WARNING,
+  readSessionMode,
+  type SessionMode,
+} from "../session-mode";
 
 export interface RetestReadiness {
   selectedCount: number;
@@ -26,6 +32,7 @@ export interface OperatorActions {
   inspectRecovery?(): Promise<RecoveryDiscovery>;
   validateRecovery?(runId: string): Promise<RecoveryValidation>;
   resumeRecovery?(runId: string, acceptSourceDrift?: boolean): Promise<void>;
+  restartRecovery?(runId: string, acceptSourceDrift?: boolean): Promise<void>;
   skipRecoveryScenario?(runId: string): Promise<RecoveryMutationResult>;
   repairRecovery?(
     runId: string,
@@ -116,14 +123,43 @@ function parseIds(value: string): string[] {
     .filter(Boolean);
 }
 
+async function selectSessionMode(ui: OperatorUi): Promise<SessionMode | undefined> {
+  const sessionMode = await ui.select<SessionMode>({
+    message: "Session Mode for this run",
+    options: [
+      {
+        value: "isolated",
+        label: "Isolated (recommended)",
+        hint: "Reset before each scenario and after the run",
+      },
+      {
+        value: "continuous",
+        label: "Continuous",
+        hint: "One initial reset; all scenarios share conversation context",
+      },
+    ],
+    initialValue: "isolated",
+  });
+  if (sessionMode === "continuous") ui.warn(CONTINUOUS_SESSION_WARNING);
+  return sessionMode;
+}
+
 async function confirmExecution(
   ui: OperatorUi,
   scope: string,
+  sessionMode: SessionMode = "isolated",
 ): Promise<boolean | undefined> {
   return ui.confirm({
-    message: `${scope} will open WhatsApp, send reset and testcase messages, update the executed workbook, and may upload evidence. Continue?`,
+    message: `${scope}${sessionMode === "continuous" ? " in Continuous Session Mode" : ""} will open WhatsApp, send reset and testcase messages, update the executed workbook, and may upload evidence. Continue?`,
     initialValue: false,
   });
+}
+
+function isContinuousRecovery(
+  recovery: Pick<RecoveryValidation, "state" | "manifest">,
+): boolean {
+  return readSessionMode(recovery.state.sessionMode) === "continuous" ||
+    readSessionMode(recovery.manifest.sessionMode) === "continuous";
 }
 
 async function repairRecoveryMismatch(
@@ -175,7 +211,12 @@ async function resumeRecoveryFromMenu(
   },
   runId: string,
   discoveredIsDemo: boolean,
+  discoveredIsContinuous = false,
 ): Promise<void> {
+  if (discoveredIsContinuous) {
+    ui.warn(CONTINUOUS_RECOVERY_WARNING);
+    return;
+  }
   let inspected = await attempt(ui, "Validating recovery without executing", () =>
     actions.validateRecovery(runId),
   );
@@ -188,6 +229,10 @@ async function resumeRecoveryFromMenu(
     formatRecoveryValidation(inspected.value),
     isDemo ? "DEMO recovery validation" : "Recovery validation",
   );
+  if (isContinuousRecovery(inspected.value)) {
+    ui.warn(CONTINUOUS_RECOVERY_WARNING);
+    return;
+  }
   if (isDemo) {
     const { state, manifest, reconciliation } = inspected.value;
     const finished = new Set([
@@ -226,6 +271,14 @@ async function resumeRecoveryFromMenu(
     );
     if (!inspected.ok) return;
     ui.note(formatRecoveryValidation(inspected.value), "Recovery validation");
+    if (isContinuousRecovery(inspected.value)) {
+      ui.warn(CONTINUOUS_RECOVERY_WARNING);
+      return;
+    }
+    if (inspected.value.state.isDemo || inspected.value.manifest.isDemo) {
+      ui.warn("DEMO recovery is preview only; no testcase was executed.");
+      return;
+    }
   }
   if (!inspected.value.ready) {
     ui.warn("Recovery prerequisites are not ready. No testcase was executed.");
@@ -253,6 +306,66 @@ async function resumeRecoveryFromMenu(
     actions.resumeRecovery(runId, acceptSourceDrift),
   );
   if (resumed.ok) ui.success(`Run ${runId} recovery finished`);
+}
+
+async function restartRecoveryFromMenu(
+  ui: OperatorUi,
+  actions: OperatorActions & {
+    validateRecovery: NonNullable<OperatorActions["validateRecovery"]>;
+  },
+  runId: string,
+  discoveredIsDemo: boolean,
+): Promise<void> {
+  const inspected = await attempt(ui, "Validating full continuous restart without executing", () =>
+    actions.validateRecovery(runId),
+  );
+  if (!inspected.ok) return;
+  const validation = inspected.value;
+  const isDemo = discoveredIsDemo || validation.state.isDemo === true ||
+    validation.manifest.isDemo === true || runId.startsWith("DEMO-RECOVERY-");
+  ui.note(formatRecoveryValidation(validation), isDemo ? "DEMO recovery validation" : "Recovery validation");
+  if (isDemo) {
+    ui.note([
+      "DEMO: UI/testing only; no live execution. No WhatsApp, Playwright, Drive, or Discord actions.",
+      `Full continuous restart: all ${validation.state.selectedScenarioIds.length} originally selected scenarios from the beginning (preview only).`,
+      `Original order: ${validation.state.selectedScenarioIds.join(", ")}`,
+      "A real restart creates a NEW Run ID and new evidence folder; the old run history is preserved.",
+      "This preview did not change recovery progress or artifacts.",
+    ].join("\n"), "DEMO continuous restart preview");
+    return;
+  }
+  if (!isContinuousRecovery(validation) || validation.restartReady !== true ||
+    !["unchanged", "formatting-only"].includes(validation.sourceDrift)) {
+    ui.warn("Full continuous restart prerequisites are not ready. No testcase was executed.");
+    return;
+  }
+  const restart = actions.restartRecovery;
+  if (!restart) {
+    ui.warn("Full continuous restart is unavailable. No testcase was executed.");
+    return;
+  }
+  let acceptSourceDrift = false;
+  if (validation.sourceDrift === "formatting-only") {
+    const accepted = await ui.confirm({
+      message: "The source file hash changed, but testcase inputs are unchanged. Accept this formatting-only drift for the full restart?",
+      initialValue: false,
+    });
+    if (!accepted) return;
+    acceptSourceDrift = true;
+  }
+  ui.warn(CONTINUOUS_SESSION_WARNING);
+  const confirmed = await ui.confirm({
+    message: `Restart ALL ${validation.state.selectedScenarioIds.length} originally selected scenarios in Run ${runId} from the beginning, including completed/skipped scenarios, in their original order? This opens WhatsApp and sends messages in Continuous Session Mode under a NEW Run ID and new evidence folder. The old run is marked ABANDONED only after the new checkpoint is saved; its history and artifacts are preserved. Continue with the FULL restart?`,
+    initialValue: false,
+  });
+  if (!confirmed) {
+    ui.info("Full continuous restart cancelled");
+    return;
+  }
+  const restarted = await attempt(ui, `Restarting all scenarios from Run ${runId}`, () =>
+    restart(runId, acceptSourceDrift),
+  );
+  if (restarted.ok) ui.success(`Continuous restart of Run ${runId} finished under a new Run ID`);
 }
 
 async function recoveryStartupMenu(
@@ -294,9 +407,22 @@ async function recoveryStartupMenu(
     }
 
     const runId = recovery.state.runId;
+    const isContinuous = isContinuousRecovery(recovery);
+    if (isContinuous) ui.warn(CONTINUOUS_RECOVERY_WARNING);
     const choice = await ui.select({
       message: `Recover interrupted Run ${runId}${isDemo ? " [DEMO]" : ""}`,
-      options: [
+      options: isContinuous ? [
+        { value: "inspect", label: "Inspect details", hint: "No messages sent" },
+        {
+          value: "restart",
+          label: "Restart continuous run from beginning",
+          hint: isDemo ? "Preview only; no changes" : "All original scenarios; new Run ID",
+          disabled: !isDemo && !actions.restartRecovery,
+        },
+        { value: "abandon", label: "Abandon", hint: "Preserves artifacts" },
+        { value: "menu", label: "Main menu" },
+        { value: "exit", label: "Exit" },
+      ] : [
         { value: "inspect", label: "Inspect recovery details", hint: "No messages sent" },
         { value: "resume", label: "Resume safely" },
         ...(isDemo
@@ -307,6 +433,7 @@ async function recoveryStartupMenu(
         { value: "menu", label: "Continue to main menu" },
         { value: "exit", label: "Exit" },
       ],
+      ...(isContinuous ? { initialValue: "inspect" } : {}),
     });
     if (choice === undefined || choice === "exit") return false;
     if (choice === "menu") return true;
@@ -322,8 +449,18 @@ async function recoveryStartupMenu(
       }
       continue;
     }
+    if (isContinuous) {
+      if (choice === "restart") {
+        await restartRecoveryFromMenu(ui, actions, runId, isDemo);
+        continue;
+      }
+      if (choice !== "abandon") {
+        ui.warn(CONTINUOUS_RECOVERY_WARNING);
+        continue;
+      }
+    }
     if (choice === "resume" || (isDemo && choice === "restart")) {
-      await resumeRecoveryFromMenu(ui, actions, runId, isDemo);
+      await resumeRecoveryFromMenu(ui, actions, runId, isDemo, isContinuous);
       continue;
     }
     if (choice === "skip") {
@@ -344,7 +481,7 @@ async function recoveryStartupMenu(
       );
       if (!skipped.ok) continue;
       if (skipped.value.warning) ui.warn(skipped.value.warning);
-      await resumeRecoveryFromMenu(ui, actions, runId, isDemo);
+      await resumeRecoveryFromMenu(ui, actions, runId, isDemo, isContinuous);
       continue;
     }
     if (choice !== "abandon") continue;
@@ -367,14 +504,16 @@ export async function runConfirmedFullTest(
   ui: OperatorUi,
   actions: OperatorActions,
 ): Promise<boolean> {
-  const confirmed = await confirmExecution(ui, "A full test run");
+  const sessionMode = await selectSessionMode(ui);
+  if (sessionMode === undefined) return false;
+  const confirmed = await confirmExecution(ui, "A full test run", sessionMode);
   if (confirmed === undefined) return false;
   if (!confirmed) {
     ui.info("Test execution cancelled");
     return true;
   }
   const result = await attempt(ui, "Starting PGN execution", () =>
-    actions.runPgn([]),
+    actions.runPgn(sessionMode === "continuous" ? ["--session=continuous"] : []),
   );
   if (result.ok) ui.success("PGN execution finished");
   return true;
@@ -458,7 +597,10 @@ async function runTestsMenu(
       args = ["--test", ids, ...(rerun ? ["--rerun"] : [])];
       scope = `Running ${parseIds(input).length} selected testcase(s)`;
     }
-    const confirmed = await confirmExecution(ui, scope);
+    const sessionMode = await selectSessionMode(ui);
+    if (sessionMode === undefined) return false;
+    if (sessionMode === "continuous") args.push("--session=continuous");
+    const confirmed = await confirmExecution(ui, scope, sessionMode);
     if (confirmed === undefined) return false;
     if (!confirmed) {
       ui.info("Test execution cancelled");
@@ -535,12 +677,19 @@ async function retestMenu(
       if (runId === undefined) return false;
       args = ["--resume", runId.trim()];
     }
+    let sessionMode: SessionMode = "isolated";
+    if (choice !== "resume") {
+      const selectedMode = await selectSessionMode(ui);
+      if (selectedMode === undefined) return false;
+      sessionMode = selectedMode;
+      if (sessionMode === "continuous") args.push("--session=continuous");
+    }
     const readiness = await validateBeforeRetest(ui, actions, args);
     if (!readiness) continue;
     const description = readiness.finalCleanupOnly
       ? "The final WhatsApp session cleanup"
       : `${readiness.selectedCount} retest scenario(s)`;
-    const confirmed = await confirmExecution(ui, description);
+    const confirmed = await confirmExecution(ui, description, sessionMode);
     if (confirmed === undefined) return false;
     if (!confirmed) {
       ui.info("Retest execution cancelled");

@@ -54,6 +54,11 @@ import {
 } from "./pgn-cli";
 import { selectScenarios } from "./pgn-selection";
 import {
+  CONTINUOUS_RECOVERY_WARNING, CONTINUOUS_SESSION_WARNING, readSessionMode,
+  sessionModeLabel, shouldResetBeforeScenario,
+} from "./session-mode";
+import { getRunConfiguration, upsertRunConfiguration } from "./excel/run-configuration";
+import {
   createRetestRunId,
   needsFinalRetestCleanup,
   retestDriveFolderName,
@@ -67,11 +72,13 @@ import {
 import {
   acquireRunProcessLock,
   assertRecoveryRunExecutable,
+  createRecoveryManifest,
   discoverRecoveryRun,
   hashFile,
   initializeRecoveryCheckpoint,
   openRecoveryCheckpoint,
   readRecoveryRun,
+  recoveryManifestMatches,
   type RecoveryCheckpoint,
   type RecoveryRunManifest,
   type RecoveryRunState,
@@ -354,22 +361,33 @@ export async function runPgnWorkbook(
   let recoveryResume:
     | { state: RecoveryRunState; manifest: RecoveryRunManifest }
     | undefined;
+  let recoveryRestart: typeof recoveryResume;
   try {
     const discovered = await discoverRecoveryRun(config.projectRoot);
-    if (options.resumeRunId) {
+    const recoveryRunId = options.resumeRunId ?? options.restartRunId;
+    if (recoveryRunId) {
       try {
         recoveryResume = await readRecoveryRun(
           config.projectRoot,
-          options.resumeRunId,
+          recoveryRunId,
         );
       } catch (error) {
         const missing = (error as NodeJS.ErrnoException).code === "ENOENT";
-        if (missing) assertRecoveryRunExecutable({ runId: options.resumeRunId });
-        const legacyRetest = mode === "retest" && missing;
+        if (missing) assertRecoveryRunExecutable({ runId: recoveryRunId });
+        const legacyRetest = mode === "retest" && missing && !options.restartRunId;
         if (!legacyRetest || discovered.kind !== "none") throw error;
       }
       if (recoveryResume) {
         assertRecoveryRunExecutable(recoveryResume.state);
+        const storedSessionMode = readSessionMode(recoveryResume.state.sessionMode);
+        if (options.sessionModeExplicit && options.sessionMode !== storedSessionMode) {
+          throw new Error("Session mode conflicts with the stored run; recovery cannot change isolation semantics");
+        }
+        options.sessionMode = storedSessionMode;
+        if (options.resumeRunId && storedSessionMode === "continuous") throw new Error(CONTINUOUS_RECOVERY_WARNING);
+        if (options.restartRunId && storedSessionMode !== "continuous") {
+          throw new Error("--restart-run is only for interrupted continuous runs; use normal isolated recovery");
+        }
         if (recoveryResume.state.mode !== mode) {
           throw new Error(
             `Run ${recoveryResume.state.runId} is a ${recoveryResume.state.mode} run, not a ${mode} run`,
@@ -395,8 +413,12 @@ export async function runPgnWorkbook(
             "Source workbook formatting changed. Review it in npm run pgn, or pass --accept-source-drift after explicit review.",
           );
         }
-        if (!validation.ready) {
+        if (options.restartRunId ? !validation.restartReady : !validation.ready) {
           throw new Error(formatRecoveryValidation(validation));
+        }
+        if (options.restartRunId) {
+          recoveryRestart = recoveryResume;
+          recoveryResume = undefined;
         }
       }
     } else if (discovered.kind === "running") {
@@ -431,6 +453,9 @@ export async function runPgnWorkbook(
       return lockReleaseOperation;
     };
     try {
+      if (recoveryRestart && JSON.stringify(await readRecoveryRun(config.projectRoot, recoveryRestart.state.runId)) !== JSON.stringify(recoveryRestart)) {
+        throw new Error("Recovery state changed before restart; inspect it again before execution");
+      }
       releaseWorkbookLock = await acquireWorkbookLock(
         config.pgnExecutedWorkbookPath,
         purpose,
@@ -442,6 +467,7 @@ export async function runPgnWorkbook(
         runProcessLock,
         releaseLocks,
         recoveryResume,
+        recoveryRestart,
       );
     } finally {
       await releaseLocks();
@@ -464,7 +490,10 @@ async function runPgnWorkbookLocked(
     state: RecoveryRunState;
     manifest: RecoveryRunManifest;
   },
+  recoveryRestart?: { state: RecoveryRunState; manifest: RecoveryRunManifest },
 ): Promise<void> {
+  const sessionMode = options.sessionMode;
+  const executionContext = { transport: "whatsapp" as const, sessionMode };
   const source = await loadPgnWorkbook(config.pgnSourceWorkbookPath);
   assertPgnWorkbookValid(source.parsed);
   const executed = await openExecutedPgnWorkbook(
@@ -495,6 +524,10 @@ async function runPgnWorkbookLocked(
     if (options.resumeRunId && !resumedRun) {
       throw new Error(`Retest Run was not found: ${options.resumeRunId}`);
     }
+    if (resumedRun && options.sessionModeExplicit && options.sessionMode !== readSessionMode(resumedRun.sessionMode)) {
+      throw new Error("Session mode conflicts with the stored retest; recovery cannot change isolation semantics");
+    }
+    if (resumedRun && readSessionMode(resumedRun.sessionMode) === "continuous") throw new Error(CONTINUOUS_RECOVERY_WARNING);
     const recoveryFinished = recoveryResume
       ? new Set([
           ...recoveryResume.state.completedScenarioIds,
@@ -506,7 +539,7 @@ async function runPgnWorkbookLocked(
       sheet: options.sheet,
       limit: options.limit,
       resumeSelectedIds:
-        recoveryResume?.state.selectedScenarioIds ?? resumedRun?.selectedIds,
+        recoveryRestart?.state.selectedScenarioIds ?? recoveryResume?.state.selectedScenarioIds ?? resumedRun?.selectedIds,
       completedIds: recoveryFinished ?? new Set(resumedRun?.finishedIds ?? []),
     });
     const scopedScenarioCount = options.sheet
@@ -576,7 +609,16 @@ async function runPgnWorkbookLocked(
     });
     console.log(`Retest Run: ${runId}`);
   } else {
-    if (recoveryResume) {
+    if (recoveryRestart) {
+      const byId = new Map(executed.parsed.scenarios.map((scenario) => [scenario.testCaseId, scenario]));
+      selectedScenarios = recoveryRestart.state.selectedScenarioIds.map((id) => {
+        const scenario = byId.get(id);
+        if (!scenario) throw new Error(`Restart scenario was not found: ${id}`);
+        return scenario;
+      });
+      allRunScenarios = selectedScenarios;
+      runId = createRunId();
+    } else if (recoveryResume) {
       selectedScenarios = selectRecoveryScenarios(
         executed.parsed.scenarios,
         recoveryResume.state,
@@ -620,6 +662,11 @@ async function runPgnWorkbookLocked(
     }
     return sourceScenario;
   });
+  const recovering = recoveryResume ?? recoveryRestart;
+  if (recovering && !recoveryManifestMatches(recovering.manifest, createRecoveryManifest(
+    recovering.state.runId, recovering.state.sourceWorkbookHash, manifestScenarios,
+    new Date(recovering.manifest.createdAt), executionContext,
+  ))) throw new Error("Selected source scenarios changed before recovery execution; no testcase was sent");
   let recoveryCheckpoint: RecoveryCheckpoint;
   if (recoveryResume) {
     const opened = await openRecoveryCheckpoint(config.projectRoot, runId);
@@ -640,6 +687,8 @@ async function runPgnWorkbookLocked(
           state.interruptionReason ?? "Previous process ended before scenario completion";
       }
       state.status = "RECOVERABLE";
+      state.sessionMode = sessionMode;
+      state.transport = executionContext.transport;
       if (selectedScenarios.length > 0) state.finalCleanupComplete = false;
       state.resumedAt = resumedAt.toISOString();
       state.resumeCount += 1;
@@ -651,6 +700,8 @@ async function runPgnWorkbookLocked(
       projectRoot: config.projectRoot,
       runId,
       mode,
+      ...executionContext,
+      restartedFromRunId: recoveryRestart?.state.runId,
       sourceWorkbookPath: config.pgnSourceWorkbookPath,
       executedWorkbookPath: config.pgnExecutedWorkbookPath,
       sourceWorkbookHash: await hashFile(config.pgnSourceWorkbookPath),
@@ -672,6 +723,21 @@ async function runPgnWorkbookLocked(
   await runProcessLock.heartbeat({ runId, mode });
   const recoveryEventAt = new Date();
   const recoverySnapshot = recoveryCheckpoint.snapshot();
+  upsertRunConfiguration(executed.workbook, {
+    runId, ...executionContext, sessionResetAttempts: recoverySnapshot.sessionResetAttempts ?? 0,
+    restartedFromRunId: recoveryRestart?.state.runId,
+  });
+  if (recoveryRestart) {
+    upsertRunConfiguration(executed.workbook, {
+      runId: recoveryRestart.state.runId, ...executionContext,
+      sessionResetAttempts: recoveryRestart.state.sessionResetAttempts ?? 0,
+      restartedFromRunId: recoveryRestart.state.restartedFromRunId,
+    });
+    appendRecoveryTranscriptEvent(executed.workbook, {
+      runId: recoveryRestart.state.runId, event: "RUN_RESTARTED", timestamp: recoveryEventAt,
+      message: `Continuous run restarted from the beginning as ${runId}; all original scenarios will run again in a new clean session.`,
+    });
+  }
   appendRecoveryTranscriptEvent(executed.workbook, {
     runId,
     event: recoveryResume ? "RUN_RESUMED" : "RUN_PREPARED",
@@ -696,13 +762,30 @@ async function runPgnWorkbookLocked(
     state.updatedAt = recoveryEventAt.toISOString();
     state.heartbeatAt = recoveryEventAt.toISOString();
   });
+  if (recoveryRestart) {
+    const previous = await openRecoveryCheckpoint(config.projectRoot, recoveryRestart.state.runId);
+    await previous.checkpoint.update((state) => {
+      for (const attempt of state.scenarioAttempts.filter((attempt) => attempt.status === "RUNNING")) {
+        attempt.status = "INTERRUPTED";
+        attempt.finishedAt = recoveryEventAt.toISOString();
+        attempt.reason = `Superseded by full continuous restart ${runId}`;
+      }
+      state.status = "ABANDONED";
+      state.activeScenarioId = undefined;
+      state.activeScenarioAttempt = undefined;
+      state.activeScenarioStartedAt = undefined;
+      state.interruptionReason = `Restarted from the beginning as ${runId}`;
+      state.updatedAt = recoveryEventAt.toISOString();
+      state.heartbeatAt = recoveryEventAt.toISOString();
+    });
+  }
 
   console.log(
     `[Test] ${recoveryResume ? "Remaining" : "Selected"} ${selectedScenarios.length} scenario(s), ${selectedScenarios.reduce((count, scenario) => count + scenario.turns.length, 0)} turn(s)`,
   );
-  console.log(
-    `[Session] Isolation enabled: send "${config.resetCommand}" and require "${config.resetConfirmation}" before every scenario`,
-  );
+  console.log(`[Test] Transport: WhatsApp; Session Mode: ${sessionModeLabel(sessionMode)}`);
+  if (sessionMode === "continuous") console.warn(CONTINUOUS_SESSION_WARNING);
+  else console.log(`[Session] Isolation enabled: send "${config.resetCommand}" and require "${config.resetConfirmation}" before every scenario`);
 
   const initialRecoveryState = recoveryCheckpoint.snapshot();
   const notificationStartedAt = new Date(initialRecoveryState.startedAt);
@@ -713,6 +796,7 @@ async function runPgnWorkbookLocked(
   let evidenceCapturedCount = initialRecoveryState.metrics.evidenceCaptured;
   let evidenceUploadedCount = initialRecoveryState.metrics.evidenceUploaded;
   let evidenceUploadErrorCount = initialRecoveryState.metrics.evidenceUploadErrors;
+  let sessionResetAttempts = initialRecoveryState.sessionResetAttempts ?? 0;
   let awaitingEvaluationCount = 0;
   let currentScenarioId = initialRecoveryState.activeScenarioId;
   let workbookProgress = initialRecoveryState.workbookProgress;
@@ -723,7 +807,22 @@ async function runPgnWorkbookLocked(
       throw new Error(`Run interrupted by ${interruptionSignal}`);
     }
   };
+  const performSessionReset = async (scenario: PgnTestScenario, finalCleanup = false): Promise<void> => {
+    throwIfInterrupted();
+    sessionResetAttempts += 1;
+    await recoveryCheckpoint.update((state) => {
+      state.sessionResetAttempts = sessionResetAttempts;
+      state.updatedAt = new Date().toISOString();
+    });
+    upsertRunConfiguration(executed.workbook, {
+      ...getRunConfiguration(executed.workbook, runId)!, sessionResetAttempts,
+    });
+    throwIfInterrupted();
+    if (!activeClient) throw new Error("No active WhatsApp client is available for reset");
+    await resetAndDrainSession(activeClient, config, runId, scenario, executed.workbook, finalCleanup);
+  };
   const notificationProgress = (updatedAt = new Date()): DiscordRunProgressEvent => ({
+    sessionResetAttempts,
     completedScenarios: executedCount,
     totalScenarios: initialRecoveryState.totalScenarios,
     currentScenarioId,
@@ -825,6 +924,7 @@ async function runPgnWorkbookLocked(
     await trackNotification(
       recoveryResume
         ? notifier.runResumed({
+            ...executionContext,
             runId,
             mode,
             selectedScenarios: initialRecoveryState.totalScenarios,
@@ -838,6 +938,7 @@ async function runPgnWorkbookLocked(
             workbookPath: config.pgnExecutedWorkbookPath,
           })
         : notifier.runStarted({
+            ...executionContext,
             runId,
             mode,
             selectedScenarios: initialRecoveryState.totalScenarios,
@@ -995,13 +1096,10 @@ async function runPgnWorkbookLocked(
               config.pgnExecutedWorkbookPath,
             );
           }
-          await resetAndDrainSession(
-            client,
-            config,
-            runId,
-            scenario,
-            executed.workbook,
-          );
+          if (shouldResetBeforeScenario(sessionMode, scenarioIndex)) {
+            if (sessionMode === "continuous") console.log("[Session] Preparing one clean initial session for the continuous run");
+            await performSessionReset(scenario);
+          }
           throwIfInterrupted();
           console.log(
             `[Scenario] ${scenario.testCaseId} (${scenario.sheetName}, ${scenario.turns.length} turn(s))`,
@@ -1198,7 +1296,13 @@ async function runPgnWorkbookLocked(
           requestProgressNotification();
         }
 
-        if (!recoveryCheckpoint.snapshot().finalCleanupComplete) {
+        if (sessionMode === "continuous") {
+          await recoveryCheckpoint.update((state) => {
+            state.finalCleanupComplete = true;
+            state.workbookProgress = "Continuous run ended without a final reset";
+          });
+          workbookProgress = "Continuous run ended without a final reset";
+        } else if (!recoveryCheckpoint.snapshot().finalCleanupComplete) {
           throwIfInterrupted();
           failureStage = "performing final bot session cleanup";
           const finalCleanupScenario = allRunScenarios.at(-1);
@@ -1207,14 +1311,7 @@ async function runPgnWorkbookLocked(
               "Could not identify a scenario for final session cleanup",
             );
           }
-          await resetAndDrainSession(
-            client,
-            config,
-            runId,
-            finalCleanupScenario,
-            executed.workbook,
-            true,
-          );
+          await performSessionReset(finalCleanupScenario, true);
           const cleanupAt = new Date();
           await recoveryCheckpoint.update((state) => {
             state.finalCleanupComplete = true;
@@ -1287,12 +1384,15 @@ async function runPgnWorkbookLocked(
       beforeCompletion.selectedScenarioIds.every((id) => resolvedIds.has(id)) &&
       beforeCompletion.finalCleanupComplete;
     const completedAt = new Date();
+    console.log(`[Summary] Transport: WhatsApp; Session Mode: ${sessionModeLabel(sessionMode)}`);
+    console.log(`[Summary] Session reset attempts: ${sessionResetAttempts}${sessionMode === "isolated" ? " (scenario resets plus final cleanup)" : " (initial only)"}`);
+    console.log(`[Summary] Duration: ${Math.round((completedAt.getTime() - notificationStartedAt.getTime()) / 1000)} s`);
     appendRecoveryTranscriptEvent(executed.workbook, {
       runId,
       event: runCompleted ? "RUN_COMPLETED" : "RUN_FAILED",
       message: runCompleted
         ? `Run completed with ${capturedCount} captured, ${errorCount + timeoutCount} technical-outcome, and ${beforeCompletion.skippedScenarioIds.length} operator-skipped scenario(s).`
-        : `Run ended with ${beforeCompletion.totalScenarios - resolvedIds.size} incomplete scenario(s); recovery remains available.`,
+        : `Run ended with ${beforeCompletion.totalScenarios - resolvedIds.size} incomplete scenario(s); ${sessionMode === "continuous" ? "only a full restart or abandonment is available" : "recovery remains available"}.`,
       timestamp: completedAt,
     });
     await saveExecutedPgnWorkbook(
@@ -1345,7 +1445,7 @@ async function runPgnWorkbookLocked(
     appendRecoveryTranscriptEvent(executed.workbook, {
       runId,
       event: interruptionSignal ? "RUN_INTERRUPTED" : "RUN_FAILED",
-      message: `${reason}. The current scenario will restart from Turn 1 after explicit recovery confirmation.`,
+      message: `${reason}. ${sessionMode === "continuous" ? CONTINUOUS_RECOVERY_WARNING : "The current scenario will restart from Turn 1 after explicit recovery confirmation."}`,
       timestamp: failedAt,
       scenario: currentScenarioId
         ? allRunScenarios.find(

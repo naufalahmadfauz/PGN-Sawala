@@ -13,6 +13,7 @@ import {
 import path from "node:path";
 import type { PgnTestScenario } from "../excel/pgn-types";
 import { isProcessAlive } from "../process-liveness";
+import { readExecutionTransport, readSessionMode, type RunExecutionContext, type SessionMode, type ExecutionTransport } from "../session-mode";
 
 export const RECOVERY_SCHEMA_VERSION = 1;
 export const RUN_LOCK_STALE_MS = 45_000;
@@ -63,6 +64,10 @@ export interface RecoveryRunState {
   runId: string;
   isDemo?: true;
   mode: "full" | "retest";
+  sessionMode?: SessionMode;
+  transport?: ExecutionTransport;
+  sessionResetAttempts?: number;
+  restartedFromRunId?: string;
   status: RecoveryRunStatus;
   sourceWorkbookPath: string;
   sourceWorkbookHash: string;
@@ -106,6 +111,8 @@ export interface RecoveryRunManifest {
   schemaVersion: typeof RECOVERY_SCHEMA_VERSION;
   runId: string;
   isDemo?: true;
+  sessionMode?: SessionMode;
+  transport?: ExecutionTransport;
   sourceWorkbookHash: string;
   createdAt: string;
   scenarios: RecoveryManifestScenario[];
@@ -287,11 +294,14 @@ export function createRecoveryManifest(
   sourceWorkbookHash: string,
   scenarios: readonly PgnTestScenario[],
   createdAt = new Date(),
+  execution: Partial<RunExecutionContext> = {},
 ): RecoveryRunManifest {
   assertSafeRunId(runId);
   return {
     schemaVersion: RECOVERY_SCHEMA_VERSION,
     runId,
+    sessionMode: readSessionMode(execution.sessionMode),
+    transport: readExecutionTransport(execution.transport),
     sourceWorkbookHash,
     createdAt: createdAt.toISOString(),
     scenarios: scenarios.map((scenario, order) => ({
@@ -357,6 +367,15 @@ function parseRecoveryState(value: unknown): RecoveryRunState {
   if (typeof candidate.runId !== "string") throw new Error("Run ID is missing");
   assertSafeRunId(candidate.runId);
   assertDemoIdentity(candidate.runId, candidate.isDemo);
+  readSessionMode(candidate.sessionMode);
+  readExecutionTransport(candidate.transport);
+  if (candidate.sessionResetAttempts !== undefined && (!Number.isInteger(candidate.sessionResetAttempts) || candidate.sessionResetAttempts < 0)) {
+    throw new Error("Recovery session reset count is invalid");
+  }
+  if (candidate.restartedFromRunId !== undefined) {
+    assertSafeRunId(candidate.restartedFromRunId);
+    if (candidate.restartedFromRunId === candidate.runId) throw new Error("A restarted run must have a new Run ID");
+  }
   if (candidate.mode !== "full" && candidate.mode !== "retest") {
     throw new Error("Recovery mode is invalid");
   }
@@ -550,6 +569,8 @@ function parseManifest(value: unknown): RecoveryRunManifest {
   }
   assertSafeRunId(candidate.runId);
   assertDemoIdentity(candidate.runId, candidate.isDemo);
+  readSessionMode(candidate.sessionMode);
+  readExecutionTransport(candidate.transport);
   validDate(candidate.createdAt, "manifest createdAt");
   for (const scenario of candidate.scenarios) {
     const parsed = scenario as RecoveryManifestScenario;
@@ -603,7 +624,9 @@ export async function readRecoveryRun(
     JSON.stringify(manifestIds) !==
       JSON.stringify(parsedState.selectedScenarioIds) ||
     parsedManifest.sourceWorkbookHash !== parsedState.sourceWorkbookHash ||
-    parsedManifest.isDemo !== parsedState.isDemo
+    parsedManifest.isDemo !== parsedState.isDemo ||
+    readSessionMode(parsedManifest.sessionMode) !== readSessionMode(parsedState.sessionMode) ||
+    readExecutionTransport(parsedManifest.transport) !== readExecutionTransport(parsedState.transport)
   ) {
     throw new Error("Recovery state and manifest do not agree");
   }
@@ -870,6 +893,10 @@ export class RecoveryCheckpoint {
       if (this.current.isDemo && !next.isDemo) {
         throw new Error("Recovery demo runs cannot become real runs");
       }
+      if (readSessionMode(this.current.sessionMode) !== readSessionMode(next.sessionMode) ||
+          readExecutionTransport(this.current.transport) !== readExecutionTransport(next.transport)) {
+        throw new Error("A run's session mode and transport cannot be changed; start a new run");
+      }
       const paths = recoveryPaths(this.projectRoot, next.runId);
       await atomicWriteJson(paths.state!, next);
       this.current = next;
@@ -902,6 +929,9 @@ export async function initializeRecoveryCheckpoint(options: {
   runId: string;
   isDemo?: true;
   mode: "full" | "retest";
+  sessionMode?: SessionMode;
+  transport?: ExecutionTransport;
+  restartedFromRunId?: string;
   sourceWorkbookPath: string;
   executedWorkbookPath: string;
   sourceWorkbookHash: string;
@@ -916,6 +946,7 @@ export async function initializeRecoveryCheckpoint(options: {
     options.sourceWorkbookHash,
     options.scenarios,
     now,
+    options,
   );
   if (options.isDemo) manifest.isDemo = true;
   const state: RecoveryRunState = {
@@ -923,6 +954,10 @@ export async function initializeRecoveryCheckpoint(options: {
     runId: options.runId,
     ...(options.isDemo ? { isDemo: true as const } : {}),
     mode: options.mode,
+    sessionMode: readSessionMode(options.sessionMode),
+    transport: readExecutionTransport(options.transport),
+    sessionResetAttempts: 0,
+    ...(options.restartedFromRunId ? { restartedFromRunId: options.restartedFromRunId } : {}),
     status: "PREPARING",
     sourceWorkbookPath: relative(options.sourceWorkbookPath),
     sourceWorkbookHash: options.sourceWorkbookHash,

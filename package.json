@@ -27,6 +27,7 @@
     "test:pgn:validate": "tsx scripts/validate-pgn-workbook.ts",
     "test:response-collector": "tsx --test scripts/response-collector.test.ts",
     "test:session-reset": "tsx --test scripts/session-reset.test.ts",
+    "test:session-mode": "tsx --test scripts/session-mode.test.ts",
     "test:workbook-writer": "tsx --test scripts/workbook-writer.test.ts",
     "test:config": "tsx --test scripts/config.test.ts",
     "test:retest": "tsx --test scripts/retest.test.ts",

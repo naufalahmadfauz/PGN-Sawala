@@ -5,8 +5,15 @@ import {
   type PgnValidationIssue,
 } from "./pgn-types";
 import { formatWorksheetSchema } from "./workbook-schema";
+import {
+  CONTINUOUS_SESSION_WARNING,
+  readSessionMode,
+  sessionModeLabel,
+  type SessionMode,
+} from "../session-mode";
 
 export interface PgnSessionIsolationConfig {
+  sessionMode?: SessionMode;
   command: string;
   confirmation: string;
   timeoutMs: number;
@@ -41,6 +48,8 @@ export function formatPgnValidation(
   parsed: ParsedPgnWorkbook,
   isolation: PgnSessionIsolationConfig,
 ): string {
+  const sessionMode = readSessionMode(isolation.sessionMode);
+  const isolated = sessionMode === "isolated";
   const lines = [
     "PGN workbook validation",
     "Workbook schema",
@@ -55,11 +64,17 @@ export function formatPgnValidation(
     "",
     "Session isolation",
     "-----------------",
+    "Transport: WhatsApp",
+    `Session Mode: ${sessionModeLabel(sessionMode)}`,
+    "Initial reset: Required",
+    `Between-scenario reset: ${isolated ? "Enabled" : "Disabled"}`,
+    `Final cleanup reset: ${isolated ? "Enabled" : "Disabled"}`,
     `Strategy: WhatsApp Conversation Builder debug command "${isolation.command}"`,
     `Expected confirmation: "${isolation.confirmation}"`,
     `Reset timeout: ${isolation.timeoutMs} ms`,
     `Post-reset quiet window: ${isolation.postResetQuietMs} ms`,
-    "Status: ENABLED",
+    `Status: ${isolated ? "ENABLED" : "DISABLED"}`,
+    ...(!isolated ? ["", CONTINUOUS_SESSION_WARNING] : []),
     "",
     "Response completion",
     "-------------------",

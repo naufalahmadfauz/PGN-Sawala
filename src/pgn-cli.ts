@@ -1,4 +1,5 @@
 import type { PgnSheetKind } from "./excel/pgn-types";
+import { readSessionMode, type SessionMode } from "./session-mode";
 
 export interface CliOptions {
   limit?: number;
@@ -7,6 +8,9 @@ export interface CliOptions {
   rerunAll: boolean;
   rerunIds: Set<string>;
   resumeRunId?: string;
+  restartRunId?: string;
+  sessionMode: SessionMode;
+  sessionModeExplicit: boolean;
   acceptSourceDrift: boolean;
 }
 
@@ -23,11 +27,23 @@ export function parseCliOptions(args: string[]): CliOptions {
     rerunAll: false,
     rerunIds: new Set(),
     acceptSourceDrift: false,
+    sessionMode: "isolated",
+    sessionModeExplicit: false,
   };
 
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
-    if (argument === "--limit") {
+    if (argument === "--fast" || argument === "--session" || argument.startsWith("--session=")) {
+      const value = argument === "--fast" ? "continuous"
+        : argument === "--session" ? args[++index] : argument.slice("--session=".length);
+      if (!value) throw new Error("--session requires isolated or continuous");
+      const sessionMode = readSessionMode(value);
+      if (options.sessionModeExplicit && options.sessionMode !== sessionMode) {
+        throw new Error("Conflicting session flags: choose either isolated or continuous");
+      }
+      options.sessionMode = sessionMode;
+      options.sessionModeExplicit = true;
+    } else if (argument === "--limit") {
       const value = Number(args[++index]);
       if (!Number.isInteger(value) || value < 1) {
         throw new Error("--limit requires a positive integer");
@@ -58,27 +74,31 @@ export function parseCliOptions(args: string[]): CliOptions {
       } else {
         options.rerunAll = true;
       }
-    } else if (argument === "--resume") {
+    } else if (argument === "--resume" || argument === "--restart-run") {
       const value = args[++index]?.trim();
       if (!value || value.startsWith("--")) {
-        throw new Error("--resume requires a Run ID");
+        throw new Error(`${argument} requires a Run ID`);
       }
-      options.resumeRunId = value;
+      if (argument === "--resume") options.resumeRunId = value;
+      else options.restartRunId = value;
     } else if (argument === "--accept-source-drift") {
       options.acceptSourceDrift = true;
     } else {
       throw new Error(`Unknown argument: ${argument}`);
     }
   }
-  if (options.acceptSourceDrift && !options.resumeRunId) {
-    throw new Error("--accept-source-drift requires --resume");
+  if (options.resumeRunId && options.restartRunId) {
+    throw new Error("--resume and --restart-run cannot be combined");
+  }
+  if (options.acceptSourceDrift && !options.resumeRunId && !options.restartRunId) {
+    throw new Error("--accept-source-drift requires --resume or --restart-run");
   }
   return options;
 }
 
 export function assertResumeOptionsCompatible(options: CliOptions): void {
   if (
-    options.resumeRunId &&
+    (options.resumeRunId || options.restartRunId) &&
     (options.limit !== undefined ||
       options.sheet !== undefined ||
       options.testIds.size > 0 ||
@@ -86,7 +106,7 @@ export function assertResumeOptionsCompatible(options: CliOptions): void {
       options.rerunIds.size > 0)
   ) {
     throw new Error(
-      "--resume cannot be combined with --limit, --sheet, --test, or --rerun; recovery uses the original selection snapshot",
+      "--resume/--restart-run cannot be combined with --limit, --sheet, --test, or --rerun; recovery uses the original selection snapshot",
     );
   }
 }

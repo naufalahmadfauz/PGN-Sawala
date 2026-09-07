@@ -3,6 +3,9 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { parsePgnValidationArgs } from "./validate-pgn-workbook";
+import { formatPgnValidation } from "../src/excel/pgn-workbook-validator";
+import type { ParsedPgnWorkbook } from "../src/excel/pgn-types";
 import {
   runControlPanel,
   type OperatorActions,
@@ -38,6 +41,11 @@ import {
   type RecoveryRunManifest,
   type RecoveryRunState,
 } from "../src/recovery/run-state";
+import {
+  CONTINUOUS_RECOVERY_WARNING,
+  CONTINUOUS_SESSION_WARNING,
+  type SessionMode,
+} from "../src/session-mode";
 
 class ScriptedUi implements OperatorUi {
   readonly events: string[] = [];
@@ -268,13 +276,14 @@ function stubActions(
   };
 }
 
-function recoveryFixture(isDemo = false): {
+function recoveryFixture(isDemo = false, sessionMode?: SessionMode): {
   discovery: RecoveryDiscovery;
   validation: RecoveryValidation;
 } {
   const state: RecoveryRunState = {
     schemaVersion: RECOVERY_SCHEMA_VERSION,
     ...(isDemo ? { isDemo: true as const } : {}),
+    ...(sessionMode ? { sessionMode, transport: "whatsapp" as const } : {}),
     runId: "RECOVERY-OPERATOR-001",
     mode: "full",
     status: "INTERRUPTED",
@@ -332,6 +341,7 @@ function recoveryFixture(isDemo = false): {
   const manifest: RecoveryRunManifest = {
     schemaVersion: RECOVERY_SCHEMA_VERSION,
     ...(isDemo ? { isDemo: true as const } : {}),
+    ...(sessionMode ? { sessionMode, transport: "whatsapp" as const } : {}),
     runId: state.runId,
     sourceWorkbookHash: state.sourceWorkbookHash,
     createdAt: state.startedAt,
@@ -375,9 +385,36 @@ function recoveryFixture(isDemo = false): {
         restartInterruptedScenarioFromTurnOne: true,
       },
       checks: [],
-      ready: true,
+      ready: sessionMode !== "continuous",
+      ...(sessionMode === "continuous" ? { restartReady: true } : {}),
     },
   };
+}
+
+function stubRecoveryActions(
+  recovery: ReturnType<typeof recoveryFixture>,
+  calls: string[],
+  overrides: Partial<OperatorActions> = {},
+): OperatorActions {
+  const mutate = (action: string) => async (runId: string) => {
+    calls.push(`${action}:${runId}`);
+    return { runId };
+  };
+  return stubActions({
+    inspectRecovery: async () => recovery.discovery,
+    validateRecovery: async (runId) => {
+      calls.push(`validate:${runId}`);
+      return recovery.validation;
+    },
+    resumeRecovery: async (runId) => { calls.push(`resume:${runId}`); },
+    restartRecovery: async (runId, acceptSourceDrift) => {
+      calls.push(`restart:${runId}:${acceptSourceDrift}`);
+    },
+    skipRecoveryScenario: mutate("skip"),
+    repairRecovery: mutate("repair"),
+    abandonRecovery: mutate("abandon"),
+    ...overrides,
+  });
 }
 
 test("browser runtime is direct on Windows, macOS, displayed Linux, and headless Linux", () => {
@@ -1215,6 +1252,206 @@ test("confirmed recovery keeps the Run ID and starts at the interrupted scenario
   );
 });
 
+test("continuous recovery offers only full restart or abandonment and guards stale dispatch", async () => {
+  const recovery = recoveryFixture(false, "continuous");
+  const before = structuredClone(recovery);
+  const calls: string[] = [];
+  const ui = new ScriptedUi(["inspect", "resume", "skip", "repair", "restart", false, "menu", "exit"]);
+  await runControlPanel(ui, stubRecoveryActions(recovery, calls));
+
+  assert.deepEqual(calls, ["validate:RECOVERY-OPERATOR-001", "validate:RECOVERY-OPERATOR-001"]);
+  assert.deepEqual(recovery, before);
+  assert.equal(ui.selectPrompts[0]?.initialValue, "inspect");
+  assert.deepEqual(ui.selectPrompts[0]?.options.map((option) => option.label), [
+    "Inspect details",
+    "Restart continuous run from beginning",
+    "Abandon",
+    "Main menu",
+    "Exit",
+  ]);
+  assert(ui.events.includes(`warn:${CONTINUOUS_RECOVERY_WARNING}`));
+  assert(ui.events.includes(`warn:${CONTINUOUS_SESSION_WARNING}`));
+  assert.equal(ui.confirmPrompts.length, 1);
+  assert.equal(ui.confirmPrompts[0]?.initialValue, false);
+  assert.match(ui.events.join("\n"), /Full continuous restart cancelled/);
+  assert.equal(ui.selectPrompts.at(-1)?.message, "Choose an operation");
+});
+
+for (const mode of ["full", "retest"] as const) {
+  for (const sourceDrift of ["unchanged", "formatting-only"] as const) {
+    test(`${mode} continuous restart validates ${sourceDrift} source and explicitly confirms the full original run`, async () => {
+      const recovery = recoveryFixture(false, "continuous");
+      recovery.validation.mode = mode;
+      recovery.validation.state.mode = mode;
+      recovery.validation.sourceDrift = sourceDrift;
+      // A full restart must not offer partial progress repair.
+      recovery.validation.reconciliation!.mismatchedScenarioIds = ["TC-001"];
+      const before = structuredClone(recovery);
+      const calls: string[] = [];
+      const ui = new ScriptedUi(["restart", ...(sourceDrift === "formatting-only" ? [true] : []), true, "exit"]);
+      await runControlPanel(ui, stubRecoveryActions(recovery, calls));
+
+      assert.deepEqual(calls, [
+        "validate:RECOVERY-OPERATOR-001",
+        `restart:RECOVERY-OPERATOR-001:${sourceDrift === "formatting-only"}`,
+      ]);
+      assert.deepEqual(recovery, before);
+      assert(ui.confirmPrompts.every((prompt) => prompt.initialValue === false));
+      assert.equal(ui.confirmPrompts.length, sourceDrift === "formatting-only" ? 2 : 1);
+      const confirmation = ui.confirmPrompts.at(-1)?.message ?? "";
+      assert.match(confirmation, /ALL 2 originally selected scenarios/);
+      assert.match(confirmation, /including completed\/skipped scenarios, in their original order/);
+      assert.match(confirmation, /NEW Run ID and new evidence folder/);
+      assert.match(confirmation, /ABANDONED only after the new checkpoint is saved/);
+      assert(ui.events.includes(`warn:${CONTINUOUS_SESSION_WARNING}`));
+    });
+  }
+
+  test(`${mode} continuous demo restart is preview only even when validation loses demo flags`, async () => {
+    const recovery = recoveryFixture(true, "continuous");
+    recovery.validation.mode = mode;
+    recovery.validation.state.mode = mode;
+    const before = structuredClone(recovery);
+    const calls: string[] = [];
+    const ui = new ScriptedUi(["restart", "resume", "skip", "repair", "exit"]);
+    await runControlPanel(ui, stubRecoveryActions(recovery, calls, {
+      validateRecovery: async () => {
+        calls.push("validate");
+        const validation = structuredClone(recovery.validation);
+        delete validation.state.isDemo;
+        delete validation.manifest.isDemo;
+        return validation;
+      },
+    }));
+    assert.deepEqual(calls, ["validate"]);
+    assert.deepEqual(recovery, before);
+    assert.equal(ui.confirmPrompts.length, 0);
+    assert.match(ui.events.join("\n"), /DEMO continuous restart preview/);
+    assert.match(ui.events.join("\n"), /all 2 originally selected scenarios from the beginning \(preview only\)/);
+    assert.match(ui.events.join("\n"), /Original order: TC-001, TC-002/);
+  });
+}
+
+test("continuous restart recognizes demo flags found only during validation", async () => {
+  const recovery = recoveryFixture(false, "continuous");
+  const validation = structuredClone(recovery.validation);
+  validation.manifest.isDemo = true;
+  const calls: string[] = [];
+  const ui = new ScriptedUi(["restart", "exit"]);
+  await runControlPanel(ui, stubRecoveryActions(recovery, calls, {
+    validateRecovery: async () => validation,
+  }));
+  assert.deepEqual(calls, []);
+  assert.equal(ui.confirmPrompts.length, 0);
+  assert.match(ui.events.join("\n"), /DEMO continuous restart preview/);
+});
+
+test("continuous restart requires restartReady, safe source drift, and an available adapter, never ready alone", async () => {
+  for (const blockedBy of ["false", "missing", "structural", "unavailable", "adapter"] as const) {
+    const recovery = recoveryFixture(false, "continuous");
+    recovery.validation.ready = true;
+    if (blockedBy === "false") recovery.validation.restartReady = false;
+    if (blockedBy === "missing") delete recovery.validation.restartReady;
+    if (blockedBy === "structural" || blockedBy === "unavailable") {
+      recovery.validation.sourceDrift = blockedBy;
+    }
+    const calls: string[] = [];
+    const ui = new ScriptedUi(["restart", "exit"]);
+    await runControlPanel(ui, stubRecoveryActions(recovery, calls,
+      blockedBy === "adapter" ? { restartRecovery: undefined } : {},
+    ));
+    assert.deepEqual(calls, ["validate:RECOVERY-OPERATOR-001"], blockedBy);
+    assert.equal(ui.confirmPrompts.length, 0, blockedBy);
+    assert.match(ui.events.join("\n"), /No testcase was executed/);
+    assert.match(ui.selectPrompts[0]?.message ?? "", /Recover interrupted Run/);
+  }
+});
+
+test("declining or cancelling continuous restart confirmations never executes", async () => {
+  for (const answer of [false, undefined]) {
+    for (const sourceDrift of ["unchanged", "formatting-only"] as const) {
+      const recovery = recoveryFixture(false, "continuous");
+      recovery.validation.sourceDrift = sourceDrift;
+      const calls: string[] = [];
+      const ui = new ScriptedUi(["restart", answer, "exit"]);
+      await runControlPanel(ui, stubRecoveryActions(recovery, calls));
+      assert.deepEqual(calls, ["validate:RECOVERY-OPERATOR-001"]);
+      assert.equal(ui.confirmPrompts.length, 1);
+      assert.equal(ui.confirmPrompts[0]?.initialValue, false);
+    }
+  }
+});
+
+test("continuous recovery can be explicitly abandoned without resuming or restarting", async () => {
+  const recovery = recoveryFixture(false, "continuous");
+  let available = true;
+  const calls: string[] = [];
+  const ui = new ScriptedUi(["abandon", false, "abandon", true, "exit"]);
+  await runControlPanel(ui, stubRecoveryActions(recovery, calls, {
+    inspectRecovery: async () => available ? recovery.discovery : { kind: "none", lock: { status: "unlocked" } },
+    abandonRecovery: async (runId) => {
+      calls.push(`abandon:${runId}`);
+      available = false;
+      return { runId };
+    },
+  }));
+  assert.deepEqual(calls, ["abandon:RECOVERY-OPERATOR-001"]);
+  assert(ui.confirmPrompts.every((prompt) => prompt.initialValue === false));
+  assert.match(ui.events.join("\n"), /marked ABANDONED; artifacts were preserved/);
+  assert.equal(ui.selectPrompts.at(-1)?.message, "Choose an operation");
+});
+
+test("stale isolated recovery menus cannot resume or repair continuous validation", async () => {
+  for (const source of ["state", "manifest"] as const) {
+    const recovery = recoveryFixture();
+    const validation = structuredClone(recovery.validation);
+    validation[source].sessionMode = "continuous";
+    validation.ready = true;
+    validation.reconciliation!.mismatchedScenarioIds = ["TC-001"];
+    const calls: string[] = [];
+    const ui = new ScriptedUi(["resume", "exit"]);
+    await runControlPanel(ui, stubRecoveryActions(recovery, calls, {
+      validateRecovery: async () => { calls.push("validate"); return validation; },
+    }));
+    assert.deepEqual(calls, ["validate"]);
+    assert.equal(ui.confirmPrompts.length, 0);
+    assert(ui.events.includes(`warn:${CONTINUOUS_RECOVERY_WARNING}`));
+  }
+});
+
+test("revalidated continuous recovery cannot pass through the isolated resume path", async () => {
+  const recovery = recoveryFixture();
+  recovery.validation.reconciliation!.mismatchedScenarioIds = ["TC-001"];
+  const continuous = recoveryFixture(false, "continuous").validation;
+  continuous.ready = true;
+  let validations = 0;
+  const calls: string[] = [];
+  const ui = new ScriptedUi(["resume", "rerun", true, "exit"]);
+  await runControlPanel(ui, stubRecoveryActions(recovery, calls, {
+    validateRecovery: async () => {
+      calls.push("validate");
+      return ++validations === 1 ? recovery.validation : continuous;
+    },
+  }));
+  assert.deepEqual(calls, ["validate", "repair:RECOVERY-OPERATOR-001", "validate"]);
+  assert.equal(ui.confirmPrompts.length, 1);
+  assert(ui.events.includes(`warn:${CONTINUOUS_RECOVERY_WARNING}`));
+});
+
+test("legacy isolated recovery still allows confirmed skip followed by resume", async () => {
+  const recovery = recoveryFixture();
+  const calls: string[] = [];
+  const ui = new ScriptedUi(["skip", true, true, "exit"]);
+  await runControlPanel(ui, stubRecoveryActions(recovery, calls, { restartRecovery: undefined }));
+  assert.deepEqual(calls, [
+    "skip:RECOVERY-OPERATOR-001",
+    "validate:RECOVERY-OPERATOR-001",
+    "resume:RECOVERY-OPERATOR-001",
+  ]);
+  assert.equal(ui.confirmPrompts.length, 2);
+  assert(ui.confirmPrompts.every((prompt) => prompt.initialValue === false));
+});
+
 for (const mode of ["full", "retest"] as const) {
   test(`${mode} demo resume and restart use the same recovery menu without execution or mutation`, async () => {
     const recovery = recoveryFixture(true);
@@ -1526,6 +1763,7 @@ test("full execution, evidence migration, and auth recreation require confirmati
   const ui = new ScriptedUi([
     "run",
     "remaining",
+    "isolated",
     false,
     "back",
     "evidence",
@@ -1553,6 +1791,121 @@ test("full execution, evidence migration, and auth recreation require confirmati
     }),
   );
   assert.deepEqual([fullRuns, migrations, recreations], [0, 0, 0]);
+});
+
+for (const sessionMode of ["isolated", "continuous"] as const) {
+  for (const selection of ["remaining", "sheet", "ids", "setup"] as const) {
+    test(`${selection} execution selects ${sessionMode} per run without changing isolated arguments`, async () => {
+      const filterAnswers = selection === "sheet" ? ["kb"] : selection === "ids" ? ["TC-001, TC-002", true] : [];
+      const args = selection === "sheet" ? ["--sheet", "kb"] : selection === "ids" ? ["--test", "TC-001,TC-002", "--rerun"] : [];
+      if (sessionMode === "continuous") args.push("--session=continuous");
+      const received: string[][] = [];
+      const ui = new ScriptedUi([
+        ...(selection === "setup" ? ["setup"] : ["run", selection, ...filterAnswers]),
+        sessionMode, true,
+        ...(selection === "setup" ? [] : ["back"]),
+        "exit",
+      ]);
+      await runControlPanel(ui, stubActions({
+        setup: async () => "full-test",
+        runPgn: async (receivedArgs) => {
+          assert(ui.confirmPrompts.at(-1)?.message.includes("will open WhatsApp"));
+          if (sessionMode === "continuous") assert(ui.events.includes(`warn:${CONTINUOUS_SESSION_WARNING}`));
+          received.push(receivedArgs);
+        },
+      }));
+      assert.deepEqual(received, [args]);
+      const selector = ui.selectPrompts.find((prompt) => prompt.message === "Session Mode for this run");
+      assert.equal(selector?.initialValue, "isolated");
+      assert.deepEqual(selector?.options.map((option) => option.value), ["isolated", "continuous"]);
+      assert.equal(ui.confirmPrompts.at(-1)?.initialValue, false);
+      assert.equal(ui.events.includes(`warn:${CONTINUOUS_SESSION_WARNING}`), sessionMode === "continuous");
+    });
+  }
+
+  for (const selection of ["ready", "ids"] as const) {
+    test(`${selection} retest validates and executes the same ${sessionMode} arguments`, async () => {
+      const received: Array<{ action: string; args: string[] }> = [];
+      const args = selection === "ids" ? ["--test", "TC-001,TC-002"] : [];
+      if (sessionMode === "continuous") args.push("--session=continuous");
+      const ui = new ScriptedUi([
+        "retest", selection, ...(selection === "ids" ? ["TC-001, TC-002"] : []),
+        sessionMode, true, "back", "exit",
+      ]);
+      await runControlPanel(ui, stubActions({
+        validateRetest: async (args) => {
+          received.push({ action: "validate", args: [...args] });
+          return { selectedCount: 2, finalCleanupOnly: false, shouldExecute: true, readyToExecute: true };
+        },
+        runRetest: async (args) => { received.push({ action: "execute", args: [...args] }); },
+      }));
+      assert.deepEqual(received, [{ action: "validate", args }, { action: "execute", args }]);
+      assert.equal(ui.selectPrompts.find((prompt) => prompt.message === "Session Mode for this run")?.initialValue, "isolated");
+      assert.equal(ui.confirmPrompts.at(-1)?.initialValue, false);
+      assert.equal(ui.events.includes(`warn:${CONTINUOUS_SESSION_WARNING}`), sessionMode === "continuous");
+    });
+  }
+}
+
+test("session choice resets to isolated for the next run instead of becoming a setting", async () => {
+  const received: string[][] = [];
+  const ui = new ScriptedUi(["run", "remaining", "continuous", true, "remaining", "isolated", true, "back", "exit"]);
+  await runControlPanel(ui, stubActions({ runPgn: async (args) => { received.push(args); } }));
+  assert.deepEqual(received, [["--session=continuous"], []]);
+  const selectors = ui.selectPrompts.filter((prompt) => prompt.message === "Session Mode for this run");
+  assert.equal(selectors.length, 2);
+  assert(selectors.every((prompt) => prompt.initialValue === "isolated"));
+});
+
+test("session selection and continuous execution cancellation never launch tests", async () => {
+  for (const selection of ["full", "retest", "setup"] as const) {
+    for (const answer of ["selector", false, undefined]) {
+      const calls: string[] = [];
+      const ui = new ScriptedUi([
+        ...(selection === "setup" ? ["setup"] : selection === "full" ? ["run", "remaining"] : ["retest", "ready"]),
+        ...(answer === "selector" ? [undefined] : ["continuous", answer]),
+        ...(answer === false ? [...(selection === "setup" ? [] : ["back"]), "exit"] : []),
+      ]);
+      await runControlPanel(ui, stubActions({
+        setup: async () => "full-test",
+        validateRetest: async () => {
+          calls.push("validate");
+          return { selectedCount: 2, finalCleanupOnly: false, shouldExecute: true, readyToExecute: true };
+        },
+        runPgn: async () => { calls.push("execute"); },
+        runRetest: async () => { calls.push("execute"); },
+      }));
+      assert.deepEqual(calls, selection === "retest" && answer !== "selector" ? ["validate"] : []);
+      assert(ui.confirmPrompts.every((prompt) => prompt.initialValue === false));
+      if (answer !== "selector") assert(ui.events.includes(`warn:${CONTINUOUS_SESSION_WARNING}`));
+    }
+  }
+});
+
+test("fresh workbook preparation remains separate from session selection and execution", async () => {
+  const calls: string[] = [];
+  const ui = new ScriptedUi(["run", "fresh", true, "back", "exit"]);
+  await runControlPanel(ui, stubActions({
+    prepareFresh: async () => { calls.push("prepare"); },
+    runPgn: async () => { calls.push("execute"); },
+  }));
+  assert.deepEqual(calls, ["prepare"]);
+  assert.equal(ui.selectPrompts.some((prompt) => prompt.message === "Session Mode for this run"), false);
+});
+
+test("legacy retest resume retains its stored mode and final-cleanup-only flow without a new selector", async () => {
+  const received: string[][] = [];
+  const ui = new ScriptedUi(["retest", "resume", "RETEST-FIXTURE", true, "back", "exit"]);
+  await runControlPanel(ui, stubActions({
+    validateRetest: async (args) => {
+      received.push([...args]);
+      return { selectedCount: 0, finalCleanupOnly: true, shouldExecute: true, readyToExecute: true };
+    },
+    runRetest: async (args) => { received.push([...args]); },
+  }));
+  assert.deepEqual(received, [["--resume", "RETEST-FIXTURE"], ["--resume", "RETEST-FIXTURE"]]);
+  assert.equal(ui.selectPrompts.some((prompt) => prompt.message === "Session Mode for this run"), false);
+  assert.match(ui.confirmPrompts[0]?.message ?? "", /final WhatsApp session cleanup/);
 });
 
 test("Notifications menu separates safe status, confirmed test, and configuration", async () => {
@@ -1609,7 +1962,7 @@ test("setup completion routes diagnostics and confirmed full tests through exist
   assert.equal(diagnostics, 1);
 
   let fullRuns = 0;
-  const fullTestUi = new ScriptedUi(["setup", true, "exit"]);
+  const fullTestUi = new ScriptedUi(["setup", "isolated", true, "exit"]);
   await runControlPanel(
     fullTestUi,
     stubActions({
@@ -1625,7 +1978,7 @@ test("setup completion routes diagnostics and confirmed full tests through exist
 
 test("zero-candidate retest returns to the menu without execution", async () => {
   let executions = 0;
-  const ui = new ScriptedUi(["retest", "ready", "back", "exit"]);
+  const ui = new ScriptedUi(["retest", "ready", "isolated", "back", "exit"]);
   await runControlPanel(
     ui,
     stubActions({
@@ -1640,7 +1993,7 @@ test("zero-candidate retest returns to the menu without execution", async () => 
 
 test("nonzero ready retest selection executes only after confirmation", async () => {
   const received: string[][] = [];
-  const ui = new ScriptedUi(["retest", "ready", true, "back", "exit"]);
+  const ui = new ScriptedUi(["retest", "ready", "isolated", true, "back", "exit"]);
   await runControlPanel(
     ui,
     stubActions({
@@ -1660,7 +2013,7 @@ test("nonzero ready retest selection executes only after confirmation", async ()
 
 test("failed retest prerequisites prevent execution", async () => {
   let executions = 0;
-  const ui = new ScriptedUi(["retest", "ready", "back", "exit"]);
+  const ui = new ScriptedUi(["retest", "ready", "isolated", "back", "exit"]);
   await runControlPanel(
     ui,
     stubActions({
@@ -1710,4 +2063,61 @@ test("environment text updates one key without duplicating or removing unknown f
   assert.match(updated, /VALUE="new value"/);
   assert.match(updated, /UNKNOWN=keep/);
   assert.match(updated, /EMPTY=\n/);
+});
+
+test("workbook validation CLI accepts only central session flags, including no-op execution filters rejection", () => {
+  assert.equal(parsePgnValidationArgs([]), "isolated");
+  for (const sessionMode of ["isolated", "continuous"] as const) {
+    assert.equal(parsePgnValidationArgs([`--session=${sessionMode}`]), sessionMode);
+    assert.equal(parsePgnValidationArgs(["--session", sessionMode]), sessionMode);
+  }
+  assert.equal(parsePgnValidationArgs(["--fast"]), "continuous");
+  assert.equal(parsePgnValidationArgs(["--fast", "--session=continuous"]), "continuous");
+  for (const args of [
+    ["--limit", "1"], ["--sheet", "all"], ["--sheet", "kb"],
+    ["--test", "TC-001"], ["--test", ",,"], ["--rerun"], ["--rerun", "TC-001"],
+    ["--resume", "RUN-001"], ["--restart-run", "RUN-001"],
+    ["--resume", "RUN-001", "--accept-source-drift"],
+  ]) {
+    assert.throws(() => parsePgnValidationArgs(args), /execution and recovery filters are not allowed/);
+    assert.throws(() => parsePgnValidationArgs(["--session=continuous", ...args]), /execution and recovery filters are not allowed/);
+  }
+  for (const args of [["--session"], ["--session="], ["--session=invalid"], ["--fast", "--session=isolated"], ["--unknown"]]) {
+    assert.throws(() => parsePgnValidationArgs(args));
+  }
+});
+
+test("workbook validation describes isolated defaults and continuous reset policy without live actions", () => {
+  const summary = { scenarios: 0, runnableTurns: 0, missingUserInput: 0, multiTurnScenarios: 0, completedScenarios: 0 };
+  const parsed: ParsedPgnWorkbook = {
+    scenarios: [], issues: [], summaries: { kb: summary, negative: summary },
+    duplicateTestCaseIds: 0, invalidTurnRows: 0,
+  };
+  const isolation = {
+    command: "reset", confirmation: "Session deleted", timeoutMs: 30_000,
+    responseIdleMs: 10_000, responseTimeoutMs: 60_000, postResetQuietMs: 10_000,
+  };
+  const legacy = formatPgnValidation(parsed, isolation);
+  const isolated = formatPgnValidation(parsed, { ...isolation, sessionMode: "isolated" });
+  assert.equal(legacy, isolated);
+  assert.match(isolated, /Session Mode: Isolated/);
+  assert.match(isolated, /Between-scenario reset: Enabled/);
+  assert.match(isolated, /Final cleanup reset: Enabled/);
+  assert.equal(isolated.includes(CONTINUOUS_SESSION_WARNING), false);
+
+  const continuous = formatPgnValidation(parsed, { ...isolation, sessionMode: "continuous" });
+  assert.match(continuous, /Session Mode: Continuous/);
+  assert.match(continuous, /Between-scenario reset: Disabled/);
+  assert.match(continuous, /Final cleanup reset: Disabled/);
+  assert(continuous.includes(CONTINUOUS_SESSION_WARNING));
+  for (const output of [isolated, continuous]) {
+    assert.match(output, /Transport: WhatsApp/);
+    assert.match(output, /Initial reset: Required/);
+    assert.match(output, /Expected confirmation: "Session deleted"/);
+    assert.match(output, /Reset timeout: 30000 ms/);
+    assert.match(output, /Post-reset quiet window: 10000 ms/);
+    assert.match(output, /READY TO EXECUTE/);
+  }
+  parsed.issues.push({ code: "MISSING_SHEET", severity: "ERROR", sheetName: "Negative Case", message: "Missing sheet" });
+  assert.match(formatPgnValidation(parsed, { ...isolation, sessionMode: "continuous" }), /NOT READY$/);
 });

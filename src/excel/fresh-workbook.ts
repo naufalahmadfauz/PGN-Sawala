@@ -14,7 +14,7 @@ import {
   RETEST_METADATA_SHEET_NAME,
 } from "./retest-workbook";
 import { TRANSCRIPT_SHEET_NAME } from "./pgn-types";
-import { optionalFieldCell } from "./workbook-schema";
+import { optionalFieldCell, RUN_CONFIGURATION_SCHEMA } from "./workbook-schema";
 import {
   openExecutedPgnWorkbook,
   saveExecutedPgnWorkbook,
@@ -75,6 +75,7 @@ export async function createFreshPgnWorkbook(
       EXECUTION_METADATA_SHEET_NAME,
       RETEST_HISTORY_SHEET_NAME,
       RETEST_METADATA_SHEET_NAME,
+      RUN_CONFIGURATION_SCHEMA.sheetName,
     ]) {
       const worksheet = fresh.workbook.getWorksheet(sheetName);
       if (worksheet) {

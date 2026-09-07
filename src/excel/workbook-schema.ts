@@ -22,7 +22,8 @@ export type WorkbookField =
   | "previousResponseTime" | "previousTestDate" | "previousEvidenceUrl"
   | "retestedAt" | "newTechnicalStatus" | "newBotResponse" | "newResponseTime"
   | "newTestDate" | "newEvidenceUrl" | "historyKey" | "startedAt" | "state"
-  | "selectedIds" | "finishedIds" | "updatedAt";
+  | "selectedIds" | "finishedIds" | "updatedAt"
+  | "transport" | "sessionMode" | "sessionResetAttempts" | "restartedFromRunId";
 
 export interface WorksheetSchemaDefinition {
   id: string;
@@ -73,6 +74,7 @@ export const TRANSCRIPT_SCHEMA: WorksheetSchemaDefinition = {
     field("firstResponseMs", "First Response (ms)"), field("totalResponseMs", "Total Response (ms)"),
     field("status", "Status"), field("error", "Error"), field("evidencePath", "Evidence Path"),
     field("evidenceUrl", "Evidence URL", false, true), field("evidenceStatus", "Evidence Status", false, true),
+    field("transport", "Transport", false, true), field("sessionMode", "Session Mode", false, true),
   ],
 };
 export const EVIDENCE_RUN_SCHEMA: WorksheetSchemaDefinition = {
@@ -112,7 +114,14 @@ export const RETEST_METADATA_SCHEMA: WorksheetSchemaDefinition = {
     field("updatedAt", "Last Updated"), field("folderId", "Evidence Drive Folder ID"), field("folderUrl", "Evidence Drive Folder URL"),
   ],
 };
-export const WORKBOOK_SCHEMAS = [KB_SCHEMA, NEGATIVE_SCHEMA, TRANSCRIPT_SCHEMA, EVIDENCE_RUN_SCHEMA, EVIDENCE_FILE_SCHEMA, RETEST_HISTORY_SCHEMA, RETEST_METADATA_SCHEMA];
+export const RUN_CONFIGURATION_SCHEMA: WorksheetSchemaDefinition = {
+  id: "runConfiguration", sheetName: "Run Configuration",
+  fields: [
+    field("runId", "Run ID"), field("transport", "Transport"), field("sessionMode", "Session Mode"),
+    field("sessionResetAttempts", "Session Reset Attempts"), field("restartedFromRunId", "Restarted From Run ID", false),
+  ],
+};
+export const WORKBOOK_SCHEMAS = [KB_SCHEMA, NEGATIVE_SCHEMA, TRANSCRIPT_SCHEMA, EVIDENCE_RUN_SCHEMA, EVIDENCE_FILE_SCHEMA, RETEST_HISTORY_SCHEMA, RETEST_METADATA_SCHEMA, RUN_CONFIGURATION_SCHEMA];
 for (const schema of WORKBOOK_SCHEMAS.filter((schema) => !schema.interactive)) {
   schema.fields = schema.fields.map((field) => ({ ...field, writable: true }));
 }
@@ -254,10 +263,14 @@ export function ensureOwnedWorksheet(workbook: Workbook, definition: WorksheetSc
 }
 
 export function ensureEvidenceField(worksheet: Worksheet, name: "evidence" | "evidenceUrl" | "evidenceStatus"): boolean {
+  return ensureOptionalSchemaField(worksheet, name);
+}
+
+export function ensureOptionalSchemaField(worksheet: Worksheet, name: WorkbookField): boolean {
   const mapping = getWorksheetSchema(worksheet);
   if (mapping.fields[name]) return false;
   const definition = mapping.definition.fields.find((item) => item.field === name);
-  if (!definition) throw new Error(`Unsupported evidence extension in ${worksheet.name}`);
+  if (!definition || definition.required) throw new Error(`Unsupported optional schema extension in ${worksheet.name}`);
   let lastColumn = 0;
   worksheet.eachRow((row) => row.eachCell((cell, column) => {
     if (cell.value !== null && cell.value !== undefined) lastColumn = Math.max(lastColumn, column);

@@ -1,4 +1,6 @@
 import type { Workbook, Cell, Worksheet } from "exceljs";
+import type { RunExecutionContext } from "../session-mode";
+import { runExecutionContext } from "./run-configuration";
 import { readEvidenceHyperlink, writeEvidenceHyperlink } from "./evidence-workbook";
 import { PGN_TEST_STATUSES, type PgnTestStatus } from "./pgn-test-status";
 import { TRANSCRIPT_SHEET_NAME, type ExecutedTurn, type PgnTestScenario } from "./pgn-types";
@@ -10,7 +12,7 @@ import {
 export const RETEST_HISTORY_SHEET_NAME = "Retest History";
 export const RETEST_METADATA_SHEET_NAME = "Retest Metadata";
 export type RetestRunState = "IN_PROGRESS" | "COMPLETE";
-export interface RetestRunMetadata {
+export interface RetestRunMetadata extends Partial<RunExecutionContext> {
   runId: string; startedAt: Date; state: RetestRunState; selectedIds: string[];
   finishedIds: string[]; updatedAt: Date; folderId?: string; folderUrl?: string;
 }
@@ -48,6 +50,7 @@ export function getRetestRunMetadata(workbook: Workbook, runId: string): RetestR
     const state = cell("state").text;
     if (state !== "IN_PROGRESS" && state !== "COMPLETE") throw new Error(`Retest Run ${runId} has invalid state "${state}"`);
     return {
+      ...runExecutionContext(workbook, runId),
       runId, startedAt: readDate(cell("startedAt"), "Started At"), state,
       selectedIds: parseIdList(cell("selectedIds").text), finishedIds: parseIdList(cell("finishedIds").text),
       updatedAt: readDate(cell("updatedAt"), "Last Updated"),
