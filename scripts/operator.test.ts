@@ -20,6 +20,7 @@ import {
   formatDiagnosticReport,
   formatSetupChecklist,
   formatSetupInspection,
+  type DiagnosticDependencies,
   type DiagnosticReport,
 } from "../src/operator/diagnostics";
 import {
@@ -44,6 +45,8 @@ import {
 import {
   CONTINUOUS_RECOVERY_WARNING,
   CONTINUOUS_SESSION_WARNING,
+  continuousSessionWarning,
+  type ExecutionTransport,
   type SessionMode,
 } from "../src/session-mode";
 
@@ -276,14 +279,15 @@ function stubActions(
   };
 }
 
-function recoveryFixture(isDemo = false, sessionMode?: SessionMode): {
+function recoveryFixture(isDemo = false, sessionMode?: SessionMode, transport?: ExecutionTransport): {
   discovery: RecoveryDiscovery;
   validation: RecoveryValidation;
 } {
   const state: RecoveryRunState = {
     schemaVersion: RECOVERY_SCHEMA_VERSION,
     ...(isDemo ? { isDemo: true as const } : {}),
-    ...(sessionMode ? { sessionMode, transport: "whatsapp" as const } : {}),
+    ...(sessionMode ? { sessionMode } : {}),
+    ...(sessionMode || transport ? { transport: transport ?? "whatsapp" } : {}),
     runId: "RECOVERY-OPERATOR-001",
     mode: "full",
     status: "INTERRUPTED",
@@ -341,7 +345,8 @@ function recoveryFixture(isDemo = false, sessionMode?: SessionMode): {
   const manifest: RecoveryRunManifest = {
     schemaVersion: RECOVERY_SCHEMA_VERSION,
     ...(isDemo ? { isDemo: true as const } : {}),
-    ...(sessionMode ? { sessionMode, transport: "whatsapp" as const } : {}),
+    ...(sessionMode ? { sessionMode } : {}),
+    ...(sessionMode || transport ? { transport: transport ?? "whatsapp" } : {}),
     runId: state.runId,
     sourceWorkbookHash: state.sourceWorkbookHash,
     createdAt: state.startedAt,
@@ -415,6 +420,49 @@ function stubRecoveryActions(
     abandonRecovery: mutate("abandon"),
     ...overrides,
   });
+}
+
+const REST_ENVIRONMENT = {
+  LIVEPERSON_REST_ENABLED: "true",
+  LIVEPERSON_ACCOUNT_ID: "123456",
+  LIVEPERSON_CLIENT_ID: "mock-rest-client",
+  LIVEPERSON_CLIENT_SECRET: "mock-rest-secret-never-log",
+  LIVEPERSON_SKILL_ID: "42",
+  LIVEPERSON_SENTINEL_DOMAIN: "sentinel.example.invalid",
+  LIVEPERSON_IDP_DOMAIN: "idp.example.invalid",
+  LIVEPERSON_ASYNC_MESSAGING_DOMAIN: "async.example.invalid",
+  LIVEPERSON_MESSAGING_REST_DOMAIN: "messaging.example.invalid",
+};
+
+function restSetupReport(): DiagnosticReport {
+  const report = diagnosticReport();
+  report.checks.push({ id: "liveperson-rest", label: "LivePerson REST", status: "info", detail: "fixture; authentication not checked" });
+  return report;
+}
+
+function restDiagnosticDependencies(projectRoot: string): DiagnosticDependencies {
+  return {
+    projectRoot,
+    transport: "rest",
+    platform: "linux",
+    environment: { ...REST_ENVIRONMENT },
+    npmVersion: async () => "11.0.0",
+    packageVersion: async (name) => {
+      assert(!["playwright", "googleapis", "sharp"].includes(name), `REST must not probe ${name}`);
+      return "1.0.0";
+    },
+    pathExists: async (filePath) => {
+      assert.doesNotMatch(filePath, /chromium|whatsapp-profile/i);
+      return true;
+    },
+    chromiumExecutablePath: async () => assert.fail("REST must not inspect Chromium"),
+    hasCommand: async () => assert.fail("REST must not probe Xvfb"),
+    validateDrive: async () => assert.fail("REST must not validate Drive"),
+    inspectDiscord: async () => assert.fail("Discord inspection must be explicit"),
+    validateRest: async () => assert.fail("REST authentication must be explicit"),
+    inspectWorkbookSchema: async () => ({ ready: true, detail: "fixture schema" }),
+    inspectRecovery: async () => ({ kind: "none", lock: { status: "unlocked" } }),
+  };
 }
 
 test("browser runtime is direct on Windows, macOS, displayed Linux, and headless Linux", () => {
@@ -555,6 +603,111 @@ test("first-time setup writes only prompted local configuration", async (context
   assert.equal(ui.confirmPrompts[0].active, "Yes");
   assert.equal(ui.confirmPrompts[0].inactive, "No, keep current settings");
 });
+
+test("REST setup opts in with masked credentials and no implicit authentication", async (context) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-rest-setup-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const ui = new ScriptedUi([
+    true, "skip", false, false, false, true,
+    "123456", REST_ENVIRONMENT.LIVEPERSON_CLIENT_ID,
+    REST_ENVIRONMENT.LIVEPERSON_CLIENT_SECRET, "42", "", "", "", "", false, "exit",
+  ]);
+  const diagnostics: boolean[] = [];
+  const result = await runSetupWizard(ui, {
+    projectRoot, environment: {},
+    diagnose: async (access) => { diagnostics.push(access); return restSetupReport(); },
+    validateRest: async () => assert.fail("Declined REST authentication must not run"),
+  });
+  assert.equal(result.environmentUpdated, true);
+  assert.deepEqual(diagnostics, [false, false, true]);
+  const written = await readFile(path.join(projectRoot, ".env"), "utf8");
+  assert.match(written, /LIVEPERSON_REST_ENABLED=true/);
+  assert.match(written, /LIVEPERSON_ACCOUNT_ID=123456/);
+  assert.match(written, /LIVEPERSON_SKILL_ID=42/);
+  assert.match(written, /LIVEPERSON_MESSAGING_REST_DOMAIN=\n/);
+  assert(written.includes(REST_ENVIRONMENT.LIVEPERSON_CLIENT_SECRET));
+  assert.equal(ui.secretPrompts.length, 2);
+  assert(ui.secretPrompts.every((prompt) => prompt.mask === "*" && prompt.clearOnError));
+  assert.equal(ui.events.join("\n").includes(REST_ENVIRONMENT.LIVEPERSON_CLIENT_SECRET), false);
+  assert.equal(ui.events.join("\n").includes(REST_ENVIRONMENT.LIVEPERSON_CLIENT_ID), false);
+  assert.doesNotMatch(written, /(?:^|\n)(?:SESSION_MODE|EXECUTION_TRANSPORT|PGN_TRANSPORT)=/);
+});
+
+test("REST setup secret cancellation preserves the entire existing environment file", async (context) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-rest-cancel-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const source = "# unchanged\nUNRELATED_SECRET=fixture-existing\nLIVEPERSON_REST_ENABLED=false\n";
+  await writeFile(path.join(projectRoot, ".env"), source);
+  const ui = new ScriptedUi([true, "skip", false, false, false, true, "123456", "mock-client", undefined]);
+  const result = await runSetupWizard(ui, {
+    projectRoot, environment: {}, diagnose: async () => restSetupReport(),
+    validateRest: async () => assert.fail("Cancellation must not authenticate"),
+  });
+  assert.equal(result.cancelled, true);
+  assert.equal(result.environmentUpdated, false);
+  assert.equal(await readFile(path.join(projectRoot, ".env"), "utf8"), source);
+  assert.equal(ui.secretPrompts.at(-1)?.message, "LIVEPERSON_CLIENT_SECRET");
+  assert.doesNotMatch(ui.events.join("\n"), /fixture-existing|mock-client/);
+});
+
+test("REST setup preserves process-managed settings and never copies their secrets into .env", async (context) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-rest-managed-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const original = "LIVEPERSON_CLIENT_SECRET=existing-file-secret\nUNRELATED=keep\n";
+  await writeFile(path.join(projectRoot, ".env"), original);
+  const environment = { ...REST_ENVIRONMENT };
+  const ui = new ScriptedUi([true, "skip", false, false, false, false, "exit"]);
+  await runSetupWizard(ui, {
+    projectRoot, environment, diagnose: async () => restSetupReport(),
+    validateRest: async () => assert.fail("Declined REST authentication must not run"),
+  });
+  const written = await readFile(path.join(projectRoot, ".env"), "utf8");
+  assert(written.startsWith(original));
+  assert.doesNotMatch(written, /LIVEPERSON_REST_ENABLED|mock-rest/);
+  for (const name of Object.keys(REST_ENVIRONMENT) as Array<keyof typeof REST_ENVIRONMENT>) {
+    assert.equal(environment[name], REST_ENVIRONMENT[name]);
+  }
+  assert.equal(ui.secretPrompts.length, 0);
+  assert.match(ui.events.join("\n"), /managed by the process environment/);
+  assert.doesNotMatch(ui.events.join("\n"), /mock-rest|existing-file-secret/);
+});
+
+test("REST setup keeps an existing local secret without displaying or replacing it", async (context) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-rest-keep-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  await writeFile(path.join(projectRoot, ".env"), "LIVEPERSON_CLIENT_SECRET=existing-file-secret\n");
+  const { LIVEPERSON_CLIENT_SECRET: _secret, ...environment } = REST_ENVIRONMENT;
+  const ui = new ScriptedUi([true, "skip", false, false, false, true, false, "exit"]);
+  await runSetupWizard(ui, { projectRoot, environment, diagnose: async () => restSetupReport() });
+  assert.match(await readFile(path.join(projectRoot, ".env"), "utf8"), /LIVEPERSON_CLIENT_SECRET=existing-file-secret/);
+  assert.equal(ui.secretPrompts.length, 0);
+  assert.doesNotMatch(ui.events.join("\n"), /existing-file-secret/);
+});
+
+for (const outcome of ["decline", "success", "failure", "cancel"] as const) {
+  test(`REST setup ${outcome} authentication is explicit and safely mocked`, async (context) => {
+    const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-rest-auth-"));
+    context.after(() => rm(projectRoot, { recursive: true, force: true }));
+    const ui = new ScriptedUi([false, outcome === "cancel" ? undefined : outcome !== "decline", ...(outcome === "cancel" ? [] : ["exit"])]);
+    let calls = 0;
+    const result = await runSetupWizard(ui, {
+      projectRoot, environment: { ...REST_ENVIRONMENT }, diagnose: async () => restSetupReport(),
+      validateRest: async (config) => {
+        calls += 1;
+        assert.equal(config.livePersonRest?.clientSecret, REST_ENVIRONMENT.LIVEPERSON_CLIENT_SECRET);
+        if (outcome === "failure") throw new Error(`Rejected ${config.livePersonRest?.clientSecret}`);
+      },
+    });
+    assert.equal(calls, ["success", "failure"].includes(outcome) ? 1 : 0);
+    assert.equal(result.cancelled, outcome === "cancel");
+    const prompt = ui.confirmPrompts.find((candidate) => candidate.message.startsWith("Validate LivePerson REST domains"));
+    assert.equal(prompt?.initialValue, false);
+    assert.match(prompt?.message ?? "", /real, harmless auth\/domain requests only; no conversations/);
+    assert.equal(ui.events.join("\n").includes(REST_ENVIRONMENT.LIVEPERSON_CLIENT_SECRET), false);
+    if (outcome === "failure") assert.match(ui.events.join("\n"), /REST validation did not pass/);
+    await assert.rejects(readFile(path.join(projectRoot, ".env"), "utf8"), /ENOENT/);
+  });
+}
 
 test("existing setup preserves comments and unrelated secret fields", async (context) => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-existing-"));
@@ -964,7 +1117,78 @@ test("diagnostics report missing Chromium, env, workbook output, and WhatsApp se
   assert.equal(byId.get("executed-workbook")?.status, "warn");
   assert.equal(byId.get("whatsapp-profile")?.status, "error");
   assert.equal(byId.get("browser-runtime")?.status, "error");
+  assert.equal(byId.get("liveperson-rest")?.status, "info");
+  assert.match(byId.get("liveperson-rest")?.detail ?? "", /disabled/);
 });
+
+test("REST-only diagnostics check common readiness without browser, profile, Drive, or implicit auth probes", async (context) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-rest-doctor-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  let schemas = 0;
+  const report = await collectDiagnostics({
+    ...restDiagnosticDependencies(projectRoot),
+    environment: {
+      ...REST_ENVIRONMENT,
+      GOOGLE_DRIVE_EVIDENCE_ENABLED: "true",
+      GOOGLE_DRIVE_EVIDENCE_PARENT_FOLDER: "abcdefghijklmno",
+      GOOGLE_SERVICE_ACCOUNT_FILE: ".secrets/must-not-read.json",
+    },
+    checkDriveAccess: true,
+    inspectWorkbookSchema: async () => { schemas += 1; return { ready: true, detail: "mocked common schema" }; },
+  });
+  assert.equal(report.ready, true);
+  assert.equal(report.transport, "rest");
+  assert.equal(schemas, 1);
+  const checks = new Map(report.checks.map((check) => [check.id, check]));
+  for (const id of ["playwright", "chromium", "whatsapp-profile", "whatsapp-target", "browser-runtime", "drive"]) {
+    assert.equal(checks.get(id)?.status, "info", id);
+    assert.match(checks.get(id)?.detail ?? "", /not required for REST/, id);
+  }
+  assert.equal(checks.get("configuration")?.status, "ok");
+  assert.equal(checks.get("liveperson-rest")?.status, "ok");
+  assert.match(checks.get("liveperson-rest")?.detail ?? "", /authentication not checked; no requests made/);
+  for (const format of [formatDiagnosticReport, formatSetupInspection, formatSetupChecklist]) {
+    const output = format(report);
+    assert.doesNotMatch(output, /Chromium missing|WhatsApp profile missing|Drive access not verified|mock-rest|must-not-read/);
+    assert.match(output, /LivePerson REST:/);
+  }
+});
+
+for (const blocker of ["disabled", "secret", "schema", "configuration"] as const) {
+  test(`REST-only readiness is blocked by ${blocker} without authentication`, async (context) => {
+    const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-rest-blocked-"));
+    context.after(() => rm(projectRoot, { recursive: true, force: true }));
+    const dependencies = restDiagnosticDependencies(projectRoot);
+    if (blocker === "disabled") dependencies.environment!.LIVEPERSON_REST_ENABLED = "false";
+    if (blocker === "secret") dependencies.environment!.LIVEPERSON_CLIENT_SECRET = "";
+    if (blocker === "configuration") dependencies.environment!.REST_RESPONSE_TIMEOUT_MS = "invalid";
+    if (blocker === "schema") dependencies.inspectWorkbookSchema = async () => ({ ready: false, detail: "missing User Input" });
+    const report = await collectDiagnostics(dependencies);
+    assert.equal(report.ready, false);
+    assert(report.checks.some((check) => check.status === "error" && ["configuration", "liveperson-rest", "workbook-schema"].includes(check.id)));
+  });
+}
+
+for (const fail of [false, true]) {
+  test(`explicit REST diagnostic authentication ${fail ? "failure is redacted" : "success reports domains and auth only"}`, async (context) => {
+    const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-rest-check-"));
+    context.after(() => rm(projectRoot, { recursive: true, force: true }));
+    let calls = 0;
+    const report = await collectDiagnostics({
+      ...restDiagnosticDependencies(projectRoot), checkRestAccess: true,
+      validateRest: async (config) => {
+        calls += 1;
+        if (fail) throw new Error(`Rejected ${config.livePersonRest?.clientSecret} ${config.livePersonRest?.clientId}`);
+      },
+    });
+    assert.equal(calls, 1);
+    assert.equal(report.ready, !fail);
+    const rest = report.checks.find((check) => check.id === "liveperson-rest");
+    assert.equal(rest?.status, fail ? "error" : "ok");
+    assert.doesNotMatch(formatDiagnosticReport(report), /mock-rest/);
+    if (!fail) assert.match(rest?.detail ?? "", /domains, app JWT, and synthetic consumer JWS validated; no conversations or testcase messages/);
+  });
+}
 
 test("diagnostics identify missing Drive credentials without making a Drive call", async (context) => {
   const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-drive-config-"));
@@ -1130,6 +1354,7 @@ for (const kind of ["recoverable", "running"] as const) {
       projectRoot,
       platform: "win32",
       environment: {
+        ...REST_ENVIRONMENT,
         PGN_WHATSAPP_PHONE: "628123456789",
         GOOGLE_DRIVE_EVIDENCE_ENABLED: "true",
         GOOGLE_DRIVE_EVIDENCE_PARENT_FOLDER: "abcdefghijklmno",
@@ -1152,6 +1377,8 @@ for (const kind of ["recoverable", "running"] as const) {
       }),
       inspectWorkbookSchema: async () => ({ ready: true, detail: "fixture mapping" }),
       checkDriveAccess: true,
+      checkRestAccess: true,
+      validateRest: async () => { externalCalls.push("rest"); },
       validateDrive: async () => {
         externalCalls.push("drive");
       },
@@ -1172,7 +1399,7 @@ for (const kind of ["recoverable", "running"] as const) {
     assert.equal(report.ready, true);
     const byId = new Map(report.checks.map((check) => [check.id, check]));
     assert.match(byId.get("recovery")?.detail ?? "", /DEMO Run RECOVERY-OPERATOR-001/);
-    for (const id of ["drive", "discord"]) {
+    for (const id of ["drive", "discord", "liveperson-rest"]) {
       assert.equal(byId.get(id)?.status, "info");
       assert.match(byId.get(id)?.detail ?? "", /DEMO: skipped/);
     }
@@ -1792,6 +2019,155 @@ test("full execution, evidence migration, and auth recreation require confirmati
   );
   assert.deepEqual([fullRuns, migrations, recreations], [0, 0, 0]);
 });
+
+for (const sessionMode of ["isolated", "continuous"] as const) {
+  for (const selection of ["full", "ids", "sheet", "retest"] as const) {
+    test(`REST ${selection} routes ${sessionMode} through shared actions with no implicit rerun`, async () => {
+      const filters = selection === "ids" ? ["--test", "TC-001,TC-002", "--rerun"]
+        : selection === "sheet" ? ["--sheet", "negative"] : [];
+      const expected = ["--transport=rest", ...filters, ...(sessionMode === "continuous" ? ["--session=continuous"] : [])];
+      const received: Array<{ action: string; args: string[] }> = [];
+      const ui = new ScriptedUi([
+        "run", "rest", sessionMode, selection,
+        ...(selection === "ids" ? ["TC-001, TC-002", true] : selection === "sheet" ? ["negative"] : selection === "retest" ? ["ready"] : []),
+        true, "back", "exit",
+      ]);
+      await runControlPanel(ui, stubActions({
+        prepareFresh: async () => assert.fail("REST full must not implicitly prepare a fresh workbook"),
+        runPgn: async (args) => { received.push({ action: "full", args }); },
+        validateRetest: async (args) => {
+          received.push({ action: "validate-retest", args: [...args] });
+          return { selectedCount: 2, shouldExecute: true, readyToExecute: true, finalCleanupOnly: false };
+        },
+        runRetest: async (args) => { received.push({ action: "retest", args }); },
+      }));
+      assert.deepEqual(received, selection === "retest"
+        ? [{ action: "validate-retest", args: expected }, { action: "retest", args: expected }]
+        : [{ action: "full", args: expected }]);
+      const runMenu = ui.selectPrompts.find((prompt) => prompt.message === "Run tests");
+      assert(runMenu?.options.some((option) => option.label === "REST Bulk Test" && option.value === "rest"));
+      for (const value of ["validate", "remaining", "sheet", "ids", "fresh", "back"]) {
+        assert(runMenu?.options.some((option) => option.value === value), `Existing WhatsApp choice ${value}`);
+      }
+      const selector = ui.selectPrompts.find((prompt) => prompt.message === "Session Mode for this REST run");
+      assert.equal(selector?.initialValue, "isolated");
+      assert.match(selector?.options[0]?.hint ?? "", /Fresh conversation per scenario/);
+      assert.match(selector?.options[1]?.hint ?? "", /One initial conversation/);
+      assert.deepEqual(ui.selectPrompts.find((prompt) => prompt.message === "REST Bulk Test")?.options.map((option) => option.value), ["full", "ids", "sheet", "retest", "validate", "back"]);
+      const confirmation = ui.confirmPrompts.at(-1);
+      assert.equal(confirmation?.initialValue, false);
+      assert.match(confirmation?.message ?? "", /real testcase messages through LivePerson REST/);
+      assert.match(confirmation?.message ?? "", /No WhatsApp, debug reset, screenshots, or Drive uploads/);
+      assert.doesNotMatch(confirmation?.message ?? "", /will open WhatsApp|send reset|upload evidence/);
+      assert.equal(ui.events.includes(`warn:${continuousSessionWarning("rest")}`), sessionMode === "continuous");
+      assert.equal(ui.events.includes(`warn:${CONTINUOUS_SESSION_WARNING}`), false);
+    });
+  }
+}
+
+test("REST transport and continuous session do not become defaults for later runs", async () => {
+  const received: string[][] = [];
+  const ui = new ScriptedUi([
+    "run", "rest", "continuous", "full", true,
+    "rest", "isolated", "full", true,
+    "remaining", "isolated", true, "back", "exit",
+  ]);
+  await runControlPanel(ui, stubActions({ runPgn: async (args) => { received.push(args); } }));
+  assert.deepEqual(received, [["--transport=rest", "--session=continuous"], ["--transport=rest"], []]);
+  assert(ui.selectPrompts.filter((prompt) => prompt.message.startsWith("Session Mode")).every((prompt) => prompt.initialValue === "isolated"));
+});
+
+test("REST validation requires explicit confirmation and never runs testcases", async () => {
+  const received: string[][] = [];
+  const ui = new ScriptedUi([
+    "run", "rest", "continuous", "validate", false, "validate", true, "back", "back", "exit",
+  ]);
+  await runControlPanel(ui, stubActions({
+    validateRest: async (args) => { received.push(args); return { ready: true, selectedCount: 7 }; },
+    runPgn: async () => assert.fail("Validation must not execute"),
+    runRetest: async () => assert.fail("Validation must not retest"),
+    validatePgn: async () => assert.fail("REST validation uses its own readiness action"),
+  }));
+  assert.deepEqual(received, [["--transport=rest", "--session=continuous"]]);
+  assert(ui.confirmPrompts.every((prompt) => prompt.initialValue === false));
+  assert.match(ui.confirmPrompts[0]?.message ?? "", /real LivePerson domain and authentication requests/);
+  assert.match(ui.events.join("\n"), /7 scenario\(s\) selected; no testcase was executed/);
+});
+
+test("REST validation without an adapter is disabled and never falls back to execution", async () => {
+  const ui = new ScriptedUi(["run", "rest", "isolated", "validate", "back", "back", "exit"]);
+  await runControlPanel(ui, stubActions({ runPgn: async () => assert.fail("Unavailable validation must not run") }));
+  assert.equal(ui.selectPrompts.find((prompt) => prompt.message === "REST Bulk Test")?.options.find((option) => option.value === "validate")?.disabled, true);
+  assert.equal(ui.confirmPrompts.length, 0);
+  assert.match(ui.events.join("\n"), /REST validation is unavailable/);
+});
+
+test("REST back, selector cancellation, and declined execution never invoke a runner", async () => {
+  for (const responses of [
+    ["run", "rest", undefined],
+    ["run", "rest", "isolated", "back", "back", "exit"],
+    ["run", "rest", "isolated", "retest", "back", "back", "back", "exit"],
+    ["run", "rest", "continuous", "full", false, "back", "back", "exit"],
+    ["run", "rest", "continuous", "full", undefined],
+  ]) {
+    await runControlPanel(new ScriptedUi(responses), stubActions({
+      runPgn: async () => assert.fail("Cancelled execution must not run"),
+      runRetest: async () => assert.fail("Cancelled execution must not retest"),
+    }));
+  }
+});
+
+test("REST retest review and selected IDs preserve transport and session arguments", async () => {
+  const received: string[][] = [];
+  const ui = new ScriptedUi(["run", "rest", "continuous", "retest", "review", "ids", "TC-002", true, "back", "exit"]);
+  await runControlPanel(ui, stubActions({
+    validateRetest: async (args) => {
+      received.push(args);
+      return { selectedCount: 1, shouldExecute: true, readyToExecute: true, finalCleanupOnly: false };
+    },
+    runRetest: async (args) => { received.push(args); },
+  }));
+  assert.deepEqual(received, [
+    ["--transport=rest", "--session=continuous"],
+    ["--transport=rest", "--test", "TC-002", "--session=continuous"],
+    ["--transport=rest", "--test", "TC-002", "--session=continuous"],
+  ]);
+  assert.equal(ui.selectPrompts.find((prompt) => prompt.message === "REST retest fixed cases")?.options.some((option) => option.value === "resume"), false);
+});
+
+for (const mode of ["full", "retest"] as const) {
+  test(`isolated REST ${mode} recovery confirms a fresh conversation from Turn 1 without Drive promises`, async () => {
+    const recovery = recoveryFixture(false, "isolated", "rest");
+    recovery.validation.state.mode = mode;
+    recovery.validation.mode = mode;
+    const calls: string[] = [];
+    const ui = new ScriptedUi(["resume", true, "exit"]);
+    await runControlPanel(ui, stubRecoveryActions(recovery, calls));
+    assert.deepEqual(calls, ["validate:RECOVERY-OPERATOR-001", "resume:RECOVERY-OPERATOR-001"]);
+    const confirmation = ui.confirmPrompts.at(-1)?.message ?? "";
+    assert.match(confirmation, /fresh conversation per scenario.*Turn 1/);
+    assert.match(confirmation, /No WhatsApp, debug reset, screenshots, or Drive uploads/);
+    assert.doesNotMatch(confirmation, /will open WhatsApp|reuse existing Drive artifacts/);
+  });
+
+  test(`continuous REST ${mode} recovery allows only full restart or abandonment`, async () => {
+    const recovery = recoveryFixture(false, "continuous", "rest");
+    recovery.validation.state.mode = mode;
+    recovery.validation.mode = mode;
+    const calls: string[] = [];
+    const ui = new ScriptedUi(["resume", "skip", "repair", "restart", true, "abandon", true, "exit"]);
+    await runControlPanel(ui, stubRecoveryActions(recovery, calls));
+    assert.deepEqual(calls, ["validate:RECOVERY-OPERATOR-001", "restart:RECOVERY-OPERATOR-001:false", "abandon:RECOVERY-OPERATOR-001"]);
+    const confirmation = ui.confirmPrompts[0]?.message ?? "";
+    assert.match(confirmation, /ALL 2 originally selected scenarios/);
+    assert.match(confirmation, /NEW Run ID and one new conversation/);
+    assert.match(confirmation, /ABANDONED only after the new checkpoint is saved/);
+    assert.doesNotMatch(confirmation, /opens WhatsApp|new evidence folder/);
+    assert(ui.events.includes(`warn:${continuousSessionWarning("rest")}`));
+    assert.equal(ui.events.includes(`warn:${CONTINUOUS_SESSION_WARNING}`), false);
+    assert(ui.confirmPrompts.every((prompt) => prompt.initialValue === false));
+  });
+}
 
 for (const sessionMode of ["isolated", "continuous"] as const) {
   for (const selection of ["remaining", "sheet", "ids", "setup"] as const) {

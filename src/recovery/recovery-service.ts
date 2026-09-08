@@ -32,7 +32,10 @@ import { validateDiscordWebhookUrl } from "../notifications/discord";
 import { retestDriveFolderName } from "../retest/retest-run";
 import { recoveryDemoConfig } from "./demo-safety";
 import { getRunConfiguration } from "../excel/run-configuration";
-import { CONTINUOUS_RECOVERY_WARNING, readSessionMode, readExecutionTransport, sessionModeLabel } from "../session-mode";
+import { CONTINUOUS_RECOVERY_WARNING, readSessionMode, readExecutionTransport, sessionModeLabel, transportLabel } from "../session-mode";
+import { assertRestConfig } from "../rest/config";
+import { LivePersonClient } from "../rest/liveperson-client";
+import { safeRestError } from "../rest/errors";
 import { fieldCell, optionalFieldCell, EVIDENCE_FILE_SCHEMA, getWorksheetSchema, normalizeWorkbookHeader } from "../excel/workbook-schema";
 import {
   acquireRunProcessLock,
@@ -93,6 +96,8 @@ export interface RecoveryValidation {
 }
 
 export interface RecoveryValidationDependencies {
+  checkRestAccess?: boolean;
+  restClient?: Pick<LivePersonClient, "validate">;
   checkDriveAccess?: boolean;
   drivePublisher?: EvidenceDrivePublisher;
   profileEntries?: (profilePath: string) => Promise<string[]>;
@@ -630,6 +635,22 @@ export async function validateRecoveryRun(
         detail: "suppressed in demo mode; no notifications sent",
       },
     );
+  } else if (readExecutionTransport(state.transport) === "rest") {
+    try {
+      assertRestConfig(config.livePersonRest);
+      if (!state.restTarget || state.restTarget.accountId !== config.livePersonRest.accountId || state.restTarget.skillId !== config.livePersonRest.skillId) {
+        throw new Error("LivePerson account/skill differs from the recovery target snapshot");
+      }
+      if (dependencies.checkRestAccess !== false) await (dependencies.restClient ?? new LivePersonClient(config.livePersonRest)).validate();
+      checks.push({ id: "rest", label: "LivePerson REST", status: "ok", detail: dependencies.checkRestAccess === false ? "configuration valid; authentication not checked" : "domain and consumer/application authentication ready; no testcase sent" });
+    } catch (error) {
+      checks.push({ id: "rest", label: "LivePerson REST", status: "error", detail: safeRestError(error, config.livePersonRest?.clientSecret) });
+    }
+    checks.push(
+      { id: "whatsapp-profile", label: "WhatsApp", status: "info", detail: "not required for REST" },
+      { id: "drive", label: "Google Drive", status: "info", detail: "not applicable for REST; no evidence folder or upload" },
+      { id: "discord", label: "Discord", status: "info", detail: "optional notifications; no notification sent by validation" },
+    );
   } else {
     const profileEntries = dependencies.profileEntries ?? readdir;
     try {
@@ -786,7 +807,7 @@ export function formatRecoveryDiscovery(discovery: RecoveryDiscovery): string {
     `Run ID: ${state.runId}`,
     ...(state.isDemo ? ["Recovery type: DEMO (local UI/testing only; live execution disabled)"] : []),
     `Mode: ${state.mode}`,
-    "Transport: WhatsApp",
+    `Transport: ${transportLabel(readExecutionTransport(state.transport))}`,
     `Session Mode: ${sessionModeLabel(readSessionMode(state.sessionMode))}`,
     ...(readSessionMode(state.sessionMode) === "continuous" ? [CONTINUOUS_RECOVERY_WARNING] : []),
     `State: ${discovery.kind === "running" ? "RUNNING" : state.status}`,
@@ -816,7 +837,7 @@ export function formatRecoveryValidation(validation: RecoveryValidation): string
     `Run ID: ${validation.runId}`,
     ...(validation.state.isDemo ? ["Recovery type: DEMO"] : []),
     `Mode: ${validation.mode}`,
-    "Transport: WhatsApp",
+    `Transport: ${transportLabel(readExecutionTransport(validation.state.transport))}`,
     `Session Mode: ${sessionModeLabel(readSessionMode(validation.state.sessionMode))}`,
     ...validation.checks.map(
       (check) => `${labels[check.status].padEnd(5)} ${check.label}: ${check.detail}`,
@@ -833,7 +854,7 @@ export function formatRecoveryValidation(validation: RecoveryValidation): string
   }
   lines.push(`Resume readiness: ${validation.ready ? "READY" : "BLOCKED"}${validation.state.isDemo ? " (preview only)" : ""}`);
   if (readSessionMode(validation.state.sessionMode) === "continuous") {
-    lines.push(`Full restart readiness: ${validation.restartReady ? "READY" : "BLOCKED"}; all ${validation.state.totalScenarios} original scenarios, new Run ID and clean initial reset`);
+    lines.push(`Full restart readiness: ${validation.restartReady ? "READY" : "BLOCKED"}; all ${validation.state.totalScenarios} original scenarios, new Run ID and ${readExecutionTransport(validation.state.transport) === "rest" ? "new REST conversation" : "clean initial reset"}`);
   }
   if (validation.state.isDemo) {
     lines.push("DEMO MODE: Real WhatsApp execution is disabled. No testcase messages were sent.");

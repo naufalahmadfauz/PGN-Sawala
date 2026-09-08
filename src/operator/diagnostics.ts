@@ -20,6 +20,10 @@ import {
   type RecoveryDiscovery,
 } from "../recovery/run-state";
 import { inspectWorkbookMappings } from "./workbook-configuration";
+import { assertRestConfig } from "../rest/config";
+import { safeRestError } from "../rest/errors";
+import { LivePersonClient } from "../rest/liveperson-client";
+import type { ExecutionTransport } from "../session-mode";
 
 export type DiagnosticStatus = "ok" | "warn" | "error" | "info";
 
@@ -31,6 +35,7 @@ export interface DiagnosticCheck {
 }
 
 export interface DiagnosticReport {
+  transport?: ExecutionTransport;
   checks: DiagnosticCheck[];
   browserRuntime: BrowserRuntimePlan;
   chromiumInstalled: boolean;
@@ -40,6 +45,7 @@ export interface DiagnosticReport {
 }
 
 export interface DiagnosticDependencies {
+  transport?: ExecutionTransport;
   projectRoot?: string;
   platform?: NodeJS.Platform;
   environment?: NodeJS.ProcessEnv;
@@ -53,6 +59,8 @@ export interface DiagnosticDependencies {
   hasCommand?: (command: string, args?: readonly string[]) => Promise<boolean>;
   validateDrive?: (config: AppConfig) => Promise<void>;
   checkDriveAccess?: boolean;
+  validateRest?: (config: AppConfig) => Promise<void>;
+  checkRestAccess?: boolean;
   inspectDiscord?: (config: AppConfig) => Promise<DiscordValidationResult>;
   checkDiscordAccess?: boolean;
   inspectRecovery?: (projectRoot: string) => Promise<RecoveryDiscovery>;
@@ -155,6 +163,8 @@ export async function collectDiagnostics(
   dependencies: DiagnosticDependencies = {},
 ): Promise<DiagnosticReport> {
   const projectRoot = path.resolve(dependencies.projectRoot ?? REPOSITORY_ROOT);
+  const transport = dependencies.transport ?? "whatsapp";
+  const restOnly = transport === "rest";
   const platform = dependencies.platform ?? process.platform;
   const environment = { ...(dependencies.environment ?? process.env) };
   const pathExists = dependencies.pathExists ?? defaultPathExists;
@@ -188,10 +198,9 @@ export async function collectDiagnostics(
     "@clack/prompts",
     "dotenv",
     "exceljs",
-    "googleapis",
+    ...(!restOnly ? ["googleapis"] : []),
     "jszip",
-    "playwright",
-    "sharp",
+    ...(!restOnly ? ["playwright", "sharp"] : []),
     "tsx",
     "typescript",
   ];
@@ -218,11 +227,11 @@ export async function collectDiagnostics(
   add(
     "playwright",
     "Playwright",
-    playwrightVersion ? "ok" : "error",
-    playwrightVersion ?? "not installed",
+    restOnly ? "info" : playwrightVersion ? "ok" : "error",
+    restOnly ? "not required for REST; not inspected" : playwrightVersion ?? "not installed",
   );
 
-  const chromiumPath = await (
+  const chromiumPath = restOnly ? undefined : await (
     dependencies.chromiumExecutablePath ?? defaultChromiumExecutablePath
   )();
   const chromiumInstalled = Boolean(
@@ -231,14 +240,14 @@ export async function collectDiagnostics(
   add(
     "chromium",
     "Playwright Chromium",
-    chromiumInstalled ? "ok" : "error",
-    chromiumInstalled ? "installed" : "missing; install Chromium",
+    restOnly ? "info" : chromiumInstalled ? "ok" : "error",
+    restOnly ? "not required for REST; not inspected" : chromiumInstalled ? "installed" : "missing; install Chromium",
   );
 
   let config: AppConfig | undefined;
   let configError: unknown;
   try {
-    config = loadConfig({ repositoryRoot: projectRoot, environment });
+    config = loadConfig({ repositoryRoot: projectRoot, environment, transport });
   } catch (error) {
     configError = error;
   }
@@ -247,7 +256,7 @@ export async function collectDiagnostics(
       "configuration",
       "Configuration",
       "error",
-      safeGoogleCredentialError(configError),
+      safeGoogleCredentialError(new Error(safeRestError(configError, environment.LIVEPERSON_CLIENT_SECRET ?? "", environment.LIVEPERSON_CLIENT_ID ?? ""))),
     );
   } else {
     add("configuration", "Configuration", "ok", "valid");
@@ -358,22 +367,47 @@ export async function collectDiagnostics(
     );
   }
 
+  const restConfig = config?.livePersonRest;
+  if (recoveryIsDemo) {
+    add("liveperson-rest", "LivePerson REST", "info", "DEMO: skipped; credentials and remote access are not inspected");
+  } else if (!config) {
+    add("liveperson-rest", "LivePerson REST", restOnly ? "error" : "warn", "configuration unavailable; domains and authentication not checked");
+  } else if (!restConfig?.enabled) {
+    add("liveperson-rest", "LivePerson REST", restOnly ? "error" : "info", "disabled; opt in with LIVEPERSON_REST_ENABLED=true; no requests made");
+  } else {
+    try {
+      assertRestConfig(restConfig);
+      const domainCount = Object.values(restConfig.domains).filter(Boolean).length;
+      if (dependencies.checkRestAccess === true) {
+        if (dependencies.validateRest) await dependencies.validateRest(config);
+        else await new LivePersonClient(restConfig).validate();
+        add("liveperson-rest", "LivePerson REST", "ok", "configured; domains, app JWT, and synthetic consumer JWS validated; no conversations or testcase messages");
+      } else {
+        add("liveperson-rest", "LivePerson REST", "ok", `configured; ${domainCount}/4 domain overrides, remaining domains discovered during explicit validation or execution; authentication not checked; no requests made`);
+      }
+    } catch (error) {
+      add("liveperson-rest", "LivePerson REST", restOnly ? "error" : "warn", safeRestError(error, restConfig.clientSecret ?? "", restConfig.clientId ?? ""));
+    }
+  }
+
   const profilePath = config?.profileDir ?? path.join(projectRoot, ".whatsapp-profile");
-  const profilePresent = await pathExists(profilePath);
+  const profilePresent = !restOnly && await pathExists(profilePath);
   add(
     "whatsapp-profile",
     "WhatsApp profile",
-    profilePresent ? "ok" : "error",
-    profilePresent ? "present" : "missing; sign in before execution",
+    restOnly ? "info" : profilePresent ? "ok" : "error",
+    restOnly ? "not required for REST; not inspected" : profilePresent ? "present" : "missing; sign in before execution",
   );
   add(
     "whatsapp-target",
     "WhatsApp target",
-    config?.target ? "ok" : "error",
-    config?.target ? `configured by ${config.target.kind}` : "not configured",
+    restOnly ? "info" : config?.target ? "ok" : "error",
+    restOnly ? "not required for REST" : config?.target ? `configured by ${config.target.kind}` : "not configured",
   );
 
-  if (recoveryIsDemo) {
+  if (restOnly) {
+    add("drive", "Google Drive", "info", "not required for REST; credentials and remote access are not inspected");
+  } else if (recoveryIsDemo) {
     add(
       "drive",
       "Google Drive",
@@ -485,7 +519,10 @@ export async function collectDiagnostics(
     }
   }
 
-  const browserRuntime = await detectBrowserRuntime({
+  const browserRuntime: BrowserRuntimePlan = restOnly ? {
+    mode: "direct",
+    reason: "not required for REST; display and Xvfb are not inspected",
+  } : await detectBrowserRuntime({
     platform,
     environment,
     headless: config?.headless ?? false,
@@ -494,11 +531,12 @@ export async function collectDiagnostics(
   add(
     "browser-runtime",
     "Browser runtime",
-    browserRuntime.mode === "unavailable" ? "error" : "ok",
+    restOnly ? "info" : browserRuntime.mode === "unavailable" ? "error" : "ok",
     browserRuntime.reason,
   );
 
   return {
+    transport,
     checks,
     browserRuntime,
     chromiumInstalled,
@@ -539,6 +577,7 @@ function checkById(
 
 function friendlyBrowserRuntime(report: DiagnosticReport): string {
   const runtime = checkById(report, "browser-runtime");
+  if (runtime?.status === "info") return runtime.detail;
   if (runtime?.status === "error") {
     return runtime.detail;
   }
@@ -584,6 +623,7 @@ function successfulCheckLine(
   failure: string,
 ): string {
   if (check?.status === "ok") return `✓ ${success}`;
+  if (check?.status === "info") return `${diagnosticSymbol("info")} ${check.label}: ${check.detail}`;
   if (check?.status === "warn") return `! ${failure}`;
   return `✗ ${failure}`;
 }
@@ -594,6 +634,7 @@ export function formatSetupChecklist(report: DiagnosticReport): string {
   const environment = checkById(report, "env");
   const drive = checkById(report, "drive");
   const discord = checkById(report, "discord");
+  const rest = checkById(report, "liveperson-rest");
   const browserRuntime = checkById(report, "browser-runtime");
   const lines = [
     successfulCheckLine(
@@ -662,7 +703,12 @@ export function formatSetupChecklist(report: DiagnosticReport): string {
   } else {
     lines.push("! Discord notifications need attention");
   }
-  if (browserRuntime?.status === "error") {
+  if (rest) {
+    lines.push(`${diagnosticSymbol(rest.status)} LivePerson REST: ${rest.detail}`);
+  }
+  if (browserRuntime?.status === "info") {
+    lines.push(`${diagnosticSymbol("info")} Browser runtime: ${browserRuntime.detail}`);
+  } else if (browserRuntime?.status === "error") {
     lines.push("✗ Browser runtime unavailable");
   } else if (report.browserRuntime.mode === "xvfb") {
     lines.push(`✓ Browser runtime: ${friendlyBrowserRuntime(report)}`);

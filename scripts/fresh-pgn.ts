@@ -1,5 +1,6 @@
 import path from "node:path";
 import { loadConfig, type AppConfig } from "../src/config";
+import { parseCliOptions } from "../src/pgn-cli";
 import { isEntrypoint, runCliMain } from "../src/cli-entrypoint";
 import { createFreshPgnWorkbook } from "../src/excel/fresh-workbook";
 import { acquireWorkbookLock } from "../src/excel/workbook-lock";
@@ -57,5 +58,5 @@ export async function prepareFreshPgnWorkbook(
 }
 
 if (isEntrypoint(import.meta.url)) {
-  runCliMain(() => prepareFreshPgnWorkbook());
+  runCliMain(() => prepareFreshPgnWorkbook(loadConfig({ transport: parseCliOptions(process.argv.slice(2)).transport })));
 }

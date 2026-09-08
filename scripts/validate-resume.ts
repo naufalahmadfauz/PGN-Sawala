@@ -1,5 +1,7 @@
 import { loadConfig, type AppConfig } from "../src/config";
 import { isEntrypoint, runCliMain } from "../src/cli-entrypoint";
+import { REPOSITORY_ROOT } from "../src/environment";
+import { discoverRecoveryRun, readRecoveryRun } from "../src/recovery/run-state";
 import {
   formatRecoveryValidation,
   validateRecoveryRun,
@@ -18,17 +20,21 @@ export function parseResumeValidationArgs(args: readonly string[]): {
 }
 
 export async function validateResume(
-  config: AppConfig = loadConfig(),
+  config?: AppConfig,
   runId?: string,
   dependencies: RecoveryValidationDependencies = {},
 ): Promise<RecoveryValidation> {
+  if (!config) {
+    const run = runId ? await readRecoveryRun(REPOSITORY_ROOT, runId) : await discoverRecoveryRun(REPOSITORY_ROOT);
+    config = loadConfig({ transport: "state" in run ? run.state.transport : undefined });
+  }
   return validateRecoveryRun(config, runId, dependencies);
 }
 
 if (isEntrypoint(import.meta.url)) {
   runCliMain(async () => {
     const options = parseResumeValidationArgs(process.argv.slice(2));
-    const validation = await validateResume(loadConfig(), options.runId);
+    const validation = await validateResume(undefined, options.runId);
     console.log(formatRecoveryValidation(validation));
     if (!validation.ready) {
       throw new Error("Recovery validation is blocked; no testcase was executed");

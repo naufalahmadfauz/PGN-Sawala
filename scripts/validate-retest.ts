@@ -11,7 +11,10 @@ import { assertPgnWorkbookValid } from "../src/excel/pgn-workbook-validator";
 import { getRetestRunMetadata } from "../src/excel/retest-workbook";
 import type { PgnTestScenario } from "../src/excel/pgn-types";
 import { assertResumeOptionsCompatible, parseCliOptions } from "../src/pgn-cli";
-import { CONTINUOUS_RECOVERY_WARNING, readSessionMode, sessionModeLabel } from "../src/session-mode";
+import { CONTINUOUS_RECOVERY_WARNING, readSessionMode, sessionModeLabel, readExecutionTransport, transportLabel } from "../src/session-mode";
+import { assertRestConfig } from "../src/rest/config";
+import { LivePersonClient } from "../src/rest/liveperson-client";
+import { safeRestError } from "../src/rest/errors";
 import { createGoogleDriveEvidencePublisher } from "../src/evidence/google-drive";
 import { safeGoogleCredentialError } from "../src/evidence/google-service-account";
 import { needsFinalRetestCleanup } from "../src/retest/retest-run";
@@ -82,9 +85,10 @@ export interface RetestValidationResult {
 
 export async function validateRetest(
   args = process.argv.slice(2),
-  config: AppConfig = loadConfig(),
+  config?: AppConfig,
 ): Promise<RetestValidationResult> {
   const options = parseCliOptions(args);
+  config ??= loadConfig({ transport: options.transport });
   assertResumeOptionsCompatible(options);
   if (options.restartRunId) throw new Error("Use test:pgn:resume:validate to inspect full continuous restart readiness");
   if (options.rerunAll || options.rerunIds.size) {
@@ -108,7 +112,8 @@ export async function validateRetest(
     throw new Error("Session mode conflicts with the stored retest; recovery cannot change isolation semantics");
   }
   if (resumedRun && readSessionMode(resumedRun.sessionMode) === "continuous") throw new Error(CONTINUOUS_RECOVERY_WARNING);
-  console.log(`Transport: WhatsApp; Session Mode: ${sessionModeLabel(options.sessionMode)}`);
+  if (resumedRun && readExecutionTransport(resumedRun.transport) !== options.transport) throw new Error("Transport conflicts with the stored retest");
+  console.log(`Transport: ${transportLabel(options.transport)}; Session Mode: ${sessionModeLabel(options.sessionMode)}`);
   if (options.resumeRunId && !resumedRun) {
     throw new Error(`Retest Run was not found: ${options.resumeRunId}`);
   }
@@ -165,6 +170,18 @@ export async function validateRetest(
   }
   console.log("");
 
+  if (options.transport === "rest") {
+    const shouldExecute = selection.selected.length > 0 || finalCleanupOnly;
+    let readyToExecute = !shouldExecute;
+    try {
+      assertRestConfig(config.livePersonRest);
+      await new LivePersonClient(config.livePersonRest).validate();
+      readyToExecute = true;
+      console.log("REST authentication/domain readiness: OK; no conversation or testcase created");
+    } catch (error) { console.log(`REST readiness: ${safeRestError(error, config.livePersonRest?.clientSecret)}`); }
+    console.log("Evidence: Not applicable for REST transport");
+    return { selectedCount: selection.selected.length, readyCount: selection.readyBySheet.kb.length + selection.readyBySheet.negative.length, finalCleanupOnly, shouldExecute, readyToExecute };
+  }
   let driveReady = false;
   if (!config.googleDriveEvidenceEnabled) {
     console.log("Google Drive Evidence: DISABLED");

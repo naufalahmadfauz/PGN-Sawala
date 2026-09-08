@@ -1,5 +1,5 @@
 export type SessionMode = "isolated" | "continuous";
-export type ExecutionTransport = "whatsapp";
+export type ExecutionTransport = "whatsapp" | "rest";
 
 export interface RunExecutionContext {
   transport: ExecutionTransport;
@@ -25,7 +25,20 @@ export function readSessionMode(value: unknown): SessionMode {
 
 export function readExecutionTransport(value: unknown): ExecutionTransport {
   if (value === undefined || value === "whatsapp") return "whatsapp";
-  throw new Error("Only the WhatsApp execution transport is supported");
+  if (value === "rest") return "rest";
+  throw new Error("Execution transport must be whatsapp or rest");
+}
+
+export function transportLabel(transport: ExecutionTransport): string {
+  return transport === "rest" ? "REST" : "WhatsApp";
+}
+
+export function continuousSessionWarning(transport: ExecutionTransport): string {
+  return transport === "whatsapp" ? CONTINUOUS_SESSION_WARNING
+    : CONTINUOUS_SESSION_WARNING.replace(
+        "One clean initial reset is required. Session resets between scenarios and final cleanup are disabled.",
+        "One new LivePerson conversation is shared for the entire run and closed at the end. No reset messages are sent.",
+      );
 }
 
 export function sessionModeLabel(mode: SessionMode): string {

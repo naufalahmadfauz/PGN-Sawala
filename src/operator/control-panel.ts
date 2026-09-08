@@ -13,10 +13,14 @@ import {
   type RecoveryValidation,
 } from "../recovery/recovery-service";
 import type { RecoveryDiscovery } from "../recovery/run-state";
+import { safeRestError } from "../rest/errors";
 import {
   CONTINUOUS_RECOVERY_WARNING,
-  CONTINUOUS_SESSION_WARNING,
+  continuousSessionWarning,
+  readExecutionTransport,
   readSessionMode,
+  transportLabel,
+  type ExecutionTransport,
   type SessionMode,
 } from "../session-mode";
 
@@ -40,6 +44,7 @@ export interface OperatorActions {
   ): Promise<RecoveryMutationResult>;
   abandonRecovery?(runId: string): Promise<RecoveryMutationResult>;
   validatePgn(): Promise<boolean>;
+  validateRest?(args: string[]): Promise<{ ready: boolean; selectedCount: number }>;
   prepareFresh(): Promise<void>;
   runPgn(args: string[]): Promise<void>;
   validateRetest(args: string[]): Promise<RetestReadiness>;
@@ -95,8 +100,9 @@ async function attempt<Value>(
     const value = await action();
     return { ok: true, value };
   } catch (error) {
+    const restError = safeRestError(error, process.env.LIVEPERSON_CLIENT_SECRET ?? "", process.env.LIVEPERSON_CLIENT_ID ?? "");
     ui.error(
-      safeGoogleCredentialError(new Error(safeDiscordError(error))),
+      safeGoogleCredentialError(new Error(safeDiscordError(new Error(restError)))),
     );
     return { ok: false };
   }
@@ -123,24 +129,31 @@ function parseIds(value: string): string[] {
     .filter(Boolean);
 }
 
-async function selectSessionMode(ui: OperatorUi): Promise<SessionMode | undefined> {
+async function selectSessionMode(
+  ui: OperatorUi,
+  transport: ExecutionTransport = "whatsapp",
+): Promise<SessionMode | undefined> {
   const sessionMode = await ui.select<SessionMode>({
-    message: "Session Mode for this run",
+    message: transport === "rest" ? "Session Mode for this REST run" : "Session Mode for this run",
     options: [
       {
         value: "isolated",
         label: "Isolated (recommended)",
-        hint: "Reset before each scenario and after the run",
+        hint: transport === "rest"
+          ? "Fresh conversation per scenario; turns share context; no debug reset"
+          : "Reset before each scenario and after the run",
       },
       {
         value: "continuous",
         label: "Continuous",
-        hint: "One initial reset; all scenarios share conversation context",
+        hint: transport === "rest"
+          ? "One initial conversation; all scenarios share context; no debug reset"
+          : "One initial reset; all scenarios share conversation context",
       },
     ],
     initialValue: "isolated",
   });
-  if (sessionMode === "continuous") ui.warn(CONTINUOUS_SESSION_WARNING);
+  if (sessionMode === "continuous") ui.warn(continuousSessionWarning(transport));
   return sessionMode;
 }
 
@@ -148,9 +161,13 @@ async function confirmExecution(
   ui: OperatorUi,
   scope: string,
   sessionMode: SessionMode = "isolated",
+  transport: ExecutionTransport = "whatsapp",
 ): Promise<boolean | undefined> {
+  const effects = transport === "rest"
+    ? `send real testcase messages through LivePerson REST using ${sessionMode === "continuous" ? "one new conversation for the run" : "a fresh conversation per scenario"} and update the executed workbook. No WhatsApp, debug reset, screenshots, or Drive uploads`
+    : "open WhatsApp, send reset and testcase messages, update the executed workbook, and may upload evidence";
   return ui.confirm({
-    message: `${scope}${sessionMode === "continuous" ? " in Continuous Session Mode" : ""} will open WhatsApp, send reset and testcase messages, update the executed workbook, and may upload evidence. Continue?`,
+    message: `${scope}${sessionMode === "continuous" ? " in Continuous Session Mode" : ""} will ${effects}. Continue?`,
     initialValue: false,
   });
 }
@@ -294,8 +311,11 @@ async function resumeRecoveryFromMenu(
     acceptSourceDrift = true;
   }
   const nextScenario = inspected.value.reconciliation?.nextScenarioId;
+  const transport = readExecutionTransport(inspected.value.state.transport ?? inspected.value.manifest.transport);
   const confirmed = await ui.confirm({
-    message: `Resume Run ${runId}${nextScenario ? ` at ${nextScenario} from Turn 1` : ""}? This will open WhatsApp, send messages, update the workbook, and reuse existing Drive artifacts.`,
+    message: `Resume Run ${runId}${nextScenario ? ` at ${nextScenario} from Turn 1` : ""}? ${transport === "rest"
+      ? "This will send real messages through LivePerson REST in a fresh conversation per scenario, restarting any interrupted scenario from Turn 1, and update the workbook. No WhatsApp, debug reset, screenshots, or Drive uploads."
+      : "This will open WhatsApp, send messages, update the workbook, and reuse existing Drive artifacts."}`,
     initialValue: false,
   });
   if (!confirmed) {
@@ -321,6 +341,7 @@ async function restartRecoveryFromMenu(
   );
   if (!inspected.ok) return;
   const validation = inspected.value;
+  const transport = readExecutionTransport(validation.state.transport ?? validation.manifest.transport);
   const isDemo = discoveredIsDemo || validation.state.isDemo === true ||
     validation.manifest.isDemo === true || runId.startsWith("DEMO-RECOVERY-");
   ui.note(formatRecoveryValidation(validation), isDemo ? "DEMO recovery validation" : "Recovery validation");
@@ -329,7 +350,7 @@ async function restartRecoveryFromMenu(
       "DEMO: UI/testing only; no live execution. No WhatsApp, Playwright, Drive, or Discord actions.",
       `Full continuous restart: all ${validation.state.selectedScenarioIds.length} originally selected scenarios from the beginning (preview only).`,
       `Original order: ${validation.state.selectedScenarioIds.join(", ")}`,
-      "A real restart creates a NEW Run ID and new evidence folder; the old run history is preserved.",
+      `A real restart creates a NEW Run ID and ${transport === "rest" ? "a new REST conversation" : "new evidence folder"}; the old run history is preserved.`,
       "This preview did not change recovery progress or artifacts.",
     ].join("\n"), "DEMO continuous restart preview");
     return;
@@ -353,9 +374,11 @@ async function restartRecoveryFromMenu(
     if (!accepted) return;
     acceptSourceDrift = true;
   }
-  ui.warn(CONTINUOUS_SESSION_WARNING);
+  ui.warn(continuousSessionWarning(transport));
   const confirmed = await ui.confirm({
-    message: `Restart ALL ${validation.state.selectedScenarioIds.length} originally selected scenarios in Run ${runId} from the beginning, including completed/skipped scenarios, in their original order? This opens WhatsApp and sends messages in Continuous Session Mode under a NEW Run ID and new evidence folder. The old run is marked ABANDONED only after the new checkpoint is saved; its history and artifacts are preserved. Continue with the FULL restart?`,
+    message: `Restart ALL ${validation.state.selectedScenarioIds.length} originally selected scenarios in Run ${runId} from the beginning, including completed/skipped scenarios, in their original order? ${transport === "rest"
+      ? "This sends real messages through LivePerson REST in Continuous Session Mode under a NEW Run ID and one new conversation. No WhatsApp, debug reset, screenshots, or Drive uploads."
+      : "This opens WhatsApp and sends messages in Continuous Session Mode under a NEW Run ID and new evidence folder."} The old run is marked ABANDONED only after the new checkpoint is saved; its history and artifacts are preserved. Continue with the FULL restart?`,
     initialValue: false,
   });
   if (!confirmed) {
@@ -522,11 +545,23 @@ export async function runConfirmedFullTest(
 async function runTestsMenu(
   ui: OperatorUi,
   actions: OperatorActions,
+  transport: ExecutionTransport = "whatsapp",
 ): Promise<boolean> {
+  const rest = transport === "rest";
+  const restSessionMode = rest ? await selectSessionMode(ui, transport) : undefined;
+  if (rest && restSessionMode === undefined) return false;
   while (true) {
     const choice = await ui.select({
-      message: "Run tests",
-      options: [
+      message: rest ? "REST Bulk Test" : "Run tests",
+      options: rest ? [
+        { value: "full", label: "Full run", hint: "Original workbook selection; completed results are skipped" },
+        { value: "ids", label: "Run specific testcase IDs", hint: "Optional rerun of existing results" },
+        { value: "sheet", label: "Run one sheet" },
+        { value: "retest", label: "Retest fixed cases" },
+        { value: "validate", label: "Validate REST readiness", hint: "Real domain/auth requests only; no conversations", disabled: !actions.validateRest },
+        { value: "back", label: "Back" },
+      ] : [
+        { value: "rest", label: "REST Bulk Test", hint: "LivePerson REST; no browser or screenshots" },
         { value: "validate", label: "Validate source workbook", hint: "No messages sent" },
         { value: "remaining", label: "Run remaining scenarios" },
         { value: "sheet", label: "Run one sheet" },
@@ -537,7 +572,38 @@ async function runTestsMenu(
     });
     if (choice === undefined) return false;
     if (choice === "back") return true;
+    if (!rest && choice === "rest") {
+      if (!(await runTestsMenu(ui, actions, "rest"))) return false;
+      continue;
+    }
+    if (rest && choice === "retest") {
+      const result = await retestMenu(ui, actions, transport, restSessionMode);
+      if (result === "back") continue;
+      return result;
+    }
     if (choice === "validate") {
+      if (rest) {
+        const validateRest = actions.validateRest;
+        if (!validateRest) {
+          ui.warn("REST validation is unavailable. No requests were made.");
+          continue;
+        }
+        const confirmed = await ui.confirm({
+          message: "Validate workbook/config/output readiness and make real LivePerson domain and authentication requests? No conversations, testcase messages, browser, screenshots, or Drive calls are made.",
+          initialValue: false,
+        });
+        if (confirmed === undefined) return false;
+        if (!confirmed) continue;
+        const result = await attempt(ui, "Validating REST readiness without conversations", () =>
+          validateRest(["--transport=rest", ...(restSessionMode === "continuous" ? ["--session=continuous"] : [])]),
+        );
+        if (result.ok) {
+          ui.info(`${result.value.selectedCount} scenario(s) selected; no testcase was executed.`);
+          if (result.value.ready) ui.success("REST validation passed");
+          else ui.warn("REST prerequisites are not ready");
+        }
+        continue;
+      }
       const result = await attempt(ui, "Validating source workbook", actions.validatePgn);
       if (result.ok) {
         result.value
@@ -546,7 +612,7 @@ async function runTestsMenu(
       }
       continue;
     }
-    if (choice === "fresh") {
+    if (!rest && choice === "fresh") {
       const confirmed = await ui.confirm({
         message: "Archive the current executed report and prepare a fresh workbook?",
         initialValue: false,
@@ -564,6 +630,7 @@ async function runTestsMenu(
       if (result.ok) ui.success("Fresh workbook prepared");
       continue;
     }
+    if (![rest ? "full" : "remaining", "sheet", "ids"].includes(choice)) continue;
 
     let args: string[] = [];
     let scope = "This test run";
@@ -597,10 +664,11 @@ async function runTestsMenu(
       args = ["--test", ids, ...(rerun ? ["--rerun"] : [])];
       scope = `Running ${parseIds(input).length} selected testcase(s)`;
     }
-    const sessionMode = await selectSessionMode(ui);
+    const sessionMode = restSessionMode ?? await selectSessionMode(ui, transport);
     if (sessionMode === undefined) return false;
+    if (rest) args.unshift("--transport=rest");
     if (sessionMode === "continuous") args.push("--session=continuous");
-    const confirmed = await confirmExecution(ui, scope, sessionMode);
+    const confirmed = await confirmExecution(ui, scope, sessionMode, transport);
     if (confirmed === undefined) return false;
     if (!confirmed) {
       ui.info("Test execution cancelled");
@@ -610,6 +678,7 @@ async function runTestsMenu(
       actions.runPgn(args),
     );
     if (result.ok) ui.success("PGN execution finished");
+    if (rest) return true;
   }
 }
 
@@ -636,26 +705,34 @@ async function validateBeforeRetest(
 async function retestMenu(
   ui: OperatorUi,
   actions: OperatorActions,
-): Promise<boolean> {
+  transport: ExecutionTransport = "whatsapp",
+  selectedSessionMode?: SessionMode,
+): Promise<boolean | "back"> {
+  const transportArgs = transport === "rest" ? ["--transport=rest"] : [];
   while (true) {
     const choice = await ui.select({
-      message: "Retest fixed cases",
+      message: transport === "rest" ? `${transportLabel(transport)} retest fixed cases` : "Retest fixed cases",
       options: [
         { value: "review", label: "Review approved candidates", hint: "No messages sent" },
         { value: "ready", label: "Run all Ready for Re-test cases" },
         { value: "ids", label: "Run selected testcase IDs" },
-        { value: "resume", label: "Resume a retest run" },
+        ...(transport === "rest" ? [] : [{ value: "resume", label: "Resume a retest run" }]),
         { value: "back", label: "Back" },
       ],
     });
     if (choice === undefined) return false;
-    if (choice === "back") return true;
+    if (choice === "back") return transport === "rest" ? "back" : true;
     if (choice === "review") {
       await attempt(ui, "Validating retest candidates", () =>
-        actions.validateRetest([]),
+        actions.validateRetest([...transportArgs, ...(selectedSessionMode === "continuous" ? ["--session=continuous"] : [])]),
       );
       continue;
     }
+    if (transport === "rest" && choice === "resume") {
+      ui.warn("Use interrupted-run recovery. Isolated REST recovery starts a fresh conversation from Turn 1; continuous runs require full restart or abandonment.");
+      continue;
+    }
+    if (!["ready", "ids", "resume"].includes(choice)) continue;
 
     let args: string[] = [];
     if (choice === "ids") {
@@ -679,17 +756,18 @@ async function retestMenu(
     }
     let sessionMode: SessionMode = "isolated";
     if (choice !== "resume") {
-      const selectedMode = await selectSessionMode(ui);
+      const selectedMode = selectedSessionMode ?? await selectSessionMode(ui, transport);
       if (selectedMode === undefined) return false;
       sessionMode = selectedMode;
       if (sessionMode === "continuous") args.push("--session=continuous");
     }
+    args.unshift(...transportArgs);
     const readiness = await validateBeforeRetest(ui, actions, args);
     if (!readiness) continue;
     const description = readiness.finalCleanupOnly
-      ? "The final WhatsApp session cleanup"
+      ? transport === "rest" ? "Finalizing the REST run" : "The final WhatsApp session cleanup"
       : `${readiness.selectedCount} retest scenario(s)`;
-    const confirmed = await confirmExecution(ui, description, sessionMode);
+    const confirmed = await confirmExecution(ui, description, sessionMode, transport);
     if (confirmed === undefined) return false;
     if (!confirmed) {
       ui.info("Retest execution cancelled");
@@ -699,6 +777,7 @@ async function retestMenu(
       actions.runRetest(args),
     );
     if (result.ok) ui.success("Retest execution finished");
+    if (transport === "rest") return true;
   }
 }
 
@@ -879,7 +958,7 @@ async function developerMenu(
         {
           value: "tests",
           label: "Safe regression tests",
-          hint: "No WhatsApp, Drive, or Discord calls",
+          hint: "No LivePerson, WhatsApp, Drive, or Discord calls",
         },
         { value: "template", label: "Create legacy workbook template" },
         { value: "back", label: "Back" },
@@ -933,7 +1012,7 @@ export async function runControlPanel(
     }
     let keepRunning = true;
     if (choice === "run") keepRunning = await runTestsMenu(ui, actions);
-    if (choice === "retest") keepRunning = await retestMenu(ui, actions);
+    if (choice === "retest") keepRunning = (await retestMenu(ui, actions)) !== false;
     if (choice === "validate") keepRunning = await validationMenu(ui, actions);
     if (choice === "workbook" && actions.workbookSchema) {
       while (true) {

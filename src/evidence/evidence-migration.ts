@@ -6,6 +6,8 @@ import {
   realpath,
 } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { evidenceFileName, safePathSegment } from "./evidence-filename";
+export { evidenceFileName } from "./evidence-filename";
 import path from "node:path";
 import ExcelJS from "exceljs";
 import type { AppConfig } from "../config";
@@ -113,25 +115,6 @@ function uniqueValue(values: Set<string>): string | undefined {
   return values.size === 1 ? [...values][0] : undefined;
 }
 
-function safePathSegment(value: string): string {
-  const sanitized = value
-    .replace(/[^A-Za-z0-9_-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 100);
-  if (!sanitized) {
-    throw new Error("Evidence identifier cannot be converted to a safe filename");
-  }
-  if (sanitized === value) {
-    return sanitized;
-  }
-  const suffix = createHash("sha256").update(value).digest("hex").slice(0, 8);
-  return `${sanitized.slice(0, 90)}-${suffix}`;
-}
-
-export function evidenceFileName(testCaseId: string, turnNumber: number): string {
-  return `${safePathSegment(testCaseId)}-turn-${turnNumber}.png`;
-}
-
 export function discoverEvidenceInventory(
   workbook: ExcelJS.Workbook,
 ): EvidenceInventory {
@@ -156,6 +139,7 @@ export function discoverEvidenceInventory(
   >();
 
   for (let rowNumber = 2; rowNumber <= transcript.rowCount; rowNumber += 1) {
+    if (optionalFieldCell(transcript, rowNumber, "transport")?.text === "rest") continue;
     if (!MIGRATABLE_ROLES.has(fieldCell(transcript, rowNumber, "role").text)) {
       continue;
     }
@@ -250,6 +234,11 @@ export function discoverEvidenceInventory(
   const coveredTurns = new Set(
     records.map((record) => `${record.testCaseId}|${record.turnNumber}`),
   );
+  for (let rowNumber = 2; rowNumber <= transcript.rowCount; rowNumber += 1) {
+    if (optionalFieldCell(transcript, rowNumber, "transport")?.text === "rest") {
+      coveredTurns.add(`${fieldCell(transcript, rowNumber, "testCaseId").text}|${fieldCell(transcript, rowNumber, "turn").text}`);
+    }
+  }
   const missingCompletedTurns: MissingCompletedEvidence[] = [];
   const finalTurnNumbers: Record<string, number> = {};
   for (const scenario of parsed.scenarios) {

@@ -1,7 +1,9 @@
 import type { PgnSheetKind } from "./excel/pgn-types";
-import { readSessionMode, type SessionMode } from "./session-mode";
+import { readExecutionTransport, readSessionMode, type ExecutionTransport, type SessionMode } from "./session-mode";
 
 export interface CliOptions {
+  transport: ExecutionTransport;
+  transportExplicit: boolean;
   limit?: number;
   sheet?: PgnSheetKind;
   testIds: Set<string>;
@@ -23,6 +25,8 @@ function parseIdList(value: string): string[] {
 
 export function parseCliOptions(args: string[]): CliOptions {
   const options: CliOptions = {
+    transport: "whatsapp",
+    transportExplicit: false,
     testIds: new Set(),
     rerunAll: false,
     rerunIds: new Set(),
@@ -33,7 +37,14 @@ export function parseCliOptions(args: string[]): CliOptions {
 
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
-    if (argument === "--fast" || argument === "--session" || argument.startsWith("--session=")) {
+    if (argument === "--transport" || argument.startsWith("--transport=")) {
+      const value = argument === "--transport" ? args[++index] : argument.slice("--transport=".length);
+      if (!value) throw new Error("--transport requires whatsapp or rest");
+      const transport = readExecutionTransport(value);
+      if (options.transportExplicit && options.transport !== transport) throw new Error("Conflicting transport flags");
+      options.transport = transport;
+      options.transportExplicit = true;
+    } else if (argument === "--fast" || argument === "--session" || argument.startsWith("--session=")) {
       const value = argument === "--fast" ? "continuous"
         : argument === "--session" ? args[++index] : argument.slice("--session=".length);
       if (!value) throw new Error("--session requires isolated or continuous");
@@ -60,8 +71,8 @@ export function parseCliOptions(args: string[]): CliOptions {
       } else {
         throw new Error("--sheet must be kb, negative, or all");
       }
-    } else if (argument === "--test") {
-      const value = args[++index];
+    } else if (argument === "--test" || argument.startsWith("--test=")) {
+      const value = argument === "--test" ? args[++index] : argument.slice("--test=".length);
       if (!value || value.startsWith("--")) {
         throw new Error("--test requires a Test Case ID");
       }

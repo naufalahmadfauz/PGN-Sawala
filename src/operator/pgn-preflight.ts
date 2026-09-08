@@ -12,7 +12,8 @@ import { selectScenarios } from "../pgn-selection";
 import { needsFinalRetestCleanup } from "../retest/retest-run";
 import { selectRetestScenarios } from "../retest/retest-selection";
 import { selectRecoveryScenarios } from "../recovery/recovery-service";
-import { CONTINUOUS_RECOVERY_WARNING, readSessionMode } from "../session-mode";
+import { CONTINUOUS_RECOVERY_WARNING, readSessionMode, readExecutionTransport } from "../session-mode";
+import { assertRestConfig } from "../rest/config";
 import {
   assertRecoveryRunExecutable,
   readRecoveryRun,
@@ -60,6 +61,9 @@ export async function inspectPgnExecution(
     }
     if (resumedState) {
       assertRecoveryRunExecutable(resumedState);
+      const transport = readExecutionTransport(resumedState.transport);
+      if (options.transportExplicit && options.transport !== transport) throw new Error("Transport conflicts with the stored run");
+      options.transport = transport;
       const sessionMode = readSessionMode(resumedState.sessionMode);
       if (options.sessionModeExplicit && options.sessionMode !== sessionMode) {
         throw new Error("Session mode conflicts with the stored run; recovery cannot change isolation semantics");
@@ -79,6 +83,7 @@ export async function inspectPgnExecution(
     : config.pgnSourceWorkbookPath;
   const loaded = await loadPgnWorkbook(workbookPath);
   assertPgnWorkbookValid(loaded.parsed);
+  if (options.transport === "rest") assertRestConfig(config.livePersonRest);
 
   if (resumedState) {
     const selected = options.restartRunId
@@ -91,7 +96,7 @@ export async function inspectPgnExecution(
     const finalCleanupOnly =
       selected.length === 0 && !resumedState.finalCleanupComplete;
     return {
-      browserRequired: selected.length > 0 || finalCleanupOnly,
+      browserRequired: options.transport === "whatsapp" && (selected.length > 0 || finalCleanupOnly),
       selectedCount: selected.length,
       finalCleanupOnly,
     };
@@ -104,7 +109,7 @@ export async function inspectPgnExecution(
       loaded.workbook,
     );
     return {
-      browserRequired: selection.runnable.length > 0,
+      browserRequired: options.transport === "whatsapp" && selection.runnable.length > 0,
       selectedCount: selection.runnable.length,
       finalCleanupOnly: false,
     };
@@ -116,6 +121,7 @@ export async function inspectPgnExecution(
   if (options.resumeRunId && !resumedRun) {
     throw new Error(`Retest Run was not found: ${options.resumeRunId}`);
   }
+  if (resumedRun && readExecutionTransport(resumedRun.transport) !== options.transport) throw new Error("Transport conflicts with the stored retest");
   if (resumedRun && options.sessionModeExplicit && options.sessionMode !== readSessionMode(resumedRun.sessionMode)) {
     throw new Error("Session mode conflicts with the stored retest; recovery cannot change isolation semantics");
   }
@@ -132,7 +138,7 @@ export async function inspectPgnExecution(
     selection.selected.length,
   );
   return {
-    browserRequired: selection.selected.length > 0 || finalCleanupOnly,
+    browserRequired: options.transport === "whatsapp" && (selection.selected.length > 0 || finalCleanupOnly),
     selectedCount: selection.selected.length,
     finalCleanupOnly,
   };

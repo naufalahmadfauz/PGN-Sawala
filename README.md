@@ -1,8 +1,43 @@
 # PGN Sawala
 
-This harness drives the consumer WhatsApp Web UI with Playwright. Messages follow the real route through the PGN WhatsApp Business number, LivePerson, and the PGN bot; no direct bot or messaging API is used.
+This harness runs the PGN workbook through either the consumer WhatsApp Web UI with Playwright or an opt-in LivePerson REST transport. Both use the current shared workbook execution engine; transport and session mode are selected per run.
 
 **v1.0.0** is the first stable release. See the [release notes](RELEASE_NOTES_v1.0.0.md) and [changelog](CHANGELOG.md) for the V1 overview and verification results.
+
+## Test Transports
+
+| Transport | Purpose | Channel And Evidence |
+| --- | --- | --- |
+| WhatsApp (default) | Real-channel acceptance testing | Consumer WhatsApp Web -> PGN WhatsApp Business number -> LivePerson -> PGN bot. Browser screenshots and optional Drive evidence. |
+| REST (opt-in) | Bulk bot testing without a browser | Direct LivePerson messaging requests. Workbook results and transcripts, **no screenshots**, no WhatsApp profile, and no Drive requirement or uploads. |
+
+REST results do not prove WhatsApp delivery, rendering, or end-to-end channel acceptance. Keep WhatsApp acceptance runs for those checks. REST is not a parallel grading engine: source inputs, selection, output workbook, retest history, technical status, and semantic evaluation rules stay in the shared runner. Neither transport automatically grades responses as Passed or Failed.
+
+Open `npm run pgn` -> **Run tests** -> **REST Bulk Test**, choose **Isolated** (default) or **Continuous**, then choose a full run, IDs, a sheet, retest, validation, or Back. Execution requires default-No confirmation. The existing WhatsApp choices remain available. Neither enabling REST in Setup nor choosing a session mode changes the default transport for later runs.
+
+REST commands are explicit alternatives to the WhatsApp commands:
+
+```bash
+npm run test:pgn:rest:validate
+npm run test:pgn:rest
+npm run test:pgn:rest -- --sheet kb
+npm run test:pgn:rest -- --test PGN-KB-031 --rerun
+npm run test:pgn:rest -- --session=continuous
+npm run test:pgn:rest:retest
+```
+
+The REST execution/retest entrypoints force REST and call the shared `runPgnWorkbook`; `--transport=rest` and `--transport=whatsapp` select transport on the shared commands. REST **Full run** preserves normal source-workbook selection and skips existing completed results. It does not silently clear output or force a rerun. For a fresh bulk run, use the existing separate fresh-workbook preparation action, or explicitly choose filtered IDs/`--rerun` as appropriate. Both transports share the configured executed workbook, so existing results can affect selection when switching transports.
+
+`test:pgn:rest:validate` checks workbook, configuration, and output readiness before making **real but harmless domain/authentication requests**: domain discovery, app JWT authentication, and synthetic consumer JWS validation only. It never creates conversations or sends testcase messages. The REST validation menu and Setup authentication check both explain these requests and require explicit confirmation. Default diagnostics and Setup inspection do not contact LivePerson.
+
+The smoke command is a separate **real integration action**, never an automatic setup, validation, regression-test, or acceptance step:
+
+```bash
+# Explicitly opt into a real LivePerson conversation and smoke message.
+npm run rest:smoke
+```
+
+Do not run the smoke command or REST execution commands as part of safe mock-only verification. Domain/auth validation is not a smoke conversation and does not establish bot-response readiness.
 
 ## Getting Started
 
@@ -14,11 +49,11 @@ npm run setup
 npm run pgn
 ```
 
-The setup wizard inspects Node.js, npm, dependencies, Playwright Chromium, the PGN workbooks, `.env`, Google Drive configuration, optional Discord notifications, browser display support, and the saved WhatsApp profile. It can safely create or update `.env`, validate a service-account file, configure a Discord Incoming Webhook through a masked prompt, install Chromium, and optionally open WhatsApp login. Credential values, webhook URLs, and profile contents are never displayed.
+The setup wizard inspects Node.js, npm, dependencies, Playwright Chromium, the PGN workbooks, `.env`, Google Drive configuration, optional Discord notifications, optional LivePerson REST configuration, browser display support, and the saved WhatsApp profile. It can safely create or update `.env`, validate a service-account file, configure Discord and REST credentials through masked prompts, install Chromium, and optionally open WhatsApp login. REST domain/auth validation is separately offered with default-No confirmation; enabling REST alone never opens a conversation. Credential values, webhook URLs, and profile contents are never displayed.
 
 `npm run pgn` provides one interactive entry point for:
 
-- full and filtered PGN runs
+- full and filtered PGN runs through WhatsApp or REST
 - approved retest validation, execution, and resume
 - interrupted-run discovery and guided recovery
 - header-based workbook schema inspection and mapping review
@@ -37,9 +72,10 @@ Run non-interactive prerequisite checks at any time:
 
 ```bash
 npm run doctor
+npm run doctor -- --transport=rest
 ```
 
-Doctor checks local prerequisites and may validate configured Google Drive access; it does not send WhatsApp testcases or Discord notifications. The control panel's recovery demo uses local synthetic artifacts and suppresses external checks.
+Default doctor checks WhatsApp prerequisites and may validate configured Google Drive access; it does not send WhatsApp testcases or Discord notifications. Its LivePerson REST check is configuration-only by default: disabled, configured/domain override status, or configuration errors, with authentication explicitly marked not checked. REST-only doctor still checks common configuration and workbook schema but does not require or probe Playwright, Chromium, Xvfb, a WhatsApp target/profile, or Drive. LivePerson network checks require an explicit access-check request; use `test:pgn:rest:validate` for the dedicated workbook/domain/auth check. The control panel's recovery demo uses local synthetic artifacts and suppresses external checks.
 
 ### Browser Support
 
@@ -57,6 +93,10 @@ The direct commands remain available for automation and experienced operators:
 - `npm run test:pgn:fresh` archives the current report and prepares a clean full-run workbook without opening WhatsApp.
 - `npm run test:pgn:retest:validate` lists approved retest scenarios and readiness without opening WhatsApp.
 - `npm run test:pgn:retest` executes only approved retest scenarios.
+- `npm run test:pgn:rest` executes the same workbook through LivePerson REST without screenshots or a browser.
+- `npm run test:pgn:rest:validate` checks workbook/config/output readiness and makes real domain/auth requests only, never conversations or testcase messages.
+- `npm run test:pgn:rest:retest` retests through REST using shared selection and history rules, without Drive requirements.
+- `npm run rest:smoke` is an explicitly invoked real REST conversation/message check, never part of safe regression tests.
 - `npm run evidence:validate` validates existing local evidence, creates three cleaned previews, and optionally checks Drive access without contacting WhatsApp.
 - `npm run evidence:migrate` backs up the completed workbook, cleans and uploads existing evidence, and writes hyperlinks without contacting WhatsApp.
 - `npm run discord:validate` safely inspects the configured Discord webhook with `GET` and does not post a message.
@@ -77,9 +117,43 @@ The direct commands remain available for automation and experienced operators:
 
 All commands load the repository-root `.env` through the central configuration module. A missing `.env` is valid. Existing process environment variables, including Codespaces Secrets and CI variables, are never overwritten by `.env` values with the same name.
 
-Configure either `PGN_WHATSAPP_PHONE` (international digits, without `+`) or `PGN_WHATSAPP_CHAT`. A phone number is preferred when both are present because the direct WhatsApp chat URL avoids ambiguous chat-name matches. The harness verifies the open conversation header against that target and confirms each outgoing WhatsApp message before collecting a response.
+For WhatsApp execution, configure either `PGN_WHATSAPP_PHONE` (international digits, without `+`) or `PGN_WHATSAPP_CHAT`. A phone number is preferred when both are present because the direct WhatsApp chat URL avoids ambiguous chat-name matches. The harness verifies the open conversation header against that target and confirms each outgoing WhatsApp message before collecting a response. REST does not require either setting.
 
 The authenticated profile is fixed at `.whatsapp-profile/`. Data files are restricted to `data/`, and generated reports are restricted to `reports/`. The profile, `.env`, `.secrets/`, service-account JSON files, QR images, evidence, diagnostics, and executed workbooks are gitignored. Treat the profile and credentials as secrets and do not share or commit them. Fresh-run preparation only archives and replaces generated test workbooks; it never removes `.env` or `.secrets/`.
+
+### LivePerson REST
+
+REST is disabled by default. Use Setup's opt-in step or configure these values in the gitignored `.env` or process-managed secrets. The values below are placeholders, not working credentials or tokens:
+
+```dotenv
+LIVEPERSON_REST_ENABLED=false
+LIVEPERSON_ACCOUNT_ID=
+LIVEPERSON_CLIENT_ID=
+LIVEPERSON_CLIENT_SECRET=
+LIVEPERSON_SKILL_ID=
+LIVEPERSON_SENTINEL_DOMAIN=
+LIVEPERSON_IDP_DOMAIN=
+LIVEPERSON_ASYNC_MESSAGING_DOMAIN=
+LIVEPERSON_MESSAGING_REST_DOMAIN=
+REST_RESPONSE_IDLE_MS=3000
+REST_RESPONSE_TIMEOUT_MS=60000
+REST_POLL_INTERVAL_MS=750
+REST_REQUEST_TIMEOUT_MS=15000
+```
+
+Set `LIVEPERSON_REST_ENABLED=true` only when opting into REST. Account ID, client ID, client secret, and the intended skill ID are required. Domain overrides are optional: leave them blank for account domain discovery, or provide the correct HTTPS service hosts for your account. Do not put credentials, JWTs, or access tokens in domain values. App JWTs and synthetic consumer JWS values are obtained by the client, not pasted into configuration, workbooks, or documentation.
+
+Setup masks client ID/secret entry, offers to retain existing credentials without showing them, and preserves process-managed values instead of copying or shadowing them in `.env`. Cancelling credential entry writes none of the pending setup changes. The optional auth/domain check uses no browser and never automatically creates a live conversation. Enablement is configuration, not a persistent transport or session preference.
+
+The client discovers `sentinel`, `idp`, `asyncMessagingEnt`, and `messagingRestApiDomain` once per run unless reviewed overrides are supplied. It obtains AppJWT through the Sentinel client-credentials endpoint and ConsumerJWS through IDP. Tokens stay in private in-memory caches, refresh near expiry, and get one authentication refresh after an HTTP 401. Isolated scenarios and recovery attempts use distinct synthetic consumer identities; no customer identifiers are used.
+
+Conversation creation sends synthetic profile metadata followed by `cm.ConsumerRequestConversation` with the configured brand/skill, NORMAL TTR, and MESSAGING channel. Replies are correlated by request ID; a missing dialog ID is resolved by selecting the open MAIN dialog from conversation metadata. Text input uses `ms.PublishEvent` with `text/plain` ContentEvent. Cleanup uses `cm.UpdateConversationField` with ConversationStateField `CLOSE`; failures are reported without deleting captured results.
+
+Polling uses the Messaging REST messages endpoint with ascending sequence order and an inclusive `newerThanSequence` cursor advanced by one. A pre-send high-water mark and publish acknowledgement prevent old history from becoming a new answer. Consumer echoes, receipts, chat-state events, internal-audience messages, and duplicate sequences do not become bot text. Multiple bot/agent text messages are joined with blank lines; each new bot message restarts the idle window. Polling stops after a settled response or the hard deadline.
+
+Retries are bounded to three attempts for safe auth/read/close requests and HTTP 429 rejections, with exponential backoff and Retry-After support. Excessive Retry-After waits fail rather than being shortened. Conversation creation and text publication are **not** retried after ambiguous network/5xx outcomes, because the operation may already have reached LivePerson; this avoids duplicate testcase messages. A response timeout or scenario-specific rejection is recorded and isolated bulk execution continues. Permanent authentication/permission failures, invalid global configuration/protocol responses, and exhausted infrastructure retries abort safely with a checkpoint. Cleanup warnings preserve results but can require operator follow-up in LivePerson.
+
+REST uses the configured executed-workbook path and existing selection/skip/rerun rules, not a second testcase format or runner. Use an intentional output path or the existing fresh/rerun workflow when comparing channels; a prior captured result is not automatically re-executed just because the transport changes. `npm run test:pgn:fresh -- --transport=rest` prepares workbook results without modifying WhatsApp profiles or contacting LivePerson. REST Run Configuration records transport, session mode, and polling timings; transcript rows record conversation/dialog IDs but never tokens. REST evidence is marked not applicable and is excluded from screenshot migration.
 
 ### Discord Notifications
 
@@ -102,7 +176,7 @@ DISCORD_NOTIFY_FAILURE=true
 
 An active full or Ready-for-Retest run creates one live status message, edits it at the configured scenario or time interval, finalizes it, and posts a fresh completion or technical-failure event. An incomplete retest batch is labeled as a checkpoint instead of a completed retest. Setup offers progress every 5 scenarios, every 10 scenarios, final only, or a custom scenario/time cadence; the final-only preset disables start and progress messages. Start, progress, completion, and failure events can also be controlled independently with the advanced flags above.
 
-Start, resume, running, completion, failure, and interruption cards include **Transport: WhatsApp**, **Session Mode: Isolated/Continuous**, and **Context isolation: Enabled/Disabled**. Final and failed/interrupted cards include session reset attempts when supplied by the runner. This context is retained even with start notifications disabled; it adds fields to the existing cards, not extra posts. Full/Ready-for-Retest/Discord Demo remains a separate run classification.
+Start, resume, running, completion, failure, and interruption cards include **Transport: WhatsApp/REST**, **Session Mode: Isolated/Continuous**, and **Context isolation: Enabled/Disabled**. Final and failed/interrupted cards include session reset attempts when supplied by the WhatsApp runner; REST never performs debug resets. This context is retained even with start notifications disabled; it adds fields to the existing cards, not extra posts. Full/Ready-for-Retest/Discord Demo remains a separate run classification.
 
 Notification delivery is fail-open. Timeouts, rate limits, deleted webhooks, malformed responses, and other Discord failures produce a redacted warning but never stop execution or alter workbook results. Discord payloads contain only operational identifiers, counts, timing, technical status, evidence counts, and the executed workbook basename. They never include WhatsApp messages, bot responses, phone numbers, screenshots, credentials, semantic Pass/Fail decisions, or automatic mentions.
 
@@ -137,7 +211,7 @@ npm run discord:demo -- --interrupt
 
 ### Google Drive Evidence
 
-Drive evidence is disabled by default. It continues to use Google Drive API v3, Shared Drive support, inherited permissions, and one evidence subfolder per run.
+Drive evidence applies to WhatsApp execution and is disabled by default. It continues to use Google Drive API v3, Shared Drive support, inherited permissions, and one evidence subfolder per run. REST execution has no screenshots and does not require or upload Drive evidence.
 
 #### Local Development
 
@@ -243,7 +317,7 @@ Migration is resumable. Stored Drive file IDs are reused, exact-name files are f
 
 ## Future Run Evidence
 
-Normal PGN execution waits for response settlement, scrolls the active conversation to the bottom, and captures a Playwright `Locator.screenshot()` of the visible conversation pane selected from `#main` or the semantic conversation wrapper. The full WhatsApp page, navigation rail, chat list, search area, and unrelated contacts are excluded. Full-page screenshots remain available only for local failure diagnostics and are not uploaded as normal evidence.
+WhatsApp PGN execution waits for response settlement, scrolls the active conversation to the bottom, and captures a Playwright `Locator.screenshot()` of the visible conversation pane selected from `#main` or the semantic conversation wrapper. The full WhatsApp page, navigation rail, chat list, search area, and unrelated contacts are excluded. Full-page screenshots remain available only for local failure diagnostics and are not uploaded as normal evidence. REST writes results and transcripts without screenshots; it does not fabricate evidence images or use browser evidence backfill.
 
 When Drive evidence is enabled, the runner validates the parent and creates the run folder before opening WhatsApp. Each attempted turn is captured locally when possible, uploaded, linked in Excel, and atomically saved with its current result before the next turn or reset. A rerun clears stale result values and links that are not produced by the new attempt. Evidence upload status remains separate from `CAPTURED`, `TIMEOUT`, `SEND_ERROR`, and `CHAT_ERROR`, so a Drive failure does not invalidate a chatbot response.
 
@@ -264,20 +338,21 @@ npm run test:pgn -- --test PGN-KB-031 --rerun PGN-NEG-018
 
 Open `npm run pgn` after an interruption to inspect the recoverable run before starting new work. For isolated runs, the recovery menu offers validation, explicit resume confirmation, scenario skip, reconciliation of conflicting progress, and abandonment while preserving history. Atomic checkpoints, process locks, and heartbeats prevent concurrent runners from overwriting progress.
 
-Isolated resume preserves the Run ID, completed scenarios, original selection, and existing Drive folder. An incomplete multi-turn scenario restarts from Turn 1 after session reset; it never resumes midway through an old conversation. Source-content and column-schema drift are checked before execution, and unsafe structural changes block resume.
+Isolated resume preserves the Run ID, completed scenarios, original selection, and recorded transport. An incomplete multi-turn scenario restarts from Turn 1: after a session reset for WhatsApp, or in a **new conversation for REST**. It never resumes midway through an old conversation. WhatsApp recovery reuses the existing Drive folder; REST recovery has no browser or Drive requirement. Source-content and column-schema drift are checked before execution, and unsafe structural changes block resume.
 
 **Continuous runs cannot resume mid-stream.** After an interruption, the original shared conversation context may no longer be reliable. The same recovery menu instead offers **Inspect details**, **Restart continuous run from beginning**, **Abandon**, **Main menu**, and **Exit**. Partial resume, skip, and progress repair are disabled. Any continuous demo encountered here is preview-only and can never reach a live executor.
 
-A full continuous restart validates the original inputs and requires full-restart readiness, explicit acceptance of formatting-only source drift when present, and a strong default-No execution confirmation. It reruns **all originally selected scenarios, in their original order**, including previously completed or skipped scenarios, and preserves the original full/retest and session modes. It creates a **new Run ID and new evidence/Drive folder**, not a continuation of the old conversation. Only after the new checkpoint exists is the old run marked `ABANDONED` with a link to its replacement; old checkpoints, workbook history, transcripts, and evidence remain preserved.
+A full continuous restart validates the original inputs and requires full-restart readiness, explicit acceptance of formatting-only source drift when present, and a strong default-No execution confirmation. It reruns **all originally selected scenarios, in their original order**, including previously completed or skipped scenarios, and preserves the original full/retest, transport, and session modes. It creates a **new Run ID**, plus a new evidence/Drive folder for WhatsApp or **one new conversation for REST**, not a continuation of the old conversation. Only after the new checkpoint exists is the old run marked `ABANDONED` with a link to its replacement; old checkpoints, workbook history, transcripts, and evidence remain preserved.
 
 The direct equivalents are:
 
 ```bash
 npm run test:pgn -- --restart-run PGN-ORIGINAL-RUN-ID
 npm run test:pgn:retest -- --restart-run RETEST-ORIGINAL-RUN-ID
+npm run test:pgn:rest -- --restart-run REST-ORIGINAL-RUN-ID
 ```
 
-`--restart-run` is for a full continuous restart, not partial recovery or a fresh selection. It cannot be combined with `--resume` or selection filters. Use `--accept-source-drift` only after explicitly reviewing a formatting-only drift warning; it does not permit changed testcase inputs or unsafe schema drift. Recovery restores the recorded session mode rather than switching modes.
+`--restart-run` is for a full continuous restart, not partial recovery or a fresh selection. It cannot be combined with `--resume` or selection filters. Use `--accept-source-drift` only after explicitly reviewing a formatting-only drift warning; it does not permit changed testcase inputs or unsafe schema drift. Recovery restores the recorded session mode and transport rather than switching them. REST continuous recovery is always a total restart or abandonment, never a partial resume, skip, or debug reset.
 
 Use `npm run test:pgn:resume:validate` to inspect readiness without sending testcase messages. For real runs this can check Drive folder access; demo runs skip external checks. If no interrupted run exists, the command reports `No recoverable PGN run was found`. Recovery state is stored locally in the gitignored `.runtime/` directory and is not included in release archives.
 
@@ -325,7 +400,7 @@ The complete selection is frozen before execution starts. A positive multi-turn 
 
 Before executing each selected scenario, the runner appends an idempotent snapshot to `Retest History`. Positive multi-turn scenarios receive one history row per result row. The snapshot retains the previous transcript Run ID, semantic Status, Bot Response, Response Time, Test Date, and Evidence URL. New results and evidence are written back to the same history row as the retest progresses, while the active report points to the latest execution.
 
-Every batch receives a new ID such as `RETEST-20260902T053000Z`. The ID is used by `Execution Transcript`, `Retest Metadata`, evidence metadata, and the dedicated Drive folder `PGN-WhatsApp-Retest-20260902T053000Z`. Previous Drive files and folders are never deleted or replaced by another run.
+Every batch receives a new ID such as `RETEST-20260902T053000Z`. The ID is used by `Execution Transcript` and `Retest Metadata`; WhatsApp also uses evidence metadata and a dedicated Drive folder such as `PGN-WhatsApp-Retest-20260902T053000Z`. Previous Drive files and folders are never deleted or replaced by another run. REST retests use the same workbook/history engine without screenshots or Drive folders.
 
 After every turn, transcript, evidence metadata, active results, history, and resume state are atomically saved. When all turns in a scenario have technical status `CAPTURED`, its semantic Status becomes `Pending Evaluation`; automation never assigns `Passed` or `Failed`. A timeout or send/chat error keeps the previous semantic Status and records the technical failure separately.
 
@@ -348,17 +423,17 @@ npm run test:pgn:retest -- --session=continuous
 
 Continuous retests share context across selected scenarios, perform no final cleanup reset, and follow the full-restart-only recovery policy above. Retest approval, history, evidence requirements, and semantic evaluation rules are otherwise unchanged.
 
-Selected retests require Google Drive evidence to be configured. Parent-folder authentication and retest-folder creation are completed before WhatsApp opens; invalid or disabled Drive configuration aborts without sending a testcase message. Per-file upload failures after startup remain non-fatal and are recorded separately from chatbot technical status.
+Selected WhatsApp retests require Google Drive evidence to be configured. Parent-folder authentication and retest-folder creation are completed before WhatsApp opens; invalid or disabled Drive configuration aborts without sending a testcase message. Per-file upload failures after startup remain non-fatal and are recorded separately from chatbot technical status. REST retests instead require REST configuration/authentication, never Drive or browser prerequisites.
 
 ## Response Completion
 
-The runner identifies response ownership from the confirmed outgoing message ID, excludes pre-existing and outgoing messages, and captures every new incoming bubble in DOM order. After the first bubble, every new or updated bubble restarts `WHATSAPP_RESPONSE_IDLE_MS`, which defaults to 10000 ms. `WHATSAPP_RESPONSE_TIMEOUT_MS` is the hard response limit and defaults to 60000 ms. A visible `typing` or `mengetik` state holds and then restarts the quiet timer, but typing detection is only an additional signal.
+The WhatsApp transport identifies response ownership from the confirmed outgoing message ID, excludes pre-existing and outgoing messages, and captures every new incoming bubble in DOM order. After the first bubble, every new or updated bubble restarts `WHATSAPP_RESPONSE_IDLE_MS`, which defaults to 10000 ms. `WHATSAPP_RESPONSE_TIMEOUT_MS` is the hard response limit and defaults to 60000 ms. A visible `typing` or `mengetik` state holds and then restarts the quiet timer, but typing detection is only an additional signal. REST uses conversation-scoped polling and its own response/request timing configuration, not DOM or typing detection.
 
 `firstResponseMs` ends at the first captured bubble. `totalResponseMs` ends at the last captured bubble and excludes the final idle confirmation period. Each turn in a multi-turn scenario independently waits for complete response settlement before the next turn is sent.
 
 ## Session Modes
 
-WhatsApp Web is the only execution transport. Session Mode controls reset boundaries, not the transport, response timing, or the separate full/retest run classification. The default is **Isolated**. Select the mode per invocation, not through `.env` or another persistent setting:
+Transport and Session Mode are independent of the separate full/retest run classification. Session Mode controls WhatsApp reset boundaries or REST conversation boundaries, not response timing. The default is **Isolated** for both transports. Select the mode per invocation, not through `.env` or another persistent setting:
 
 ```bash
 npm run test:pgn:validate -- --session=isolated
@@ -370,6 +445,8 @@ npm run test:pgn -- --fast
 
 `--session=isolated` and `--session isolated` are equivalent; likewise for continuous. `--fast` is an alias for `--session=continuous`, not a shortcut around reset confirmation, response settlement, or evidence checks. Conflicting session flags are rejected. `test:pgn:validate` accepts only these session-related flags, rejects execution/recovery filters, and only describes the selected policy; it never opens WhatsApp or sends a reset.
 
+The WhatsApp policy is:
+
 | Policy | Isolated (Default) | Continuous (Opt-In) |
 | --- | --- | --- |
 | Initial reset and quiet drain | Required | Required |
@@ -380,9 +457,21 @@ npm run test:pgn -- --fast
 
 **Continuous Session Mode warning:** exactly one clean initial reset is required before the first scenario. There are no resets between scenarios and **no final reset**. All scenarios share the same bot conversation, so previous testcase context may influence later responses. Results are context-dependent, not independent testcase outcomes. This mode is useful for rapid development checks, exploratory testing, and context-stress testing, but is not recommended as the only final acceptance run.
 
+The REST policy is:
+
+| Policy | Isolated (Default) | Continuous (Opt-In) |
+| --- | --- | --- |
+| Conversation creation | Fresh conversation per scenario | One fresh initial conversation per run |
+| Multi-turn scenario | All turns use that scenario's conversation | All turns use the run's conversation |
+| Context across scenarios | Independent conversations | Shared across the whole selection |
+| Debug `reset` commands | Never | Never |
+| Interrupted-run recovery | New conversation; interrupted scenario starts at Turn 1 | Total restart with a new Run ID/conversation or abandon |
+
+**REST continuous warning:** one fresh initial conversation is created; all selected scenarios share it. Previous testcase context may influence later responses, so results are not independent testcase outcomes. There is no initial, between-scenario, or final debug reset. REST isolation comes from new conversations, not the Conversation Builder debug/reset facility.
+
 ### Reset Safety
 
-In isolated mode, independent scenarios are isolated with the deployed Conversation Builder debug command `reset`. Before every runnable scenario, including the first remaining scenario after isolated resume, the runner snapshots WhatsApp, sends `reset`, and waits only for a new incoming response containing `Session deleted`. Continuous mode uses this same contract exactly once at the beginning. `PGN_RESET_COMMAND`, `PGN_RESET_CONFIRMATION`, and `PGN_RESET_TIMEOUT_MS` configure the reset contract, not the session mode, and default to `reset`, `Session deleted`, and 30000 ms.
+This section applies only to WhatsApp. In isolated mode, independent scenarios are isolated with the deployed Conversation Builder debug command `reset`. Before every runnable scenario, including the first remaining scenario after isolated resume, the runner snapshots WhatsApp, sends `reset`, and waits only for a new incoming response containing `Session deleted`. Continuous mode uses this same contract exactly once at the beginning. `PGN_RESET_COMMAND`, `PGN_RESET_CONFIRMATION`, and `PGN_RESET_TIMEOUT_MS` configure the WhatsApp reset contract, not the session mode, and default to `reset`, `Session deleted`, and 30000 ms. REST never sends this debug command, including during recovery.
 
 After reset confirmation, the runner requires `POST_RESET_QUIET_MS` of silence, defaulting to 10000 ms. Any new or changed incoming message is recorded as `STALE_BOT` and restarts that timer, so it cannot be assigned to the next testcase. A visible typing state also holds the drain and restarts the quiet timer when it clears, but message arrival remains authoritative. Resets occur outside the scenario turn loop, so both modes retain context within a multi-turn scenario. In isolated mode, the next reset is attempted only after the completed scenario has been written and atomically saved, and a final reset and drain run after the last selected scenario. Continuous mode retains the initial reset/drain safety but skips all between-scenario and final cleanup resets.
 
@@ -390,6 +479,6 @@ Reset traffic never enters User Input, Bot Response, expected handling, or seman
 
 If the expected confirmation is not captured before the reset timeout, the runner saves a reset-failure screenshot and diagnostics, records the failed control attempt, saves the executed workbook, aborts all remaining scenarios, and exits non-zero. This fail-safe prevents results from being collected under uncertain bot context.
 
-Isolation depends on the deployed bot continuing to allow the Conversation Builder reset/debug command. LivePerson recommends disabling debug commands in production, so this deployment capability must remain enabled for the QA harness.
+WhatsApp isolation depends on the deployed bot continuing to allow the Conversation Builder reset/debug command. LivePerson recommends disabling debug commands in production, so this deployment capability must remain enabled for WhatsApp QA. REST isolation does not depend on debug commands.
 
 `CAPTURED`, `TIMEOUT`, `SEND_ERROR`, and `CHAT_ERROR` are technical states only. They are written to the transcript and technical failures are appended to Notes without replacing existing notes. They never produce a semantic Passed or Failed decision.

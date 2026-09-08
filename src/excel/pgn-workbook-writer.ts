@@ -58,7 +58,7 @@ const TABLE_CONTENT_TYPE =
 function ensureTranscriptWorksheet(workbook: ExcelJS.Workbook): Worksheet {
   const existing = workbook.getWorksheet(TRANSCRIPT_SHEET_NAME);
   if (existing) {
-    for (const field of ["evidenceUrl", "evidenceStatus", "transport", "sessionMode"] as const) {
+    for (const field of ["evidenceUrl", "evidenceStatus", "transport", "sessionMode", "conversationId", "dialogId"] as const) {
       ensureOptionalSchemaField(existing, field);
     }
     const role = fieldColumn(existing, "role");
@@ -80,7 +80,7 @@ function ensureTranscriptWorksheet(workbook: ExcelJS.Workbook): Worksheet {
   header.alignment = { vertical: "middle", wrapText: true };
   worksheet.views = [{ state: "frozen", ySplit: 1 }];
   const widths = [
-    24, 18, 28, 12, 9, 16, 70, 24, 20, 20, 18, 45, 55, 20, 24, 16, 18,
+    24, 18, 28, 12, 9, 16, 70, 24, 20, 20, 18, 45, 55, 20, 24, 16, 18, 38, 38,
   ];
   widths.forEach((width, index) => {
     worksheet.getColumn(index + 1).width = width;
@@ -333,6 +333,7 @@ function appendTranscriptRows(
 ): void {
   const common = {
     ...runExecutionContext(worksheet.workbook, runId),
+    conversationId: execution.conversationId ?? "", dialogId: execution.dialogId ?? "",
     runId, testCaseId: scenario.testCaseId, sheet: scenario.sheetName,
     excelRow: execution.turn.rowNumber, turn: execution.turn.turnNumber,
     status: execution.technicalStatus, error: execution.error ?? "",

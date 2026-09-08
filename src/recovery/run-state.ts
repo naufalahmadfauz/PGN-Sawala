@@ -68,6 +68,7 @@ export interface RecoveryRunState {
   transport?: ExecutionTransport;
   sessionResetAttempts?: number;
   restartedFromRunId?: string;
+  restTarget?: { accountId: string; skillId: string };
   status: RecoveryRunStatus;
   sourceWorkbookPath: string;
   sourceWorkbookHash: string;
@@ -376,6 +377,10 @@ function parseRecoveryState(value: unknown): RecoveryRunState {
     assertSafeRunId(candidate.restartedFromRunId);
     if (candidate.restartedFromRunId === candidate.runId) throw new Error("A restarted run must have a new Run ID");
   }
+  if (candidate.restTarget !== undefined && (
+    !candidate.restTarget || typeof candidate.restTarget.accountId !== "string" ||
+    typeof candidate.restTarget.skillId !== "string" || !/^[A-Za-z0-9_-]+$/.test(candidate.restTarget.accountId) || !/^\d+$/.test(candidate.restTarget.skillId)
+  )) throw new Error("Recovery REST target is invalid");
   if (candidate.mode !== "full" && candidate.mode !== "retest") {
     throw new Error("Recovery mode is invalid");
   }
@@ -897,6 +902,9 @@ export class RecoveryCheckpoint {
           readExecutionTransport(this.current.transport) !== readExecutionTransport(next.transport)) {
         throw new Error("A run's session mode and transport cannot be changed; start a new run");
       }
+      if (JSON.stringify(this.current.restTarget) !== JSON.stringify(next.restTarget)) {
+        throw new Error("A run's REST account and skill cannot be changed; start a new run");
+      }
       const paths = recoveryPaths(this.projectRoot, next.runId);
       await atomicWriteJson(paths.state!, next);
       this.current = next;
@@ -932,6 +940,7 @@ export async function initializeRecoveryCheckpoint(options: {
   sessionMode?: SessionMode;
   transport?: ExecutionTransport;
   restartedFromRunId?: string;
+  restTarget?: { accountId: string; skillId: string };
   sourceWorkbookPath: string;
   executedWorkbookPath: string;
   sourceWorkbookHash: string;
@@ -958,6 +967,7 @@ export async function initializeRecoveryCheckpoint(options: {
     transport: readExecutionTransport(options.transport),
     sessionResetAttempts: 0,
     ...(options.restartedFromRunId ? { restartedFromRunId: options.restartedFromRunId } : {}),
+    ...(options.restTarget ? { restTarget: options.restTarget } : {}),
     status: "PREPARING",
     sourceWorkbookPath: relative(options.sourceWorkbookPath),
     sourceWorkbookHash: options.sourceWorkbookHash,

@@ -14,7 +14,8 @@ export type EvidenceStatus =
   | "EVIDENCE_CAPTURE_ERROR"
   | "EVIDENCE_UPLOAD_ERROR"
   | "EVIDENCE_MISSING"
-  | "EVIDENCE_REQUIRES_RERUN";
+  | "EVIDENCE_REQUIRES_RERUN"
+  | "EVIDENCE_NOT_APPLICABLE";
 
 export type PgnSheetKind = "kb" | "negative";
 export type TechnicalStatus =
@@ -89,6 +90,8 @@ export interface ExecutedBotMessage {
 }
 
 export interface ExecutedTurn {
+  conversationId?: string;
+  dialogId?: string;
   turn: PgnTestTurn;
   technicalStatus: TechnicalStatus;
   sentAt?: Date;

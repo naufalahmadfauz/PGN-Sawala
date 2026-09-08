@@ -23,7 +23,8 @@ export type WorkbookField =
   | "retestedAt" | "newTechnicalStatus" | "newBotResponse" | "newResponseTime"
   | "newTestDate" | "newEvidenceUrl" | "historyKey" | "startedAt" | "state"
   | "selectedIds" | "finishedIds" | "updatedAt"
-  | "transport" | "sessionMode" | "sessionResetAttempts" | "restartedFromRunId";
+  | "transport" | "sessionMode" | "sessionResetAttempts" | "restartedFromRunId"
+  | "conversationId" | "dialogId" | "restResponseIdleMs" | "restResponseTimeoutMs" | "restPollIntervalMs";
 
 export interface WorksheetSchemaDefinition {
   id: string;
@@ -75,6 +76,7 @@ export const TRANSCRIPT_SCHEMA: WorksheetSchemaDefinition = {
     field("status", "Status"), field("error", "Error"), field("evidencePath", "Evidence Path"),
     field("evidenceUrl", "Evidence URL", false, true), field("evidenceStatus", "Evidence Status", false, true),
     field("transport", "Transport", false, true), field("sessionMode", "Session Mode", false, true),
+    field("conversationId", "Conversation ID", false, true), field("dialogId", "Dialog ID", false, true),
   ],
 };
 export const EVIDENCE_RUN_SCHEMA: WorksheetSchemaDefinition = {
@@ -119,6 +121,9 @@ export const RUN_CONFIGURATION_SCHEMA: WorksheetSchemaDefinition = {
   fields: [
     field("runId", "Run ID"), field("transport", "Transport"), field("sessionMode", "Session Mode"),
     field("sessionResetAttempts", "Session Reset Attempts"), field("restartedFromRunId", "Restarted From Run ID", false),
+    field("restResponseIdleMs", "REST Response Idle (ms)", false),
+    field("restResponseTimeoutMs", "REST Response Timeout (ms)", false),
+    field("restPollIntervalMs", "REST Poll Interval (ms)", false),
   ],
 };
 export const WORKBOOK_SCHEMAS = [KB_SCHEMA, NEGATIVE_SCHEMA, TRANSCRIPT_SCHEMA, EVIDENCE_RUN_SCHEMA, EVIDENCE_FILE_SCHEMA, RETEST_HISTORY_SCHEMA, RETEST_METADATA_SCHEMA, RUN_CONFIGURATION_SCHEMA];

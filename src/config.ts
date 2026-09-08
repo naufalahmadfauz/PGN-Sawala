@@ -1,4 +1,6 @@
 import path from "node:path";
+import { loadRestConfig, type LivePersonRestConfig } from "./rest/config";
+import type { ExecutionTransport } from "./session-mode";
 import {
   GOOGLE_SERVICE_ACCOUNT_SOURCES,
   type GoogleServiceAccountConfiguration,
@@ -16,6 +18,7 @@ export interface WhatsAppTarget {
 }
 
 export interface AppConfig {
+  livePersonRest?: LivePersonRestConfig;
   projectRoot: string;
   environmentFilePath: string;
   environmentFileLoaded: boolean;
@@ -225,6 +228,7 @@ function readTarget(environment: NodeJS.ProcessEnv): WhatsAppTarget | undefined 
 }
 
 export interface LoadConfigOptions {
+  transport?: ExecutionTransport;
   repositoryRoot?: string;
   environment?: NodeJS.ProcessEnv;
 }
@@ -235,7 +239,13 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
     repositoryRoot: projectRoot,
     values: options.environment,
   });
-  const environment = loadedEnvironment.values;
+  const environment = { ...loadedEnvironment.values };
+  if (options.transport === "rest") {
+    // Unused browser/evidence settings must not prevent a REST-only machine from running.
+    for (const key of Object.keys(environment)) {
+      if (/^(?:WHATSAPP_|PGN_WHATSAPP_|PGN_RESET_|GOOGLE_|LEGACY_EVIDENCE_|POST_RESET_)/.test(key)) delete environment[key];
+    }
+  }
   const artifactsDir = path.resolve(projectRoot, "artifacts");
   const profileDir = path.resolve(projectRoot, ".whatsapp-profile");
   const configuredProfile = environment.WHATSAPP_PROFILE_DIR?.trim();
@@ -380,6 +390,7 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
   }
 
   return {
+    livePersonRest: loadRestConfig(environment),
     projectRoot,
     environmentFilePath: loadedEnvironment.envFilePath,
     environmentFileLoaded: loadedEnvironment.envFileLoaded,

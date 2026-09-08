@@ -2,6 +2,7 @@ import path from "node:path";
 import { loadConfig } from "../config";
 import { REPOSITORY_ROOT } from "../environment";
 import { validateDiscordWebhook } from "../notifications/discord";
+import { parseCliOptions } from "../pgn-cli";
 import { runPgnWorkbook } from "../pgn-runner";
 import {
   loginWhatsApp,
@@ -13,6 +14,7 @@ import { validateEvidence } from "../../scripts/evidence-validate";
 import { prepareFreshPgnWorkbook } from "../../scripts/fresh-pgn";
 import { validatePgnWorkbook } from "../../scripts/validate-pgn-workbook";
 import { validateRetest } from "../../scripts/validate-retest";
+import { validateRest } from "../../scripts/validate-rest";
 import { runBrowserAction } from "./browser-runtime";
 import type { OperatorActions } from "./control-panel";
 import { collectDiagnostics, formatDiagnosticReport } from "./diagnostics";
@@ -40,6 +42,7 @@ const SAFE_TEST_FILES = [
   "scripts/response-collector.test.ts",
   "scripts/session-reset.test.ts",
   "scripts/session-mode.test.ts",
+  "scripts/rest.test.ts",
   "scripts/workbook-writer.test.ts",
   "scripts/config.test.ts",
   "scripts/retest.test.ts",
@@ -83,11 +86,14 @@ export function createDefaultActions(ui: OperatorUi): OperatorActions {
       const inspection = await inspectWorkbookMappings(config, redetect);
       ui.note(formatWorkbookMappings(inspection), "Workbook schema");
     },
-    inspectRecovery: () => discoverRecoveryRun(loadConfig().projectRoot),
-    validateRecovery: (runId) => validateRecoveryRun(loadConfig(), runId),
+    inspectRecovery: () => discoverRecoveryRun(REPOSITORY_ROOT),
+    validateRecovery: async (runId) => {
+      const { state } = await readRecoveryRun(REPOSITORY_ROOT, runId);
+      return validateRecoveryRun(loadConfig({ transport: state.transport }), runId);
+    },
     resumeRecovery: async (runId, acceptSourceDrift = false) => {
-      const config = loadConfig();
-      const { state } = await readRecoveryRun(config.projectRoot, runId);
+      const { state } = await readRecoveryRun(REPOSITORY_ROOT, runId);
+      const config = loadConfig({ transport: state.transport });
       assertRecoveryRunExecutable(state);
       const mode = state.mode;
       const entrypoint = mode === "retest" ? "retest-pgn.ts" : "run-pgn.ts";
@@ -96,6 +102,10 @@ export function createDefaultActions(ui: OperatorUi): OperatorActions {
         runId,
         ...(acceptSourceDrift ? ["--accept-source-drift"] : []),
       ];
+      if (state.transport === "rest") {
+        await runPgnWorkbook(["--transport=rest", ...args], mode);
+        return;
+      }
       await browserAction(
         entrypoint,
         args,
@@ -104,8 +114,8 @@ export function createDefaultActions(ui: OperatorUi): OperatorActions {
       );
     },
     restartRecovery: async (runId, acceptSourceDrift = false) => {
-      const config = loadConfig();
-      const { state } = await readRecoveryRun(config.projectRoot, runId);
+      const { state } = await readRecoveryRun(REPOSITORY_ROOT, runId);
+      const config = loadConfig({ transport: state.transport });
       assertRecoveryRunExecutable(state);
       const mode = state.mode;
       const args = [
@@ -113,6 +123,10 @@ export function createDefaultActions(ui: OperatorUi): OperatorActions {
         runId,
         ...(acceptSourceDrift ? ["--accept-source-drift"] : []),
       ];
+      if (state.transport === "rest") {
+        await runPgnWorkbook(["--transport=rest", ...args], mode);
+        return;
+      }
       await browserAction(
         mode === "retest" ? "retest-pgn.ts" : "run-pgn.ts",
         args,
@@ -120,15 +134,28 @@ export function createDefaultActions(ui: OperatorUi): OperatorActions {
         async () => (await inspectPgnExecution(args, mode, config)).browserRequired,
       );
     },
-    skipRecoveryScenario: (runId) => skipRecoveryScenario(loadConfig(), runId),
-    repairRecovery: (runId, strategy) =>
-      repairRecoveryProgress(loadConfig(), runId, strategy),
-    abandonRecovery: (runId) => abandonRecoveryRun(loadConfig(), runId),
+    skipRecoveryScenario: async (runId) => {
+      const { state } = await readRecoveryRun(REPOSITORY_ROOT, runId);
+      return skipRecoveryScenario(loadConfig({ transport: state.transport }), runId);
+    },
+    repairRecovery: async (runId, strategy) => {
+      const { state } = await readRecoveryRun(REPOSITORY_ROOT, runId);
+      return repairRecoveryProgress(loadConfig({ transport: state.transport }), runId, strategy);
+    },
+    abandonRecovery: async (runId) => {
+      const { state } = await readRecoveryRun(REPOSITORY_ROOT, runId);
+      return abandonRecoveryRun(loadConfig({ transport: state.transport }), runId);
+    },
     validatePgn: validatePgnWorkbook,
+    validateRest: (args) => validateRest(loadConfig({ transport: "rest" }), args),
     prepareFresh: prepareFreshPgnWorkbook,
     runPgn: async (args) => {
-      if (!(await ensureReviewedWorkbookMapping(ui, loadConfig()))) {
+      if (!(await ensureReviewedWorkbookMapping(ui, loadConfig({ transport: parseCliOptions(args).transport })))) {
         throw new Error("Workbook mapping review cancelled; no testcase was executed.");
+      }
+      if (parseCliOptions(args).transport === "rest") {
+        await runPgnWorkbook(args, "full");
+        return;
       }
       await browserAction(
         "run-pgn.ts",
@@ -141,8 +168,12 @@ export function createDefaultActions(ui: OperatorUi): OperatorActions {
     },
     validateRetest,
     runRetest: async (args) => {
-      if (!(await ensureReviewedWorkbookMapping(ui, loadConfig()))) {
+      if (!(await ensureReviewedWorkbookMapping(ui, loadConfig({ transport: parseCliOptions(args).transport })))) {
         throw new Error("Workbook mapping review cancelled; no testcase was executed.");
+      }
+      if (parseCliOptions(args).transport === "rest") {
+        await runPgnWorkbook(args, "retest");
+        return;
       }
       await browserAction(
         "retest-pgn.ts",

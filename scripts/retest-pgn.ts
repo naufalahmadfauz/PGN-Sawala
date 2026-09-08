@@ -3,8 +3,9 @@ import { runCliMain } from "../src/cli-entrypoint";
 import { runBrowserEntrypoint } from "../src/operator/browser-runtime";
 import { inspectPgnExecution } from "../src/operator/pgn-preflight";
 import { runPgnWorkbook } from "../src/pgn-runner";
+import { parseCliOptions } from "../src/pgn-cli";
 
-const config = loadConfig();
+const config = loadConfig({ transport: parseCliOptions(process.argv.slice(2)).transport });
 runCliMain(() =>
   runBrowserEntrypoint(
     () => runPgnWorkbook(process.argv.slice(2), "retest"),

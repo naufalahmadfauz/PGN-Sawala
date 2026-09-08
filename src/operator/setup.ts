@@ -1,7 +1,7 @@
 import { access, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import dotenv from "dotenv";
-import { loadConfig, normalizeGoogleDriveFolderId } from "../config";
+import { loadConfig, normalizeGoogleDriveFolderId, type AppConfig } from "../config";
 import { reviewWorkbookMapping } from "./workbook-configuration";
 import {
   resolveGoogleServiceAccount,
@@ -27,8 +27,25 @@ import {
 } from "./diagnostics";
 import { runInheritedCommand } from "./process";
 import type { OperatorUi } from "./ui";
+import { assertRestConfig } from "../rest/config";
+import { safeRestError } from "../rest/errors";
+import { LivePersonClient } from "../rest/liveperson-client";
+
+const REST_SETUP_KEYS = [
+  "LIVEPERSON_REST_ENABLED",
+  "LIVEPERSON_ACCOUNT_ID",
+  "LIVEPERSON_CLIENT_ID",
+  "LIVEPERSON_CLIENT_SECRET",
+  "LIVEPERSON_SKILL_ID",
+  "LIVEPERSON_SENTINEL_DOMAIN",
+  "LIVEPERSON_IDP_DOMAIN",
+  "LIVEPERSON_ASYNC_MESSAGING_DOMAIN",
+  "LIVEPERSON_MESSAGING_REST_DOMAIN",
+] as const;
+type RestSetupKey = (typeof REST_SETUP_KEYS)[number];
 
 const CONFIGURATION_KEYS = [
+  ...REST_SETUP_KEYS,
   "PGN_WHATSAPP_PHONE",
   "PGN_WHATSAPP_CHAT",
   "WHATSAPP_HEADLESS",
@@ -63,6 +80,7 @@ export interface DiscordSetupDependencies {
 }
 
 export interface SetupDependencies extends DiscordSetupDependencies {
+  validateRest?: (config: AppConfig) => Promise<void>;
   reviewWorkbookMapping?: () => Promise<boolean>;
   platform?: NodeJS.Platform;
   diagnose?: (checkDriveAccess: boolean) => Promise<DiagnosticReport>;
@@ -508,6 +526,54 @@ function cancelled(ui: OperatorUi): SetupResult {
   };
 }
 
+async function promptRestUpdates(
+  ui: OperatorUi,
+  fileValues: Record<string, string>,
+  environment: NodeJS.ProcessEnv,
+  processManaged: ReadonlySet<RestSetupKey>,
+): Promise<Record<string, string> | undefined> {
+  const updates: Record<string, string> = {};
+  let enabled = configuredBoolean("LIVEPERSON_REST_ENABLED", fileValues, environment, false);
+  if (processManaged.has("LIVEPERSON_REST_ENABLED")) {
+    ui.info("LivePerson REST enablement is managed by the process environment and was left unchanged.");
+  } else {
+    const answer = await ui.confirm({
+      message: "Enable LivePerson REST bulk testing? This does not change the default transport or start a conversation.",
+      initialValue: enabled,
+    });
+    if (answer === undefined) return undefined;
+    enabled = answer;
+    updates.LIVEPERSON_REST_ENABLED = String(enabled);
+  }
+  if (!enabled) return updates;
+
+  for (const name of REST_SETUP_KEYS) {
+    if (name === "LIVEPERSON_REST_ENABLED") continue;
+    if (processManaged.has(name)) {
+      ui.info(`${name} is managed by the process environment. Update its source or Codespaces Secret; the value remains hidden and unchanged.`);
+      continue;
+    }
+    const existing = configuredValue(name, fileValues, environment);
+    const secret = name === "LIVEPERSON_CLIENT_ID" || name === "LIVEPERSON_CLIENT_SECRET";
+    const optional = name.endsWith("_DOMAIN");
+    if (secret && existing) {
+      const keep = await ui.confirm({ message: `Keep the currently configured ${name}?`, initialValue: true });
+      if (keep === undefined) return undefined;
+      if (keep) continue;
+    }
+    const prompt = {
+      message: `${name}${optional ? " (optional; blank uses discovery/default routing)" : ""}`,
+      validate: (value: string) => optional || value.trim() ? undefined : `${name} must not be empty`,
+    };
+    const value = secret
+      ? await ui.secret({ ...prompt, mask: "*", clearOnError: true })
+      : await ui.text({ ...prompt, initialValue: existing || undefined });
+    if (value === undefined) return undefined;
+    updates[name] = value.trim();
+  }
+  return updates;
+}
+
 export async function runSetupWizard(
   ui: OperatorUi,
   dependencies: SetupDependencies = {},
@@ -528,6 +594,7 @@ export async function runSetupWizard(
         environment,
         checkDriveAccess,
         checkDiscordAccess: false,
+        checkRestAccess: false,
       }));
   const installChromium =
     dependencies.installChromium ??
@@ -553,6 +620,7 @@ export async function runSetupWizard(
   if (configure === undefined) return cancelled(ui);
 
   let environmentUpdated = false;
+  let restUpdates: Record<string, string> = {};
   if (configure) {
     const fileValues = await readEnvironmentValues(projectRoot);
     const updates: Record<string, string> = {};
@@ -744,6 +812,15 @@ export async function runSetupWizard(
     if (!discordUpdates) return cancelled(ui);
     Object.assign(updates, discordUpdates);
 
+    if (report.checks.some((check) => check.id === "liveperson-rest")) {
+      const prompted = await promptRestUpdates(ui, fileValues, environment, new Set(
+        REST_SETUP_KEYS.filter((name) => loadedEnvironment.sourceFor(name) === "process environment"),
+      ));
+      if (!prompted) return cancelled(ui);
+      restUpdates = prompted;
+      Object.assign(updates, restUpdates);
+    }
+
     await ui.task(
       "Writing .env safely",
       () => writeEnvironmentUpdates(projectRoot, updates),
@@ -769,7 +846,7 @@ export async function runSetupWizard(
     }
   }
   let chromiumInstalled = false;
-  if (!report.chromiumInstalled) {
+  if (report.transport !== "rest" && !report.chromiumInstalled) {
     const installChoice = await ui.select({
       message: "Playwright Chromium is missing. Install it now?",
       options: [
@@ -805,7 +882,7 @@ export async function runSetupWizard(
 
   report = await diagnose(true);
   let loginStarted = false;
-  if (!report.profilePresent && dependencies.loginWhatsApp) {
+  if (report.transport !== "rest" && !report.profilePresent && dependencies.loginWhatsApp) {
     const login = await ui.confirm({
       message: "Open WhatsApp login now?",
       initialValue: false,
@@ -815,6 +892,42 @@ export async function runSetupWizard(
       await dependencies.loginWhatsApp();
       loginStarted = true;
       report = await diagnose(true);
+    }
+  }
+  if (report.checks.some((check) => check.id === "liveperson-rest")) {
+    let restConfig: AppConfig["livePersonRest"];
+    try {
+      const config = loadConfig({ repositoryRoot: projectRoot, environment: { ...environment, ...restUpdates } });
+      restConfig = config.livePersonRest;
+      if (restConfig?.enabled) {
+        const validate = await ui.confirm({
+          message: "Validate LivePerson REST domains and authentication now? This makes real, harmless auth/domain requests only; no conversations, testcase messages, browser, screenshots, or Drive calls.",
+          initialValue: false,
+        });
+        if (validate === undefined) {
+          ui.cancel("Setup cancelled");
+          return { cancelled: true, environmentUpdated, chromiumInstalled, loginStarted };
+        }
+        if (validate) {
+          assertRestConfig(restConfig);
+          await ui.task("Validating LivePerson REST domains and authentication", () =>
+            dependencies.validateRest ? dependencies.validateRest(config) : new LivePersonClient(restConfig!).validate(),
+          "REST authentication validated; no conversation created");
+          report = { ...report, checks: report.checks.map((check) => check.id === "liveperson-rest" ? {
+            ...check, status: "ok", detail: "domains and authentication validated; no conversations or testcase messages",
+          } : check) };
+          report.ready = !report.checks.some((check) => check.status === "error");
+        }
+      }
+    } catch (error) {
+      const detail = safeRestError(error, restConfig?.clientSecret ?? "", restConfig?.clientId ?? "",
+        restUpdates.LIVEPERSON_CLIENT_SECRET ?? "", environment.LIVEPERSON_CLIENT_SECRET ?? "",
+        restUpdates.LIVEPERSON_CLIENT_ID ?? "", environment.LIVEPERSON_CLIENT_ID ?? "");
+      ui.warn(`REST validation did not pass: ${detail}`);
+      report = { ...report, checks: report.checks.map((check) => check.id === "liveperson-rest" ? {
+        ...check, status: report.transport === "rest" ? "error" : "warn", detail,
+      } : check) };
+      report.ready = !report.checks.some((check) => check.status === "error");
     }
   }
   ui.note(formatSetupChecklist(report), "Setup checklist");
@@ -834,8 +947,8 @@ export async function runSetupWizard(
       {
         value: "full-test",
         label: "Start full test",
-        hint: report.ready ? undefined : "Resolve setup issues first",
-        disabled: !report.ready,
+        hint: report.transport === "rest" ? "Choose REST Bulk Test from the main menu" : report.ready ? undefined : "Resolve setup issues first",
+        disabled: report.transport === "rest" || !report.ready,
       },
       { value: "exit", label: "Exit" },
     ],

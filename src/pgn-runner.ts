@@ -1,14 +1,12 @@
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Workbook } from "exceljs";
-import { loadConfig, requireTarget, type AppConfig } from "./config";
+import { loadConfig, type AppConfig } from "./config";
 import { loadPgnWorkbook } from "./excel/pgn-workbook-loader";
 import {
   appendLatestTurnExecution,
   applyScenarioResults,
-  appendPostResetDrainTranscript,
   appendRecoveryTranscriptEvent,
-  appendSessionResetTranscript,
   openExecutedPgnWorkbook,
   saveExecutedPgnWorkbook,
 } from "./excel/pgn-workbook-writer";
@@ -32,16 +30,13 @@ import { acquireWorkbookLock } from "./excel/workbook-lock";
 import type {
   ExecutedTurn,
   PgnTestScenario,
-  PgnTestTurn,
-  TechnicalStatus,
 } from "./excel/pgn-types";
-import type { BotSessionResetAttempt, SentMessage } from "./types";
-import {
-  createGoogleDriveEvidencePublisher,
-  type EvidenceDrivePublisher,
-} from "./evidence/google-drive";
 import { safeGoogleCredentialError } from "./evidence/google-service-account";
-import { evidenceFileName } from "./evidence/evidence-migration";
+import { evidenceFileName } from "./evidence/evidence-filename";
+import type { RunEvidenceContext } from "./transports/whatsapp";
+import type { TestTransport } from "./transports/test-transport";
+import { assertRestConfig } from "./rest/config";
+import { safeRestError, redactRestText } from "./rest/errors";
 import {
   createDiscordNotifier,
   registerDiscordInterruptionHandlers,
@@ -54,8 +49,8 @@ import {
 } from "./pgn-cli";
 import { selectScenarios } from "./pgn-selection";
 import {
-  CONTINUOUS_RECOVERY_WARNING, CONTINUOUS_SESSION_WARNING, readSessionMode,
-  sessionModeLabel, shouldResetBeforeScenario,
+  CONTINUOUS_RECOVERY_WARNING, continuousSessionWarning, readSessionMode,
+  readExecutionTransport, transportLabel, sessionModeLabel,
 } from "./session-mode";
 import { getRunConfiguration, upsertRunConfiguration } from "./excel/run-configuration";
 import {
@@ -84,260 +79,15 @@ import {
   type RecoveryRunState,
   type RunProcessLock,
 } from "./recovery/run-state";
-import { WhatsAppClient } from "./whatsapp/client";
-import {
-  BotSessionResetError,
-  resetBotSession,
-  waitForPostResetQuiet,
-} from "./whatsapp/session-reset";
 
 export type PgnExecutionMode = "full" | "retest";
-
-interface RunEvidenceContext {
-  publisher: EvidenceDrivePublisher;
-  folderId: string;
-}
 
 function createRunId(): string {
   return new Date().toISOString().replace(/[-:.]/g, "");
 }
 
-function safeFileName(value: string): string {
-  return value.replace(/[^a-zA-Z0-9_-]+/g, "-").slice(0, 80) || "test";
-}
-
 function relativeToProject(config: AppConfig, absolutePath: string): string {
   return path.relative(config.projectRoot, absolutePath).replaceAll(path.sep, "/");
-}
-
-async function saveFailureEvidence(
-  client: WhatsAppClient,
-  name: string,
-  config: AppConfig,
-): Promise<string | undefined> {
-  try {
-    const debug = await client.saveDebugArtifacts(name);
-    return relativeToProject(config, debug.screenshotPath);
-  } catch (error) {
-    console.error(
-      `[Debug] Could not save failure evidence: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    return undefined;
-  }
-}
-
-async function executeTurn(
-  client: WhatsAppClient,
-  config: AppConfig,
-  runId: string,
-  scenario: PgnTestScenario,
-  turn: PgnTestTurn,
-  driveEvidence?: RunEvidenceContext,
-): Promise<ExecutedTurn> {
-  const artifactKey = `${runId}-${safeFileName(scenario.testCaseId)}-turn-${turn.turnNumber}`;
-  let sentMessage: SentMessage | undefined;
-  try {
-    const baseline = await client.captureMessageState();
-    sentMessage = await client.sendMessage(turn.userInput, baseline);
-    let response;
-    try {
-      response = await client.waitForBotResponse(
-        baseline,
-        sentMessage,
-        `${scenario.testCaseId} Turn ${turn.turnNumber}`,
-      );
-    } catch (error) {
-      const completedAt = new Date();
-      const detail = error instanceof Error ? error.message : String(error);
-      return {
-        turn,
-        technicalStatus: "CHAT_ERROR",
-        sentAt: sentMessage.sentAt,
-        completedAt,
-        botMessages: [],
-        combinedResponse: "",
-        error: detail,
-        evidencePath: await saveFailureEvidence(
-          client,
-          `chat-error-${artifactKey}`,
-          config,
-        ),
-        evidenceStatus: "EVIDENCE_CAPTURE_ERROR",
-      };
-    }
-
-    const evidenceAbsolutePath = path.join(
-      config.evidenceDir,
-      `${artifactKey}.png`,
-    );
-    let evidencePath: string | undefined;
-    let evidenceUrl: string | undefined;
-    let evidenceStatus: ExecutedTurn["evidenceStatus"];
-    let evidenceDriveFileId: string | undefined;
-    let evidenceDriveFileName: string | undefined;
-    try {
-      await client.captureScreenshot(evidenceAbsolutePath);
-      evidencePath = relativeToProject(config, evidenceAbsolutePath);
-      evidenceStatus = driveEvidence
-        ? "EVIDENCE_PENDING"
-        : "EVIDENCE_LOCAL_ONLY";
-    } catch (error) {
-      evidenceStatus = "EVIDENCE_CAPTURE_ERROR";
-      console.error(
-        `[Evidence] Screenshot failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-    if (driveEvidence && evidencePath) {
-      try {
-        const uploaded = await driveEvidence.publisher.uploadPng({
-          folderId: driveEvidence.folderId,
-          localPath: evidenceAbsolutePath,
-          fileName: evidenceFileName(
-            scenario.testCaseId,
-            turn.turnNumber,
-          ),
-        });
-        evidenceUrl = uploaded.webViewLink;
-        evidenceDriveFileId = uploaded.id;
-        evidenceDriveFileName = uploaded.name;
-        evidenceStatus = "EVIDENCE_SYNCED";
-        console.log(`[Evidence] Uploaded ${uploaded.name}`);
-      } catch (error) {
-        evidenceStatus = "EVIDENCE_UPLOAD_ERROR";
-        console.error(
-          `[Evidence] EVIDENCE_UPLOAD_ERROR: ${safeGoogleCredentialError(error, config.googleServiceAccount?.value)}`,
-        );
-      }
-    }
-
-    const technicalStatus: TechnicalStatus = response.timedOut
-      ? "TIMEOUT"
-      : "CAPTURED";
-    const error = response.timedOut
-      ? `TIMEOUT after ${config.responseTimeoutMs} ms`
-      : undefined;
-    if (response.timedOut) {
-      evidencePath ??= await saveFailureEvidence(
-        client,
-        `response-timeout-${artifactKey}`,
-        config,
-      );
-    }
-    return {
-      turn,
-      technicalStatus,
-      sentAt: sentMessage.sentAt,
-      completedAt: response.completedAt,
-      botMessages: response.messages.map((message, index) => ({
-        sequence: index + 1,
-        message: message.text,
-        timestamp: message.observedAt,
-      })),
-      combinedResponse: response.combinedResponse,
-      firstResponseMs: response.firstResponseMs,
-      totalResponseMs: response.totalResponseMs,
-      error,
-      evidencePath,
-      evidenceUrl,
-      evidenceStatus,
-      evidenceDriveFileId,
-      evidenceDriveFileName,
-    };
-  } catch (error) {
-    const completedAt = new Date();
-    const detail = error instanceof Error ? error.message : String(error);
-    return {
-      turn,
-      technicalStatus: "SEND_ERROR",
-      sentAt: sentMessage?.sentAt,
-      completedAt,
-      botMessages: [],
-      combinedResponse: "",
-      error: detail,
-      evidencePath: await saveFailureEvidence(
-        client,
-        `send-error-${artifactKey}`,
-        config,
-      ),
-      evidenceStatus: "EVIDENCE_CAPTURE_ERROR",
-    };
-  }
-}
-
-function makeResetArtifactPathsRelative(
-  config: AppConfig,
-  attempt: BotSessionResetAttempt,
-): void {
-  if (attempt.evidencePath) {
-    attempt.evidencePath = relativeToProject(config, attempt.evidencePath);
-  }
-  if (attempt.diagnosticsPath) {
-    attempt.diagnosticsPath = relativeToProject(
-      config,
-      attempt.diagnosticsPath,
-    );
-  }
-}
-
-async function resetAndDrainSession(
-  client: WhatsAppClient,
-  config: AppConfig,
-  runId: string,
-  scenario: PgnTestScenario,
-  workbook: Workbook,
-  finalCleanup = false,
-): Promise<void> {
-  try {
-    const attempt = await resetBotSession(client, {
-      command: config.resetCommand,
-      confirmation: config.resetConfirmation,
-      timeoutMs: config.resetTimeoutMs,
-      failureArtifactName: `reset-failure-${safeFileName(scenario.testCaseId)}-${runId}`,
-    });
-    const drain = await waitForPostResetQuiet(client, {
-      baselineMessages:
-        attempt.messageStateAtCompletion ?? attempt.responseMessages,
-      quietMs: config.postResetQuietMs,
-    });
-    makeResetArtifactPathsRelative(config, attempt);
-    appendSessionResetTranscript(workbook, runId, scenario, attempt);
-    appendPostResetDrainTranscript(workbook, runId, scenario, drain);
-    await saveExecutedPgnWorkbook(workbook, config.pgnExecutedWorkbookPath);
-  } catch (error) {
-    if (!(error instanceof BotSessionResetError)) {
-      throw error;
-    }
-
-    makeResetArtifactPathsRelative(config, error.attempt);
-    appendSessionResetTranscript(workbook, runId, scenario, error.attempt);
-    await saveExecutedPgnWorkbook(workbook, config.pgnExecutedWorkbookPath);
-    if (error.attempt.evidencePath) {
-      console.error(
-        `[Session] Debug screenshot: ${error.attempt.evidencePath}`,
-      );
-    }
-    if (error.attempt.diagnosticsPath) {
-      console.error(
-        `[Session] Diagnostics: ${error.attempt.diagnosticsPath}`,
-      );
-    }
-    console.error("[Session] ABORTING TEST RUN");
-    console.error(
-      finalCleanup
-        ? "[Session] Reason: Unable to confirm final PGN bot session cleanup."
-        : "[Session] Reason: Unable to confirm clean PGN bot session before next scenario.",
-    );
-    console.error("[Session] Completed test results have been saved.");
-    if (!finalCleanup) {
-      console.error("[Session] Remaining scenarios were NOT executed.");
-    }
-    throw new Error(
-      finalCleanup
-        ? "Unable to confirm final PGN bot session cleanup."
-        : "Unable to confirm clean PGN bot session before next scenario.",
-      { cause: error },
-    );
-  }
 }
 
 function uniqueRetestRunId(workbook: Workbook, now: Date): string {
@@ -354,9 +104,10 @@ function uniqueRetestRunId(workbook: Workbook, now: Date): string {
 export async function runPgnWorkbook(
   args = process.argv.slice(2),
   mode: PgnExecutionMode = "full",
-  config = loadConfig(),
+  config?: AppConfig,
 ): Promise<void> {
   const options = parseCliOptions(args);
+  config ??= loadConfig({ transport: options.transport });
   assertResumeOptionsCompatible(options);
   let recoveryResume:
     | { state: RecoveryRunState; manifest: RecoveryRunManifest }
@@ -379,6 +130,9 @@ export async function runPgnWorkbook(
       }
       if (recoveryResume) {
         assertRecoveryRunExecutable(recoveryResume.state);
+        const storedTransport = readExecutionTransport(recoveryResume.state.transport);
+        if (options.transportExplicit && options.transport !== storedTransport) throw new Error("Transport conflicts with the stored run; recovery cannot change channels");
+        options.transport = storedTransport;
         const storedSessionMode = readSessionMode(recoveryResume.state.sessionMode);
         if (options.sessionModeExplicit && options.sessionMode !== storedSessionMode) {
           throw new Error("Session mode conflicts with the stored run; recovery cannot change isolation semantics");
@@ -435,6 +189,7 @@ export async function runPgnWorkbook(
       );
     }
 
+    if (options.transport === "rest") assertRestConfig(config.livePersonRest);
     const purpose = mode === "retest" ? "PGN retest runner" : "PGN test runner";
     const runProcessLock = await acquireRunProcessLock(
       config.projectRoot,
@@ -474,7 +229,7 @@ export async function runPgnWorkbook(
     }
   } catch (error) {
     throw new Error(
-      safeGoogleCredentialError(error, config.googleServiceAccount?.value),
+      safeGoogleCredentialError(options.transport === "rest" ? new Error(safeRestError(error, config.livePersonRest?.clientSecret)) : error, config.googleServiceAccount?.value),
       { cause: error },
     );
   }
@@ -493,7 +248,8 @@ async function runPgnWorkbookLocked(
   recoveryRestart?: { state: RecoveryRunState; manifest: RecoveryRunManifest },
 ): Promise<void> {
   const sessionMode = options.sessionMode;
-  const executionContext = { transport: "whatsapp" as const, sessionMode };
+  const transport = options.transport;
+  const executionContext = { transport, sessionMode };
   const source = await loadPgnWorkbook(config.pgnSourceWorkbookPath);
   assertPgnWorkbookValid(source.parsed);
   const executed = await openExecutedPgnWorkbook(
@@ -524,6 +280,7 @@ async function runPgnWorkbookLocked(
     if (options.resumeRunId && !resumedRun) {
       throw new Error(`Retest Run was not found: ${options.resumeRunId}`);
     }
+    if (resumedRun && readExecutionTransport(resumedRun.transport) !== transport) throw new Error("Transport conflicts with the stored retest; recovery cannot change channels");
     if (resumedRun && options.sessionModeExplicit && options.sessionMode !== readSessionMode(resumedRun.sessionMode)) {
       throw new Error("Session mode conflicts with the stored retest; recovery cannot change isolation semantics");
     }
@@ -575,7 +332,7 @@ async function runPgnWorkbookLocked(
         return;
       }
     }
-    if (!config.googleDriveEvidenceEnabled) {
+    if (transport === "whatsapp" && !config.googleDriveEvidenceEnabled) {
       throw new Error(
         "Retest mode requires Google Drive evidence. Configure Drive before launching the selected retests.",
       );
@@ -702,6 +459,7 @@ async function runPgnWorkbookLocked(
       mode,
       ...executionContext,
       restartedFromRunId: recoveryRestart?.state.runId,
+      ...(transport === "rest" ? { restTarget: { accountId: config.livePersonRest!.accountId!, skillId: config.livePersonRest!.skillId! } } : {}),
       sourceWorkbookPath: config.pgnSourceWorkbookPath,
       executedWorkbookPath: config.pgnExecutedWorkbookPath,
       sourceWorkbookHash: await hashFile(config.pgnSourceWorkbookPath),
@@ -726,6 +484,11 @@ async function runPgnWorkbookLocked(
   upsertRunConfiguration(executed.workbook, {
     runId, ...executionContext, sessionResetAttempts: recoverySnapshot.sessionResetAttempts ?? 0,
     restartedFromRunId: recoveryRestart?.state.runId,
+    ...(transport === "rest" ? {
+      restResponseIdleMs: config.livePersonRest!.responseIdleMs,
+      restResponseTimeoutMs: config.livePersonRest!.responseTimeoutMs,
+      restPollIntervalMs: config.livePersonRest!.pollIntervalMs,
+    } : {}),
   });
   if (recoveryRestart) {
     upsertRunConfiguration(executed.workbook, {
@@ -783,9 +546,10 @@ async function runPgnWorkbookLocked(
   console.log(
     `[Test] ${recoveryResume ? "Remaining" : "Selected"} ${selectedScenarios.length} scenario(s), ${selectedScenarios.reduce((count, scenario) => count + scenario.turns.length, 0)} turn(s)`,
   );
-  console.log(`[Test] Transport: WhatsApp; Session Mode: ${sessionModeLabel(sessionMode)}`);
-  if (sessionMode === "continuous") console.warn(CONTINUOUS_SESSION_WARNING);
-  else console.log(`[Session] Isolation enabled: send "${config.resetCommand}" and require "${config.resetConfirmation}" before every scenario`);
+  console.log(`[Test] Transport: ${transportLabel(transport)}; Session Mode: ${sessionModeLabel(sessionMode)}`);
+  if (sessionMode === "continuous") console.warn(continuousSessionWarning(transport));
+  else console.log(transport === "rest" ? "[Session] REST isolation: a new conversation for each scenario; no reset messages" : `[Session] Isolation enabled: send "${config.resetCommand}" and require "${config.resetConfirmation}" before every scenario`);
+  if (transport === "rest") console.log("[Evidence] Not applicable for REST transport; no screenshots or Drive folders");
 
   const initialRecoveryState = recoveryCheckpoint.snapshot();
   const notificationStartedAt = new Date(initialRecoveryState.startedAt);
@@ -807,7 +571,7 @@ async function runPgnWorkbookLocked(
       throw new Error(`Run interrupted by ${interruptionSignal}`);
     }
   };
-  const performSessionReset = async (scenario: PgnTestScenario, finalCleanup = false): Promise<void> => {
+  const recordSessionReset = async (): Promise<void> => {
     throwIfInterrupted();
     sessionResetAttempts += 1;
     await recoveryCheckpoint.update((state) => {
@@ -818,8 +582,6 @@ async function runPgnWorkbookLocked(
       ...getRunConfiguration(executed.workbook, runId)!, sessionResetAttempts,
     });
     throwIfInterrupted();
-    if (!activeClient) throw new Error("No active WhatsApp client is available for reset");
-    await resetAndDrainSession(activeClient, config, runId, scenario, executed.workbook, finalCleanup);
   };
   const notificationProgress = (updatedAt = new Date()): DiscordRunProgressEvent => ({
     sessionResetAttempts,
@@ -837,7 +599,7 @@ async function runPgnWorkbookLocked(
   let heartbeatTimer: NodeJS.Timeout | undefined;
   let heartbeatOperation: Promise<void> | undefined;
   let periodicProgress: Promise<void> | undefined;
-  let activeClient: WhatsAppClient | undefined;
+  let activeTransport: TestTransport | undefined;
   let interruptionSignal: "SIGINT" | "SIGTERM" | undefined;
   let resolveShutdownSettled!: () => void;
   const shutdownSettled = new Promise<void>((resolve) => {
@@ -914,7 +676,7 @@ async function runPgnWorkbookLocked(
           state.updatedAt = interruptedAt.toISOString();
           state.heartbeatAt = interruptedAt.toISOString();
         }),
-        activeClient?.close(),
+        activeTransport?.close(),
       ]);
     },
     notificationTimeoutMs: 5_000,
@@ -934,7 +696,7 @@ async function runPgnWorkbookLocked(
             remainingScenarios: selectedScenarios.length,
             interruptedScenarioId: initialRecoveryState.activeScenarioId,
             reusedDriveFolder: Boolean(initialRecoveryState.driveRunFolderId),
-            googleDriveEvidenceEnabled: config.googleDriveEvidenceEnabled,
+            googleDriveEvidenceEnabled: transport === "whatsapp" && config.googleDriveEvidenceEnabled,
             workbookPath: config.pgnExecutedWorkbookPath,
           })
         : notifier.runStarted({
@@ -943,7 +705,7 @@ async function runPgnWorkbookLocked(
             mode,
             selectedScenarios: initialRecoveryState.totalScenarios,
             startedAt: notificationStartedAt,
-            googleDriveEvidenceEnabled: config.googleDriveEvidenceEnabled,
+            googleDriveEvidenceEnabled: transport === "whatsapp" && config.googleDriveEvidenceEnabled,
             workbookPath: config.pgnExecutedWorkbookPath,
           }),
     );
@@ -962,7 +724,7 @@ async function runPgnWorkbookLocked(
       }, progressPollingIntervalMs);
       progressTimer.unref();
     }
-    failureStage = "preparing Google Drive evidence";
+    failureStage = transport === "rest" ? "preparing REST run metadata" : "preparing Google Drive evidence";
     let driveEvidence: RunEvidenceContext | undefined;
     const storedEvidenceRun = getEvidenceRunMetadata(executed.workbook, runId);
     const checkpointBeforeDrive = recoveryCheckpoint.snapshot();
@@ -970,7 +732,8 @@ async function runPgnWorkbookLocked(
       storedEvidenceRun?.folderId ?? checkpointBeforeDrive.driveRunFolderId ?? "";
     let driveFolderUrl =
       storedEvidenceRun?.folderUrl ?? checkpointBeforeDrive.driveRunFolderUrl ?? "";
-    if (config.googleDriveEvidenceEnabled) {
+    if (transport === "whatsapp" && config.googleDriveEvidenceEnabled) {
+      const { createGoogleDriveEvidencePublisher } = await import("./evidence/google-drive");
       const publisher = createGoogleDriveEvidencePublisher(config);
       const parent = await publisher.validateParentFolder();
       throwIfInterrupted();
@@ -996,7 +759,7 @@ async function runPgnWorkbookLocked(
         state.heartbeatAt = folderCheckpointAt.toISOString();
       });
     }
-    upsertEvidenceRunMetadata(executed.workbook, {
+    if (transport === "whatsapp") upsertEvidenceRunMetadata(executed.workbook, {
       runId,
       folderId: driveFolderId,
       folderUrl: driveFolderUrl,
@@ -1024,21 +787,19 @@ async function runPgnWorkbookLocked(
       state.heartbeatAt = metadataSavedAt.toISOString();
     });
     throwIfInterrupted();
-    const browserRequired =
+    const executionRequired =
       selectedScenarios.length > 0 ||
       !recoveryCheckpoint.snapshot().finalCleanupComplete;
-    if (browserRequired) {
-      const client = new WhatsAppClient(config, { handleProcessSignals: false });
-      activeClient = client;
+    if (executionRequired) {
+      const finalScenario = allRunScenarios.at(-1);
+      if (!finalScenario) throw new Error("No scenario is available for transport lifecycle initialization");
+      const client: TestTransport = transport === "rest"
+        ? new (await import("./transports/rest")).RestTransport(config.livePersonRest!, runId, sessionMode)
+        : new (await import("./transports/whatsapp")).WhatsAppTransport(config, runId, sessionMode, executed.workbook, finalScenario, recordSessionReset, throwIfInterrupted, driveEvidence);
+      activeTransport = client;
       try {
-        failureStage = "opening WhatsApp Web";
-        await client.open();
-        throwIfInterrupted();
-        failureStage = "authenticating WhatsApp Web";
-        await client.ensureAuthenticated({ allowQrLogin: false });
-        throwIfInterrupted();
-        failureStage = "opening the configured WhatsApp chat";
-        await client.openChat(requireTarget(config));
+        failureStage = `initializing ${transportLabel(transport)} transport`;
+        await client.initializeRun();
         throwIfInterrupted();
 
         for (
@@ -1096,10 +857,7 @@ async function runPgnWorkbookLocked(
               config.pgnExecutedWorkbookPath,
             );
           }
-          if (shouldResetBeforeScenario(sessionMode, scenarioIndex)) {
-            if (sessionMode === "continuous") console.log("[Session] Preparing one clean initial session for the continuous run");
-            await performSessionReset(scenario);
-          }
+          await client.beginScenario(scenario, scenarioIndex);
           throwIfInterrupted();
           console.log(
             `[Scenario] ${scenario.testCaseId} (${scenario.sheetName}, ${scenario.turns.length} turn(s))`,
@@ -1107,21 +865,15 @@ async function runPgnWorkbookLocked(
           failureStage = `executing scenario ${scenario.testCaseId}`;
           for (const turn of scenario.turns) {
             throwIfInterrupted();
-            console.log(`[Turn ${turn.turnNumber}] Sending: ${turn.userInput}`);
-            const execution = await executeTurn(
-              client,
-              config,
-              runId,
-              scenario,
-              turn,
-              driveEvidence,
-            );
+            console.log(`[Turn ${turn.turnNumber}] Sending: ${transport === "rest" ? redactRestText(turn.userInput, config.livePersonRest?.clientSecret) : turn.userInput}`);
+            const execution: ExecutedTurn = { ...await client.sendMessage(scenario, turn), turn };
             throwIfInterrupted();
             executions.push(execution);
             if (
               execution.evidenceStatus &&
               execution.evidenceStatus !== "EVIDENCE_CAPTURE_ERROR" &&
               execution.evidenceStatus !== "EVIDENCE_MISSING" &&
+              execution.evidenceStatus !== "EVIDENCE_NOT_APPLICABLE" &&
               execution.evidenceStatus !== "EVIDENCE_REQUIRES_RERUN"
             ) {
               evidenceCapturedCount += 1;
@@ -1132,7 +884,7 @@ async function runPgnWorkbookLocked(
             if (execution.evidenceStatus === "EVIDENCE_UPLOAD_ERROR") {
               evidenceUploadErrorCount += 1;
             }
-            upsertEvidenceFileMetadata(executed.workbook, {
+            if (transport === "whatsapp") upsertEvidenceFileMetadata(executed.workbook, {
               evidenceKey: `${runId}|${scenario.testCaseId}|${turn.turnNumber}`,
               runId,
               testCaseId: scenario.testCaseId,
@@ -1293,37 +1045,26 @@ async function runPgnWorkbookLocked(
             state.heartbeatAt = attemptFinishedAt.toISOString();
           });
           currentScenarioId = undefined;
+          await client.endScenario(scenario);
           requestProgressNotification();
         }
 
-        if (sessionMode === "continuous") {
-          await recoveryCheckpoint.update((state) => {
-            state.finalCleanupComplete = true;
-            state.workbookProgress = "Continuous run ended without a final reset";
-          });
-          workbookProgress = "Continuous run ended without a final reset";
-        } else if (!recoveryCheckpoint.snapshot().finalCleanupComplete) {
+        if (!recoveryCheckpoint.snapshot().finalCleanupComplete) {
           throwIfInterrupted();
-          failureStage = "performing final bot session cleanup";
-          const finalCleanupScenario = allRunScenarios.at(-1);
-          if (!finalCleanupScenario) {
-            throw new Error(
-              "Could not identify a scenario for final session cleanup",
-            );
-          }
-          await performSessionReset(finalCleanupScenario, true);
+          failureStage = `performing final ${transportLabel(transport)} cleanup`;
+          await client.finalizeRun();
           const cleanupAt = new Date();
           await recoveryCheckpoint.update((state) => {
             state.finalCleanupComplete = true;
-            state.workbookProgress = "Final bot session cleanup saved";
+            state.workbookProgress = transport === "rest" ? "REST conversations finalized" : sessionMode === "continuous" ? "Continuous run ended without a final reset" : "Final bot session cleanup saved";
             state.updatedAt = cleanupAt.toISOString();
             state.heartbeatAt = cleanupAt.toISOString();
           });
-          workbookProgress = "Final bot session cleanup saved";
+          workbookProgress = recoveryCheckpoint.snapshot().workbookProgress;
         }
       } finally {
         await client.close();
-        if (activeClient === client) activeClient = undefined;
+        if (activeTransport === client) activeTransport = undefined;
       }
     }
 
@@ -1359,12 +1100,12 @@ async function runPgnWorkbookLocked(
       console.log(`Timeout: ${timeoutCount}`);
       console.log(`Errors: ${errorCount}`);
       console.log(`Skipped by Status: ${skippedByStatusCount}`);
-      console.log(`Evidence Uploaded: ${evidenceUploadedCount}`);
+      console.log(transport === "rest" ? "Evidence: Not applicable for REST transport" : `Evidence Uploaded: ${evidenceUploadedCount}`);
       console.log(
         `Workbook: ${relativeToProject(config, config.pgnExecutedWorkbookPath)}`,
       );
       console.log(
-        `Evidence Folder: ${driveFolderUrl || driveFolderId || "LOCAL ONLY"}`,
+        `Evidence Folder: ${transport === "rest" ? "NOT APPLICABLE" : driveFolderUrl || driveFolderId || "LOCAL ONLY"}`,
       );
       console.log(`Awaiting Evaluation: ${awaitingEvaluationCount}`);
       if (retestRun.state === "IN_PROGRESS") {
@@ -1384,8 +1125,9 @@ async function runPgnWorkbookLocked(
       beforeCompletion.selectedScenarioIds.every((id) => resolvedIds.has(id)) &&
       beforeCompletion.finalCleanupComplete;
     const completedAt = new Date();
-    console.log(`[Summary] Transport: WhatsApp; Session Mode: ${sessionModeLabel(sessionMode)}`);
-    console.log(`[Summary] Session reset attempts: ${sessionResetAttempts}${sessionMode === "isolated" ? " (scenario resets plus final cleanup)" : " (initial only)"}`);
+    console.log(`[Summary] Transport: ${transportLabel(transport)}; Session Mode: ${sessionModeLabel(sessionMode)}`);
+    console.log(`[Summary] Selected: ${initialRecoveryState.totalScenarios}; Executed: ${executedCount}; Responses: ${capturedCount}; Timeouts: ${timeoutCount}; Technical errors: ${errorCount}`);
+    console.log(transport === "rest" ? "[Summary] Evidence: Not applicable for REST transport" : `[Summary] Session reset attempts: ${sessionResetAttempts}${sessionMode === "isolated" ? " (scenario resets plus final cleanup)" : " (initial only)"}`);
     console.log(`[Summary] Duration: ${Math.round((completedAt.getTime() - notificationStartedAt.getTime()) / 1000)} s`);
     appendRecoveryTranscriptEvent(executed.workbook, {
       runId,

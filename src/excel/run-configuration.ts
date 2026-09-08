@@ -1,11 +1,14 @@
 import type { Workbook } from "exceljs";
 import { readExecutionTransport, readSessionMode, type RunExecutionContext } from "../session-mode";
-import { RUN_CONFIGURATION_SCHEMA, ensureOwnedWorksheet, fieldCell, optionalFieldCell } from "./workbook-schema";
+import { RUN_CONFIGURATION_SCHEMA, ensureOwnedWorksheet, ensureOptionalSchemaField, fieldCell, optionalFieldCell } from "./workbook-schema";
 
 export interface RunConfiguration extends RunExecutionContext {
   runId: string;
   sessionResetAttempts: number;
   restartedFromRunId?: string;
+  restResponseIdleMs?: number;
+  restResponseTimeoutMs?: number;
+  restPollIntervalMs?: number;
 }
 
 export function getRunConfiguration(workbook: Workbook, runId: string): RunConfiguration | undefined {
@@ -21,6 +24,9 @@ export function getRunConfiguration(workbook: Workbook, runId: string): RunConfi
       transport: readExecutionTransport(fieldCell(sheet, row, "transport").text),
       sessionResetAttempts,
       restartedFromRunId: optionalFieldCell(sheet, row, "restartedFromRunId")?.text || undefined,
+      restResponseIdleMs: Number(optionalFieldCell(sheet, row, "restResponseIdleMs")?.value) || undefined,
+      restResponseTimeoutMs: Number(optionalFieldCell(sheet, row, "restResponseTimeoutMs")?.value) || undefined,
+      restPollIntervalMs: Number(optionalFieldCell(sheet, row, "restPollIntervalMs")?.value) || undefined,
     };
   }
   return undefined;
@@ -37,6 +43,9 @@ export function upsertRunConfiguration(workbook: Workbook, configuration: RunCon
     throw new Error("Run Configuration session mode and transport are immutable");
   }
   const sheet = ensureOwnedWorksheet(workbook, RUN_CONFIGURATION_SCHEMA);
+  if (configuration.transport === "rest") {
+    for (const name of ["restResponseIdleMs", "restResponseTimeoutMs", "restPollIntervalMs"] as const) ensureOptionalSchemaField(sheet, name);
+  }
   let row = sheet.rowCount + 1;
   for (let candidate = 2; candidate <= sheet.rowCount; candidate += 1) {
     if (fieldCell(sheet, candidate, "runId").text === configuration.runId) { row = candidate; break; }
@@ -47,6 +56,10 @@ export function upsertRunConfiguration(workbook: Workbook, configuration: RunCon
   fieldCell(sheet, row, "sessionResetAttempts").value = configuration.sessionResetAttempts;
   const parent = optionalFieldCell(sheet, row, "restartedFromRunId");
   if (parent) parent.value = configuration.restartedFromRunId ?? "";
+  for (const name of ["restResponseIdleMs", "restResponseTimeoutMs", "restPollIntervalMs"] as const) {
+    const cell = optionalFieldCell(sheet, row, name);
+    if (cell && configuration[name] !== undefined) cell.value = configuration[name]!;
+  }
 }
 
 export function runExecutionContext(workbook: Workbook, runId: string): RunExecutionContext {

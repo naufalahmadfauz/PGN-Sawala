@@ -1,6 +1,8 @@
 import path from "node:path";
 import {
   readSessionMode,
+  readExecutionTransport,
+  transportLabel,
   sessionModeLabel,
   type ExecutionTransport,
   type SessionMode,
@@ -527,7 +529,7 @@ function modeLabel(mode: DiscordRunMode): string {
 function sessionContextFields(run: DiscordRunStartedEvent): DiscordEmbedField[] {
   const sessionMode = readSessionMode(run.sessionMode);
   return [
-    { name: "Transport", value: "WhatsApp", inline: true },
+    { name: "Transport", value: transportLabel(readExecutionTransport(run.transport)), inline: true },
     { name: "Session Mode", value: sessionModeLabel(sessionMode), inline: true },
     { name: "Context isolation", value: sessionMode === "isolated" ? "Enabled" : "Disabled", inline: true },
   ];
@@ -634,8 +636,8 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
           inline: true,
         },
         {
-          name: "Google Drive Evidence",
-          value: event.googleDriveEvidenceEnabled ? "Enabled" : "Disabled",
+          name: event.transport === "rest" ? "Evidence" : "Google Drive Evidence",
+          value: event.transport === "rest" ? "Not applicable for REST" : event.googleDriveEvidenceEnabled ? "Enabled" : "Disabled",
           inline: true,
         },
         { name: "Started", value: localDateTime(event.startedAt), inline: true },
@@ -687,8 +689,8 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
           inline: true,
         },
         {
-          name: "Drive folder",
-          value: event.reusedDriveFolder ? "Reusing existing folder" : "Not created before interruption",
+          name: event.transport === "rest" ? "Recovery context" : "Drive folder",
+          value: event.transport === "rest" ? "New conversation; interrupted scenario restarts from Turn 1" : event.reusedDriveFolder ? "Reusing existing folder" : "Not created before interruption",
           inline: true,
         },
         { name: "Resumed", value: localDateTime(event.resumedAt), inline: true },
@@ -867,8 +869,8 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
           inline: true,
         },
         {
-          name: "Evidence uploaded",
-          value: String(event.evidenceUploaded),
+          name: run.transport === "rest" ? "Evidence" : "Evidence uploaded",
+          value: run.transport === "rest" ? "Not applicable for REST" : String(event.evidenceUploaded),
           inline: true,
         },
         {
@@ -922,16 +924,16 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
           inline: true,
         },
         {
-          name: "Evidence uploaded",
-          value: String(event.evidenceUploaded),
+          name: run.transport === "rest" ? "Evidence" : "Evidence uploaded",
+          value: run.transport === "rest" ? "Not applicable for REST" : String(event.evidenceUploaded),
           inline: true,
         },
-        {
+        ...(run.transport !== "rest" ? [{
           name: "Evidence upload errors",
           value: String(event.evidenceUploadErrors),
           inline: true,
-        },
-        ...(event.sessionResetAttempts !== undefined ? [{
+        }] : []),
+        ...(run.transport !== "rest" && event.sessionResetAttempts !== undefined ? [{
           name: "Session reset attempts",
           value: String(event.sessionResetAttempts),
           inline: true,
@@ -984,11 +986,11 @@ class FailOpenDiscordNotifier implements DiscordNotifier {
           inline: true,
         },
         {
-          name: "Evidence progress",
-          value: event.evidenceProgress,
+          name: run.transport === "rest" ? "Evidence" : "Evidence progress",
+          value: run.transport === "rest" ? "Not applicable for REST" : event.evidenceProgress,
           inline: true,
         },
-        ...(event.sessionResetAttempts !== undefined ? [{
+        ...(run.transport !== "rest" && event.sessionResetAttempts !== undefined ? [{
           name: "Session reset attempts",
           value: String(event.sessionResetAttempts),
           inline: true,
