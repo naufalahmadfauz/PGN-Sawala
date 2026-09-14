@@ -67,6 +67,7 @@ async function browserAction(
   const config = loadConfig();
   await runBrowserAction({
     headless: config.headless,
+    whatsappBrowserChannel: config.whatsappBrowserChannel,
     projectRoot: config.projectRoot,
     scriptPath: scriptPath(entrypoint),
     args,

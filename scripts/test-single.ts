@@ -28,6 +28,7 @@ const config = loadConfig();
 runCliMain(() =>
   runBrowserEntrypoint(runSingleTest, {
     headless: config.headless,
+    whatsappBrowserChannel: config.whatsappBrowserChannel,
     projectRoot: config.projectRoot,
   }),
 );

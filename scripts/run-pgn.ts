@@ -11,6 +11,7 @@ runCliMain(() =>
     () => runPgnWorkbook(process.argv.slice(2), "full"),
     {
       headless: config.headless,
+      whatsappBrowserChannel: config.whatsappBrowserChannel,
       projectRoot: config.projectRoot,
       browserRequired: async () =>
         (await inspectPgnExecution(process.argv.slice(2), "full", config))

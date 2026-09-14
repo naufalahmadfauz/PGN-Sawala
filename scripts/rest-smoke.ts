@@ -23,8 +23,8 @@ export async function restSmoke(config: AppConfig = loadConfig({ transport: "res
     await transport.finalizeRun();
     console.log(`Conversation: ${transport.pendingConversationCount ? "cleanup failed; operator follow-up required" : "closed"}`);
     if (transport.pendingConversationCount) throw new Error("REST smoke conversation cleanup failed; the response was preserved");
-    if (response.technicalStatus !== "CAPTURED") throw new Error("REST smoke did not capture a complete bot response");
-  } catch (error) { throw new Error(safeRestError(error, config.livePersonRest.clientSecret)); }
+    if (response.technicalStatus !== "CAPTURED") throw new Error(`REST smoke did not capture a complete bot response${response.error ? `: ${response.error}` : ""}`);
+  } catch (error) { throw new Error(transport.client.redact(error)); }
   finally { await transport.close(); }
 }
 

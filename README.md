@@ -119,6 +119,15 @@ All commands load the repository-root `.env` through the central configuration m
 
 For WhatsApp execution, configure either `PGN_WHATSAPP_PHONE` (international digits, without `+`) or `PGN_WHATSAPP_CHAT`. A phone number is preferred when both are present because the direct WhatsApp chat URL avoids ambiguous chat-name matches. The harness verifies the open conversation header against that target and confirms each outgoing WhatsApp message before collecting a response. REST does not require either setting.
 
+WhatsApp browser compatibility can be selected with `WHATSAPP_BROWSER_CHANNEL=chrome`. This launches branded Google Chrome through Playwright, which may be required when WhatsApp Web rejects the bundled Playwright Chromium build. If the setting is unset, the existing bundled Chromium behavior is preserved. When Chrome is explicitly selected, the runner fails clearly if it is unavailable rather than silently falling back:
+
+```bash
+npx playwright install --with-deps chrome
+WHATSAPP_BROWSER_CHANNEL=chrome npm run whatsapp:verify
+```
+
+Setup offers **Google Chrome (recommended)** or **Playwright Chromium** for WhatsApp. `npm run doctor` reports the selected channel and Chrome installation/version when Chrome is configured. REST transport ignores WhatsApp browser settings and does not inspect or require Chrome, Chromium, Playwright, Xvfb, or the WhatsApp profile.
+
 The authenticated profile is fixed at `.whatsapp-profile/`. Data files are restricted to `data/`, and generated reports are restricted to `reports/`. The profile, `.env`, `.secrets/`, service-account JSON files, QR images, evidence, diagnostics, and executed workbooks are gitignored. Treat the profile and credentials as secrets and do not share or commit them. Fresh-run preparation only archives and replaces generated test workbooks; it never removes `.env` or `.secrets/`.
 
 ### LivePerson REST
@@ -149,7 +158,7 @@ The client discovers `sentinel`, `idp`, `asyncMessagingEnt`, and `messagingRestA
 
 Conversation creation sends synthetic profile metadata followed by `cm.ConsumerRequestConversation` with the configured brand/skill, NORMAL TTR, and MESSAGING channel. Replies are correlated by request ID; a missing dialog ID is resolved by selecting the open MAIN dialog from conversation metadata. Text input uses `ms.PublishEvent` with `text/plain` ContentEvent. Cleanup uses `cm.UpdateConversationField` with ConversationStateField `CLOSE`; failures are reported without deleting captured results.
 
-Polling uses the Messaging REST messages endpoint with ascending sequence order and an inclusive `newerThanSequence` cursor advanced by one. A pre-send high-water mark and publish acknowledgement prevent old history from becoming a new answer. Consumer echoes, receipts, chat-state events, internal-audience messages, and duplicate sequences do not become bot text. Multiple bot/agent text messages are joined with blank lines; each new bot message restarts the idle window. Polling stops after a settled response or the hard deadline.
+Polling uses the Messaging REST messages endpoint with ascending sequence order and an inclusive `newerThanSequence` cursor at the last known sequence (zero for the initial read). Already-seen sequences are discarded locally; requesting a sequence beyond the latest stored message can return HTTP 400 instead of an empty page. A pre-send high-water mark and publish acknowledgement prevent old history from becoming a new answer. Consumer echoes, receipts, chat-state events, internal-audience messages, and duplicate sequences do not become bot text. Multiple bot/agent text messages are joined with blank lines; each new bot message restarts the idle window. Polling stops after a settled response or the hard deadline. Smoke failures include the sanitized underlying error after conversation cleanup.
 
 Retries are bounded to three attempts for safe auth/read/close requests and HTTP 429 rejections, with exponential backoff and Retry-After support. Excessive Retry-After waits fail rather than being shortened. Conversation creation and text publication are **not** retried after ambiguous network/5xx outcomes, because the operation may already have reached LivePerson; this avoids duplicate testcase messages. A response timeout or scenario-specific rejection is recorded and isolated bulk execution continues. Permanent authentication/permission failures, invalid global configuration/protocol responses, and exhausted infrastructure retries abort safely with a checkpoint. Cleanup warnings preserve results but can require operator follow-up in LivePerson.
 

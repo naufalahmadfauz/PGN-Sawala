@@ -96,6 +96,7 @@ export interface RecoveryValidation {
 }
 
 export interface RecoveryValidationDependencies {
+  checkWhatsAppBrowser?: (config: AppConfig) => Promise<void>;
   checkRestAccess?: boolean;
   restClient?: Pick<LivePersonClient, "validate">;
   checkDriveAccess?: boolean;
@@ -652,6 +653,14 @@ export async function validateRecoveryRun(
       { id: "discord", label: "Discord", status: "info", detail: "optional notifications; no notification sent by validation" },
     );
   } else {
+    if (config.whatsappBrowserChannel) {
+      try {
+        await (dependencies.checkWhatsAppBrowser ?? (await import("../whatsapp/browser")).assertWhatsAppBrowserAvailable)(config);
+        checks.push({ id: "whatsapp-browser", label: "Google Chrome", status: "ok", detail: "configured WhatsApp browser is installed; no browser launched" });
+      } catch (error) {
+        checks.push({ id: "whatsapp-browser", label: "Google Chrome", status: "error", detail: error instanceof Error ? error.message : "Configured WhatsApp browser is unavailable" });
+      }
+    }
     const profileEntries = dependencies.profileEntries ?? readdir;
     try {
       const entries = await profileEntries(config.profileDir);

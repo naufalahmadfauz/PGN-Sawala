@@ -146,6 +146,9 @@ class MockLivePerson {
     this.pending = this.pending.filter((event) => event.at > this.now || event.conversation !== item.id);
     const start = Number(url.searchParams.get("newerThanSequence"));
     assert.equal(url.searchParams.get("sortOrder"), "ASC");
+    // The live API rejects a filter beyond the latest stored sequence, even while
+    // the conversation is open and simply waiting for another message.
+    if (item.messages.length && start > Number(item.messages.at(-1)!.sequence)) return response({ error: "Invalid sequence filter" }, 400);
     const remaining = item.messages.filter((message) => Number(message.sequence) >= start);
     const data = remaining.slice(0, this.pageSize);
     return response({ data, links: remaining.length > data.length ? { next: "https://untrusted.invalid/do-not-follow" } : {} });
@@ -392,7 +395,7 @@ for (const route of ["create", "send"]) {
   }
 }
 
-test("pagination and inclusive sequence filtering never reread old bot answers or follow remote next links", async () => {
+test("overlapping pagination filters old messages and waits safely at the latest sequence", async () => {
   const api = new MockLivePerson(); api.pageSize = 2; api.sequenceStrings = true;
   const client = new LivePersonClient(config(), { fetch: api.fetch });
   const conversation = await client.createConversation(client.syntheticConsumer("RUN", "case"));
@@ -565,6 +568,34 @@ test("REST validation and explicit smoke use the real client contracts with mock
   await assert.rejects(access(fx.cfg.pgnExecutedWorkbookPath));
   await restSmoke(fx.cfg, "Halo", { fetch: fx.api.fetch, now: () => fx.api.now, sleep: fx.api.sleep });
   assert.equal(fx.api.conversations.size, 1); assert([...fx.api.conversations.values()][0].closed);
+});
+
+test("REST smoke reports the underlying polling failure and still closes the conversation", async (context) => {
+  const fx = await fixture(context);
+  fx.api.afterPublish = () => { fx.api.faults.set("messages", [400]); };
+  await assert.rejects(restSmoke(fx.cfg, "Halo", { fetch: fx.api.fetch, now: () => fx.api.now, sleep: fx.api.sleep }), (error: unknown) => {
+    assert(error instanceof Error);
+    assert.match(error.message, /REST smoke did not capture a complete bot response: LivePerson message polling failed \(HTTP 400\)/);
+    for (const secret of [SECRET, APP_TOKEN, CONSUMER_TOKEN]) assert.equal(error.message.includes(secret), false);
+    return true;
+  });
+  assert.equal(fx.api.calls.filter((call) => call.route === "send").length, 1);
+  assert([...fx.api.conversations.values()][0].closed);
+});
+
+test("REST smoke redacts cached credentials from unexpected failures before cleanup", async (context) => {
+  const fx = await fixture(context);
+  context.mock.method(RestTransport.prototype, "sendMessage", async function(this: RestTransport) {
+    const app = await this.client.applicationToken();
+    const consumer = await this.client.consumerToken(this.client.syntheticConsumer("RUN", "smoke-error"));
+    throw new Error(`Unexpected ${SECRET} ${app} ${consumer}`);
+  });
+  await assert.rejects(restSmoke(fx.cfg, "Halo", { fetch: fx.api.fetch }), (error: unknown) => {
+    assert(error instanceof Error); assert.match(error.message, /Unexpected/); assert.match(error.message, /\[REDACTED\]/);
+    for (const secret of [SECRET, APP_TOKEN, CONSUMER_TOKEN]) assert.equal(error.message.includes(secret), false);
+    return true;
+  });
+  assert([...fx.api.conversations.values()][0].closed);
 });
 
 for (const session of ["isolated", "continuous"] as const) {

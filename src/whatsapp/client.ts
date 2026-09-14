@@ -2,6 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { chromium, type BrowserContext, type Locator, type Page } from "playwright";
 import type { AppConfig, WhatsAppTarget } from "../config";
+import { assertWhatsAppBrowserAvailable, CHROME_NOT_INSTALLED, safeBrowserVersion, whatsappBrowserLabel } from "./browser";
 import type {
   MessageSnapshot,
   ResponseCapture,
@@ -53,6 +54,7 @@ export class WhatsAppClient {
   ) {}
 
   async open(): Promise<void> {
+    await assertWhatsAppBrowserAvailable(this.config);
     await Promise.all([
       mkdir(this.config.profileDir, { recursive: true }),
       mkdir(this.config.artifactsDir, { recursive: true }),
@@ -60,7 +62,7 @@ export class WhatsAppClient {
       mkdir(this.config.evidenceDir, { recursive: true }),
     ]);
 
-    console.log("[WhatsApp] Starting Chromium");
+    console.log(`[WhatsApp] Browser channel: ${whatsappBrowserLabel(this.config.whatsappBrowserChannel)}`);
     const launchOptions: NonNullable<
       Parameters<typeof chromium.launchPersistentContext>[1]
     > = {
@@ -71,8 +73,8 @@ export class WhatsAppClient {
       handleSIGINT: this.options.handleProcessSignals ?? true,
       handleSIGTERM: this.options.handleProcessSignals ?? true,
     };
-    if (this.config.browserChannel) {
-      launchOptions.channel = this.config.browserChannel;
+    if (this.config.whatsappBrowserChannel) {
+      launchOptions.channel = this.config.whatsappBrowserChannel;
     }
 
     try {
@@ -82,6 +84,9 @@ export class WhatsAppClient {
       );
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
+      if (this.config.whatsappBrowserChannel === "chrome" && /(?:distribution.*(?:not found|not installed)|executable.*doesn.t exist)/i.test(detail)) {
+        throw new Error(CHROME_NOT_INSTALLED);
+      }
       if (/ProcessSingleton|profile.*in use|SingletonLock/i.test(detail)) {
         throw new Error(
           "The .whatsapp-profile browser is already running. Stop the other WhatsApp harness process and retry.",
@@ -90,6 +95,8 @@ export class WhatsAppClient {
       }
       throw error;
     }
+
+    console.log(`[WhatsApp] Browser version: ${safeBrowserVersion(this.context.browser()?.version()) ?? "unknown"}`);
 
     const pages = this.context.pages();
     this.page =
@@ -127,7 +134,7 @@ export class WhatsAppClient {
       if (await this.hasUnsupportedBrowserMessage()) {
         await this.saveDebugArtifacts("unsupported-browser");
         throw new Error(
-          "WhatsApp rejected this Chromium build as unsupported. See artifacts/debug/unsupported-browser.png.",
+          `WhatsApp rejected ${whatsappBrowserLabel(this.config.whatsappBrowserChannel)} as unsupported.${this.config.whatsappBrowserChannel ? "" : " Try WHATSAPP_BROWSER_CHANNEL=chrome after installing Google Chrome."} See artifacts/debug/unsupported-browser.png.`,
         );
       }
 

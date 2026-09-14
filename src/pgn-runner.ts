@@ -409,6 +409,10 @@ async function runPgnWorkbookLocked(
     }
   }
 
+  if (transport === "whatsapp") {
+    await (await import("./whatsapp/browser")).assertWhatsAppBrowserAvailable(config);
+  }
+
   const sourceById = new Map(
     source.parsed.scenarios.map((scenario) => [scenario.testCaseId, scenario]),
   );
