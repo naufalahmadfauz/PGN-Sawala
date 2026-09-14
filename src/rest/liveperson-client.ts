@@ -286,7 +286,10 @@ export class LivePersonClient {
     const messages: RestMessage[] = [];
     let cursor = after;
     for (let page = 0; page < 100; page += 1) {
-      const query = new URLSearchParams({ newerThanSequence: String(cursor + 1), sortBy: "sequence", sortOrder: "ASC", limit: "100" });
+      // This filter is inclusive. Asking for the next, not-yet-stored sequence
+      // can return HTTP 400 while waiting for a reply. Overlap the known cursor
+      // and discard already-seen messages below, including across page boundaries.
+      const query = new URLSearchParams({ newerThanSequence: String(Math.max(0, cursor)), sortBy: "sequence", sortOrder: "ASC", limit: "100" });
       const response = object(await this.#authorized("messagingRestApiDomain",
         `/messaging/v1/conversations/${encodeURIComponent(conversation.conversationId)}/dialogs/${encodeURIComponent(conversation.dialogId)}/messages?${query}`,
         conversation.consumerId, { method: "GET" }, "message polling", { retrySafe: true, scenario: true, deadline },

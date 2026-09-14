@@ -579,6 +579,7 @@ test("first-time setup writes only prompted local configuration", async (context
     true,
     "phone",
     "+62 812 3456 7890",
+    "bundled",
     false,
     false,
     false,
@@ -602,6 +603,19 @@ test("first-time setup writes only prompted local configuration", async (context
   );
   assert.equal(ui.confirmPrompts[0].active, "Yes");
   assert.equal(ui.confirmPrompts[0].inactive, "No, keep current settings");
+});
+
+test("setup can select branded Google Chrome for WhatsApp", async (context) => {
+  const projectRoot = await mkdtemp(path.join(tmpdir(), "pgn-operator-chrome-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const ui = new ScriptedUi([true, "phone", "628123456789", "chrome", false, false, false, "exit"]);
+  const result = await runSetupWizard(ui, {
+    projectRoot,
+    environment: {},
+    diagnose: async () => diagnosticReport(),
+  });
+  assert.equal(result.environmentUpdated, true);
+  assert.match(await readFile(path.join(projectRoot, ".env"), "utf8"), /WHATSAPP_BROWSER_CHANNEL=chrome/);
 });
 
 test("REST setup opts in with masked credentials and no implicit authentication", async (context) => {
@@ -717,7 +731,7 @@ test("existing setup preserves comments and unrelated secret fields", async (con
     path.join(projectRoot, ".env"),
     `# retained comment\nUNRELATED_SECRET=${fixtureSecret}\nPGN_WHATSAPP_CHAT=Existing chat\nWHATSAPP_HEADLESS=false\nGOOGLE_DRIVE_EVIDENCE_ENABLED=false\n`,
   );
-  const ui = new ScriptedUi([true, "keep", true, false, false, "exit"]);
+  const ui = new ScriptedUi([true, "keep", "bundled", true, false, false, "exit"]);
   await runSetupWizard(ui, {
     projectRoot,
     environment: {},

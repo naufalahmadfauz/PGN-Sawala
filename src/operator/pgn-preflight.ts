@@ -85,6 +85,12 @@ export async function inspectPgnExecution(
   assertPgnWorkbookValid(loaded.parsed);
   if (options.transport === "rest") assertRestConfig(config.livePersonRest);
 
+  const readiness = async (selectedCount: number, finalCleanupOnly = false): Promise<PgnExecutionPreflight> => {
+    const browserRequired = options.transport === "whatsapp" && (selectedCount > 0 || finalCleanupOnly);
+    if (browserRequired) await (await import("../whatsapp/browser")).assertWhatsAppBrowserAvailable(config);
+    return { browserRequired, selectedCount, finalCleanupOnly };
+  };
+
   if (resumedState) {
     const selected = options.restartRunId
       ? resumedState.selectedScenarioIds.map((id) => {
@@ -95,11 +101,7 @@ export async function inspectPgnExecution(
       : selectRecoveryScenarios(loaded.parsed.scenarios, resumedState);
     const finalCleanupOnly =
       selected.length === 0 && !resumedState.finalCleanupComplete;
-    return {
-      browserRequired: options.transport === "whatsapp" && (selected.length > 0 || finalCleanupOnly),
-      selectedCount: selected.length,
-      finalCleanupOnly,
-    };
+    return readiness(selected.length, finalCleanupOnly);
   }
 
   if (mode === "full") {
@@ -108,11 +110,7 @@ export async function inspectPgnExecution(
       options,
       loaded.workbook,
     );
-    return {
-      browserRequired: options.transport === "whatsapp" && selection.runnable.length > 0,
-      selectedCount: selection.runnable.length,
-      finalCleanupOnly: false,
-    };
+    return readiness(selection.runnable.length);
   }
 
   const resumedRun = options.resumeRunId
@@ -137,9 +135,5 @@ export async function inspectPgnExecution(
     resumedRun,
     selection.selected.length,
   );
-  return {
-    browserRequired: options.transport === "whatsapp" && (selection.selected.length > 0 || finalCleanupOnly),
-    selectedCount: selection.selected.length,
-    finalCleanupOnly,
-  };
+  return readiness(selection.selected.length, finalCleanupOnly);
 }

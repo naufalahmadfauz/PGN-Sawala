@@ -297,7 +297,7 @@ test("zero-candidate retest command exits before WhatsApp startup", async (conte
         ),
         PGN_WHATSAPP_CHAT: "",
         PGN_WHATSAPP_PHONE: "",
-        WHATSAPP_BROWSER_CHANNEL: "invalid-if-opened",
+        WHATSAPP_BROWSER_CHANNEL: "chrome",
       },
       timeout: 30_000,
     },

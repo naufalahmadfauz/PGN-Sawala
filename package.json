@@ -19,6 +19,7 @@
     "whatsapp:login": "tsx scripts/whatsapp-login.ts",
     "whatsapp:verify": "tsx scripts/whatsapp-verify.ts",
     "test:single": "tsx scripts/test-single.ts",
+    "test:whatsapp-browser": "tsx --test scripts/whatsapp-browser.test.ts",
     "test:pgn": "tsx scripts/run-pgn.ts",
     "test:pgn:rest": "tsx scripts/run-pgn-rest.ts",
     "test:pgn:rest:validate": "tsx scripts/validate-rest.ts",

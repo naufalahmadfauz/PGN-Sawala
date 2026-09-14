@@ -30,6 +30,7 @@ import type { OperatorUi } from "./ui";
 import { assertRestConfig } from "../rest/config";
 import { safeRestError } from "../rest/errors";
 import { LivePersonClient } from "../rest/liveperson-client";
+import { CHROME_NOT_INSTALLED } from "../whatsapp/browser";
 
 const REST_SETUP_KEYS = [
   "LIVEPERSON_REST_ENABLED",
@@ -49,6 +50,7 @@ const CONFIGURATION_KEYS = [
   "PGN_WHATSAPP_PHONE",
   "PGN_WHATSAPP_CHAT",
   "WHATSAPP_HEADLESS",
+  "WHATSAPP_BROWSER_CHANNEL",
   "GOOGLE_DRIVE_EVIDENCE_ENABLED",
   "GOOGLE_DRIVE_EVIDENCE_PARENT_FOLDER",
   "GOOGLE_SERVICE_ACCOUNT_JSON",
@@ -85,6 +87,7 @@ export interface SetupDependencies extends DiscordSetupDependencies {
   platform?: NodeJS.Platform;
   diagnose?: (checkDriveAccess: boolean) => Promise<DiagnosticReport>;
   installChromium?: (withDependencies: boolean) => Promise<void>;
+  installChrome?: (withDependencies: boolean) => Promise<void>;
   loginWhatsApp?: () => Promise<void>;
   validateCredentialFile?: (
     projectRoot: string,
@@ -96,6 +99,7 @@ export interface SetupResult {
   cancelled: boolean;
   environmentUpdated: boolean;
   chromiumInstalled: boolean;
+  chromeInstalled?: boolean;
   loginStarted: boolean;
   nextAction?: SetupNextAction;
 }
@@ -195,9 +199,10 @@ async function defaultValidateCredentialFile(
   resolveGoogleServiceAccount(configuration);
 }
 
-export async function installPlaywrightChromium(
+export async function installPlaywrightBrowser(
   projectRoot: string,
   withDependencies: boolean,
+  browser: "chromium" | "chrome",
 ): Promise<void> {
   const cliPath = path.join(projectRoot, "node_modules", "playwright", "cli.js");
   await access(cliPath);
@@ -207,10 +212,14 @@ export async function installPlaywrightChromium(
       cliPath,
       "install",
       ...(withDependencies ? ["--with-deps"] : []),
-      "chromium",
+      browser,
     ],
     { cwd: projectRoot },
   );
+}
+
+export function installPlaywrightChromium(projectRoot: string, withDependencies: boolean): Promise<void> {
+  return installPlaywrightBrowser(projectRoot, withDependencies, "chromium");
 }
 
 function configuredValue(
@@ -600,6 +609,7 @@ export async function runSetupWizard(
     dependencies.installChromium ??
     ((withDependencies: boolean) =>
       installPlaywrightChromium(projectRoot, withDependencies));
+  const installChrome = dependencies.installChrome ?? ((withDependencies: boolean) => installPlaywrightBrowser(projectRoot, withDependencies, "chrome"));
   const validateCredentialFile =
     dependencies.validateCredentialFile ?? defaultValidateCredentialFile;
 
@@ -684,11 +694,32 @@ export async function runSetupWizard(
       updates.PGN_WHATSAPP_PHONE = "";
     }
 
+    if (report.transport !== "rest" && target !== "skip") {
+      if (loadedEnvironment.sourceFor("WHATSAPP_BROWSER_CHANNEL") === "process environment") {
+        ui.info("The WhatsApp browser channel is managed by the process environment. Update that environment or Codespaces Secret to change it.");
+      } else {
+        if (platform === "linux") ui.info("Google Chrome is recommended for WhatsApp Web compatibility on Linux/Codespaces; WhatsApp may reject the bundled Chromium distribution.");
+        const browser = await ui.select({
+          message: "Browser for WhatsApp",
+          options: [
+            { value: "chrome" as const, label: "Google Chrome (recommended)" },
+            { value: "bundled" as const, label: "Playwright Chromium" },
+          ],
+          initialValue: Object.hasOwn(fileValues, "WHATSAPP_BROWSER_CHANNEL") && !fileValues.WHATSAPP_BROWSER_CHANNEL.trim() ? "bundled" : "chrome",
+        });
+        if (browser === undefined) return cancelled(ui);
+        updates.WHATSAPP_BROWSER_CHANNEL = browser === "chrome" ? "chrome" : "";
+        if (browser === "chrome") {
+          ui.info("Google Chrome will be used for WhatsApp Web; setup will verify it before login or execution.");
+        }
+      }
+    }
+
     const currentHeadless = /^(?:true|1)$/i.test(
       configuredValue("WHATSAPP_HEADLESS", fileValues, environment),
     );
     const headless = await ui.confirm({
-      message: "Run Chromium headless?",
+      message: "Run the WhatsApp browser headless?",
       initialValue: currentHeadless,
     });
     if (headless === undefined) return cancelled(ui);
@@ -832,6 +863,9 @@ export async function runSetupWizard(
     ) {
       synchronizeEnvironmentFileUpdates(updates);
     }
+    if (Object.hasOwn(updates, "WHATSAPP_BROWSER_CHANNEL") && loadedEnvironment.sourceFor("WHATSAPP_BROWSER_CHANNEL") !== "process environment") {
+      environment.WHATSAPP_BROWSER_CHANNEL = updates.WHATSAPP_BROWSER_CHANNEL;
+    }
     environmentUpdated = true;
     ui.success("Configuration saved without exposing credential values.");
   }
@@ -846,16 +880,20 @@ export async function runSetupWizard(
     }
   }
   let chromiumInstalled = false;
-  if (report.transport !== "rest" && !report.chromiumInstalled) {
+  let chromeInstalled = false;
+  const chromeSelected = report.whatsappBrowserChannel === "chrome";
+  if (report.transport !== "rest" && !(chromeSelected ? report.chromeInstalled : report.chromiumInstalled)) {
+    const browserName = chromeSelected ? "Google Chrome" : "Playwright Chromium";
+    const installName = chromeSelected ? "Chrome" : "Chromium";
     const installChoice = await ui.select({
-      message: "Playwright Chromium is missing. Install it now?",
+      message: `${browserName} is missing. Install it now?`,
       options: [
-        { value: "browser" as const, label: "Install Chromium" },
+        { value: "browser" as const, label: `Install ${installName}` },
         ...(platform === "linux"
           ? [
               {
                 value: "dependencies" as const,
-                label: "Install Chromium + OS deps",
+                label: `Install ${installName} + OS deps`,
                 hint: "Runs playwright install --with-deps",
               },
             ]
@@ -868,21 +906,25 @@ export async function runSetupWizard(
     if (installChoice !== "skip") {
       const withDependencies = installChoice === "dependencies";
       ui.note(
-        `npx playwright install${withDependencies ? " --with-deps" : ""} chromium`,
+        `npx playwright install${withDependencies ? " --with-deps" : ""} ${chromeSelected ? "chrome" : "chromium"}`,
         "Install command",
       );
       await ui.task(
-        "Installing Playwright Chromium",
-        () => installChromium(withDependencies),
-        "Playwright Chromium installed",
+        `Installing ${browserName}`,
+        () => (chromeSelected ? installChrome : installChromium)(withDependencies),
+        `${browserName} installed`,
       );
-      chromiumInstalled = true;
+      if (chromeSelected) chromeInstalled = true;
+      else chromiumInstalled = true;
+    } else if (chromeSelected) {
+      ui.warn(CHROME_NOT_INSTALLED);
     }
   }
 
   report = await diagnose(true);
   let loginStarted = false;
-  if (report.transport !== "rest" && !report.profilePresent && dependencies.loginWhatsApp) {
+  const browserInstalled = report.whatsappBrowserChannel === "chrome" ? report.chromeInstalled : report.chromiumInstalled;
+  if (report.transport !== "rest" && browserInstalled && !report.profilePresent && dependencies.loginWhatsApp) {
     const login = await ui.confirm({
       message: "Open WhatsApp login now?",
       initialValue: false,
@@ -897,7 +939,7 @@ export async function runSetupWizard(
   if (report.checks.some((check) => check.id === "liveperson-rest")) {
     let restConfig: AppConfig["livePersonRest"];
     try {
-      const config = loadConfig({ repositoryRoot: projectRoot, environment: { ...environment, ...restUpdates } });
+      const config = loadConfig({ repositoryRoot: projectRoot, environment: { ...environment, ...restUpdates }, transport: "rest" });
       restConfig = config.livePersonRest;
       if (restConfig?.enabled) {
         const validate = await ui.confirm({
@@ -958,6 +1000,7 @@ export async function runSetupWizard(
     cancelled: false,
     environmentUpdated,
     chromiumInstalled,
+    chromeInstalled,
     loginStarted,
     nextAction: nextAction ?? "exit",
   };

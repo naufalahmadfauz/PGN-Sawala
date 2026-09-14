@@ -17,6 +17,15 @@ export interface WhatsAppTarget {
   value: string;
 }
 
+export type WhatsAppBrowserChannel = "chrome";
+
+export function readWhatsAppBrowserChannel(value: string | undefined): WhatsAppBrowserChannel | undefined {
+  const channel = value?.trim();
+  if (!channel) return undefined;
+  if (channel === "chrome") return channel;
+  throw new Error("WHATSAPP_BROWSER_CHANNEL must be chrome or empty for bundled Chromium");
+}
+
 export interface AppConfig {
   livePersonRest?: LivePersonRestConfig;
   projectRoot: string;
@@ -44,7 +53,7 @@ export interface AppConfig {
   postResetQuietMs: number;
   betweenTestsMs: number;
   headless: boolean;
-  browserChannel?: string;
+  whatsappBrowserChannel?: WhatsAppBrowserChannel;
   googleDriveEvidenceEnabled: boolean;
   googleDriveEvidenceParentFolderId?: string;
   googleDriveEvidenceFolderPrefix: string;
@@ -445,8 +454,9 @@ export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
       0,
     ),
     headless: booleanFromEnvironment(environment, "WHATSAPP_HEADLESS", false),
-    browserChannel:
-      environment.WHATSAPP_BROWSER_CHANNEL?.trim() || undefined,
+    whatsappBrowserChannel: options.transport === "rest"
+      ? undefined
+      : readWhatsAppBrowserChannel(environment.WHATSAPP_BROWSER_CHANNEL),
     googleDriveEvidenceEnabled,
     googleDriveEvidenceParentFolderId: configuredDriveParent
       ? normalizeGoogleDriveFolderId(configuredDriveParent)

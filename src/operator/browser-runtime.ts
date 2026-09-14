@@ -1,5 +1,6 @@
 import path from "node:path";
 import { commandAvailable, runInheritedCommand } from "./process";
+import type { WhatsAppBrowserChannel } from "../config";
 
 export type BrowserRuntimeMode = "direct" | "xvfb" | "unavailable";
 
@@ -83,6 +84,8 @@ export async function detectBrowserRuntime(
 }
 
 interface BrowserActionOptions extends DetectBrowserRuntimeOptions {
+  whatsappBrowserChannel?: WhatsAppBrowserChannel;
+  checkBrowserAvailability?: () => Promise<void>;
   scriptPath: string;
   args?: readonly string[];
   projectRoot: string;
@@ -97,6 +100,10 @@ export async function runBrowserAction(
   if (options.browserRequired && !(await options.browserRequired())) {
     await options.direct();
     return;
+  }
+  if (options.whatsappBrowserChannel) {
+    if (options.checkBrowserAvailability) await options.checkBrowserAvailability();
+    else await (await import("../whatsapp/browser")).assertWhatsAppBrowserAvailable(options, options);
   }
   const runtime = await detectBrowserRuntime(options);
   if (runtime.mode === "direct") {

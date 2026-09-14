@@ -1,0 +1,66 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "explabs": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Experiential Labs",
+      "options": {
+        "baseURL": "https://api.experientiallabs.ai/v1",
+        "apiKey": "xpl_3b911c63a1c6240cd74b3b9f202daa5c167296b9"
+      },
+      "models": {
+        "muse-spark-1.3-contributor": {
+          "name": "muse-spark-1.3-contributor",
+          "limit": {
+            "context": 1048576,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0.1,
+            "output": 0.2
+          }
+        },
+        "gpt-5-mini": {
+          "name": "gpt-5-mini",
+          "limit": {
+            "context": 400000,
+            "output": 128000
+          },
+          "cost": {
+            "input": 0.61,
+            "output": 2.94
+          }
+        },
+        "claude-sonnet-4.5": {
+          "name": "claude-sonnet-4.5",
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          },
+          "cost": {
+            "input": 0.61,
+            "output": 2.94
+          }
+        },
+        "gpt-6-astra": {
+          "name": "gpt-6-astra",
+          "limit": {
+            "context": 1050000,
+            "output": 128000
+          },
+          "cost": {
+            "input": 10.0,
+            "output": 50.0
+          }
+        },
+        "gpt-5.6-luna": {
+          "name": "gpt-5.6-luna",
+          "limit": {
+            "context": 1050000,
+            "output": 128000
+          }
+        }
+      }
+    }
+  }
+}

@@ -7,6 +7,7 @@ const config = loadConfig();
 runCliMain(() =>
   runBrowserEntrypoint(() => verifyWhatsApp(config), {
     headless: config.headless,
+    whatsappBrowserChannel: config.whatsappBrowserChannel,
     projectRoot: config.projectRoot,
   }),
 );

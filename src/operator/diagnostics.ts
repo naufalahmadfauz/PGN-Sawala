@@ -1,6 +1,7 @@
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
-import { loadConfig, type AppConfig } from "../config";
+import { loadConfig, type AppConfig, type WhatsAppBrowserChannel } from "../config";
+import { CHROME_NOT_INSTALLED, inspectGoogleChrome, safeBrowserVersion, type ChromeInstallation } from "../whatsapp/browser";
 import { createGoogleDriveEvidencePublisher } from "../evidence/google-drive";
 import {
   resolveGoogleServiceAccount,
@@ -39,6 +40,9 @@ export interface DiagnosticReport {
   checks: DiagnosticCheck[];
   browserRuntime: BrowserRuntimePlan;
   chromiumInstalled: boolean;
+  whatsappBrowserChannel?: WhatsAppBrowserChannel;
+  chromeInstalled?: boolean;
+  chromeVersion?: string;
   profilePresent: boolean;
   environmentFilePresent: boolean;
   ready: boolean;
@@ -56,6 +60,7 @@ export interface DiagnosticDependencies {
     projectRoot: string,
   ) => Promise<string | undefined>;
   chromiumExecutablePath?: () => Promise<string | undefined>;
+  inspectChrome?: () => Promise<ChromeInstallation>;
   hasCommand?: (command: string, args?: readonly string[]) => Promise<boolean>;
   validateDrive?: (config: AppConfig) => Promise<void>;
   checkDriveAccess?: boolean;
@@ -231,19 +236,6 @@ export async function collectDiagnostics(
     restOnly ? "not required for REST; not inspected" : playwrightVersion ?? "not installed",
   );
 
-  const chromiumPath = restOnly ? undefined : await (
-    dependencies.chromiumExecutablePath ?? defaultChromiumExecutablePath
-  )();
-  const chromiumInstalled = Boolean(
-    chromiumPath && (await pathExists(chromiumPath)),
-  );
-  add(
-    "chromium",
-    "Playwright Chromium",
-    restOnly ? "info" : chromiumInstalled ? "ok" : "error",
-    restOnly ? "not required for REST; not inspected" : chromiumInstalled ? "installed" : "missing; install Chromium",
-  );
-
   let config: AppConfig | undefined;
   let configError: unknown;
   try {
@@ -260,6 +252,31 @@ export async function collectDiagnostics(
     );
   } else {
     add("configuration", "Configuration", "ok", "valid");
+  }
+
+  let chromiumInstalled = false;
+  let chromeInstalled = false;
+  let chromeVersion: string | undefined;
+  if (restOnly) {
+    add("chromium", "Playwright Chromium", "info", "not required for REST; not inspected");
+  } else if (!config) {
+    add("browser-channel", "Browser channel", "error", "configuration unavailable; browser not inspected");
+  } else if (config.whatsappBrowserChannel === "chrome") {
+    add("browser-channel", "Browser channel", "info", "chrome");
+    try {
+      const chrome = await (dependencies.inspectChrome ?? (() => inspectGoogleChrome({ platform, environment, pathExists: dependencies.pathExists })))();
+      chromeInstalled = chrome.installed;
+      chromeVersion = safeBrowserVersion(chrome.version);
+      add("chrome", "Google Chrome", chromeInstalled ? "ok" : "error", chromeInstalled ? "installed" : CHROME_NOT_INSTALLED);
+      if (chromeInstalled) add("chrome-version", "Chrome version", chromeVersion ? "ok" : "warn", chromeVersion ?? "unavailable; version will be logged when WhatsApp starts");
+    } catch {
+      add("chrome", "Google Chrome", "error", `availability check failed; run ${"npx playwright install --with-deps chrome"}`);
+    }
+  } else {
+    add("browser-channel", "Browser channel", "info", "bundled Chromium");
+    const chromiumPath = await (dependencies.chromiumExecutablePath ?? defaultChromiumExecutablePath)();
+    chromiumInstalled = Boolean(chromiumPath && (await pathExists(chromiumPath)));
+    add("chromium", "Playwright Chromium", chromiumInstalled ? "ok" : "error", chromiumInstalled ? "installed" : "missing; install Chromium");
   }
 
   const environmentFilePath = path.join(projectRoot, ".env");
@@ -540,6 +557,9 @@ export async function collectDiagnostics(
     checks,
     browserRuntime,
     chromiumInstalled,
+    whatsappBrowserChannel: restOnly ? undefined : config?.whatsappBrowserChannel,
+    chromeInstalled: restOnly ? undefined : chromeInstalled,
+    chromeVersion,
     profilePresent,
     environmentFilePresent,
     ready: !checks.some((check) => check.status === "error"),
@@ -636,6 +656,7 @@ export function formatSetupChecklist(report: DiagnosticReport): string {
   const discord = checkById(report, "discord");
   const rest = checkById(report, "liveperson-rest");
   const browserRuntime = checkById(report, "browser-runtime");
+  const browserChannel = checkById(report, "browser-channel");
   const lines = [
     successfulCheckLine(
       node,
@@ -653,9 +674,9 @@ export function formatSetupChecklist(report: DiagnosticReport): string {
       "Dependencies need attention",
     ),
     successfulCheckLine(
-      checkById(report, "chromium"),
-      "Chromium installed",
-      "Chromium missing",
+      checkById(report, report.whatsappBrowserChannel === "chrome" ? "chrome" : "chromium"),
+      report.whatsappBrowserChannel === "chrome" ? "Google Chrome installed" : "Chromium installed",
+      report.whatsappBrowserChannel === "chrome" ? "Google Chrome missing" : "Chromium missing",
     ),
     successfulCheckLine(
       checkById(report, "source-workbook"),
@@ -706,6 +727,13 @@ export function formatSetupChecklist(report: DiagnosticReport): string {
   if (rest) {
     lines.push(`${diagnosticSymbol(rest.status)} LivePerson REST: ${rest.detail}`);
   }
+  if (browserChannel) {
+    lines.push(`${diagnosticSymbol(browserChannel.status)} WhatsApp browser channel: ${browserChannel.detail}`);
+  }
+  const chrome = checkById(report, "chrome");
+  const chromeVersion = checkById(report, "chrome-version");
+  if (chrome) lines.push(`${diagnosticSymbol(chrome.status)} Google Chrome: ${chrome.detail}`);
+  if (chromeVersion) lines.push(`${diagnosticSymbol(chromeVersion.status)} Chrome version: ${chromeVersion.detail}`);
   if (browserRuntime?.status === "info") {
     lines.push(`${diagnosticSymbol("info")} Browser runtime: ${browserRuntime.detail}`);
   } else if (browserRuntime?.status === "error") {
