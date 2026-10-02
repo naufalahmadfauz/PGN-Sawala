@@ -4,6 +4,8 @@ This harness runs the PGN workbook through either the consumer WhatsApp Web UI w
 
 **v1.0.0** is the first stable release. See the [release notes](RELEASE_NOTES_v1.0.0.md) and [changelog](CHANGELOG.md) for the V1 overview and verification results.
 
+For code changes and agent continuation, start with [AGENTS.md](AGENTS.md), the [architecture guide](docs/architecture.md), and the [development workflow](docs/development.md). Project terminology is defined in [GLOSSARY.md](GLOSSARY.md).
+
 ## Test Transports
 
 | Transport | Purpose | Channel And Evidence |
