@@ -82,7 +82,7 @@ export async function inspectPgnExecution(
     ? config.pgnExecutedWorkbookPath
     : config.pgnSourceWorkbookPath;
   const loaded = await loadPgnWorkbook(workbookPath);
-  assertPgnWorkbookValid(loaded.parsed);
+  assertPgnWorkbookValid(loaded.parsed, options.sheet);
   if (options.transport === "rest") assertRestConfig(config.livePersonRest);
 
   const readiness = async (selectedCount: number, finalCleanupOnly = false): Promise<PgnExecutionPreflight> => {

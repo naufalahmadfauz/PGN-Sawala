@@ -12,6 +12,8 @@ _Avoid_: Row or turn when referring to the whole test case.
 **Turn**: One prepared user input and the response collected for it within a scenario. A response can contain several bot messages.
 _Avoid_: Treating each bot message as a separate turn.
 
+**Test-case sheet**: A worksheet listing prepared scenarios belonging to the positive or negative test category.
+
 **Source workbook**: The prepared test inputs, expected responses, and reference material from which an executed workbook is created. Execution preserves this workbook.
 
 **Executed workbook**: The working results copy containing captured responses, evaluation statuses, transcripts, and run history. It can accumulate results from multiple runs.

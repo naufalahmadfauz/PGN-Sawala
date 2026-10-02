@@ -11,6 +11,7 @@ import { discoverEvidenceInventory } from "../src/evidence/evidence-migration";
 import { KB_HEADERS, NEGATIVE_HEADERS, loadPgnWorkbook } from "../src/excel/pgn-workbook-loader";
 import { getRunConfiguration } from "../src/excel/run-configuration";
 import { getRetestRunMetadata } from "../src/excel/retest-workbook";
+import { openExecutedPgnWorkbook } from "../src/excel/pgn-workbook-writer";
 import { fieldCell } from "../src/excel/workbook-schema";
 import { inspectPgnExecution } from "../src/operator/pgn-preflight";
 import { parseCliOptions } from "../src/pgn-cli";
@@ -24,7 +25,9 @@ import { discoverRecoveryRun, hashFile, openRecoveryCheckpoint, readRecoveryRun,
 import { validateRecoveryRun } from "../src/recovery/recovery-service";
 import { createDiscordNotifier } from "../src/notifications/discord";
 import { validateRest } from "./validate-rest";
+import { validateRetest } from "./validate-retest";
 import { restSmoke } from "./rest-smoke";
+import { runWorkbookMenu } from "./fixtures/workbook-menu";
 
 const SECRET = "fixture-liveperson-client-secret-never-log";
 const APP_TOKEN = "fixture-AppJWT-private-value";
@@ -155,7 +158,7 @@ class MockLivePerson {
   };
 }
 
-async function fixture(context: TestContext, api = new MockLivePerson()) {
+async function fixture(context: TestContext, api = new MockLivePerson(), layout?: "kb" | "negative") {
   const root = await mkdtemp(path.join(tmpdir(), "pgn-rest-"));
   const cfg = loadConfig({ repositoryRoot: root, environment: { ...environment, DISCORD_NOTIFICATIONS_ENABLED: "false", GOOGLE_DRIVE_EVIDENCE_ENABLED: "true", GOOGLE_SERVICE_ACCOUNT_JSON: "must-not-read" } });
   await mkdir(path.dirname(cfg.pgnSourceWorkbookPath), { recursive: true });
@@ -169,6 +172,7 @@ async function fixture(context: TestContext, api = new MockLivePerson()) {
   const negative = source.addWorksheet("Negative Case");
   negative.addRow(NEGATIVE_HEADERS);
   negative.addRow([1, "Fixture", "REST-NEG-001", "Objective", "Negative", "Condition", "Expected", null, null, null, "Ready for Re-test"]);
+  if (layout) source.removeWorksheet(layout === "kb" ? negative.id : kb.id);
   await source.xlsx.writeFile(cfg.pgnSourceWorkbookPath);
   const original = await hashFile(cfg.pgnSourceWorkbookPath);
   const noLive = async (): Promise<never> => { throw new Error("Live boundary forbidden"); };
@@ -461,6 +465,75 @@ test("receipts, consumer text, internal audience and metadata events cannot sett
   assert.equal(result.technicalStatus, "TIMEOUT"); assert.equal(result.combinedResponse, "");
   await transport.close();
 });
+
+for (const layout of ["kb", "negative"] as const) {
+  test(`REST ${layout}-only full execution and retest save and reopen history without screenshot evidence`, async (context) => {
+    const fx = await fixture(context, new MockLivePerson(), layout);
+    const expectedIds = layout === "kb" ? ["REST-001", "REST-002"] : ["REST-NEG-001"];
+    const expectedInputs = layout === "kb" ? ["First", "Second A", "Second B"] : ["Negative"];
+    assert.equal((await validateRest(fx.cfg)).selectedCount, expectedIds.length);
+    await runPgnWorkbook(["--transport=rest"], "full", fx.cfg);
+    const full = await fx.latest();
+    assert.deepEqual(full.state.completedScenarioIds, expectedIds);
+    const loaded = await loadPgnWorkbook(fx.cfg.pgnExecutedWorkbookPath);
+    const previous = loaded.parsed.scenarios.flatMap((scenario) => scenario.turns.map((turn) => fieldCell(loaded.workbook.getWorksheet(scenario.sheetName)!, turn.rowNumber, "botResponse").text));
+    const args = ["--transport=rest", "--sheet", layout];
+    assert.equal((await inspectPgnExecution(args, "retest", fx.cfg)).selectedCount, expectedIds.length);
+    assert.equal((await validateRetest(args, fx.cfg)).selectedCount, expectedIds.length);
+    fx.api.responseText = "Retested answer";
+    await runPgnWorkbook(args, "retest", fx.cfg);
+    const retest = await fx.latest();
+    assert.equal(retest.state.status, "COMPLETED");
+    assert.deepEqual(fx.api.calls.filter((call) => call.route === "send").map((call) => call.body.body.event.message), [...expectedInputs, ...expectedInputs]);
+    const { workbook, parsed } = await openExecutedPgnWorkbook(fx.cfg.pgnSourceWorkbookPath, fx.cfg.pgnExecutedWorkbookPath);
+    assert.equal(workbook.getWorksheet(layout === "kb" ? "Negative Case" : "Test Case Knowledge Base"), undefined);
+    for (const scenario of parsed.scenarios) {
+      assert.equal(scenario.status, "Pending Evaluation");
+      const sheet = workbook.getWorksheet(scenario.sheetName)!;
+      for (const turn of scenario.turns) {
+        assert.match(fieldCell(sheet, turn.rowNumber, "botResponse").text, /Retested answer/);
+        assert.equal(fieldCell(sheet, turn.rowNumber, "evidence").text, "");
+      }
+    }
+    const history = workbook.getWorksheet("Retest History")!;
+    assert.deepEqual(history.getRows(2, history.rowCount - 1)!.map((row) => fieldCell(history, row.number, "previousBotResponse").text), previous);
+    assert.deepEqual(getRetestRunMetadata(workbook, retest.state.runId)?.finishedIds, expectedIds);
+    const transcript = workbook.getWorksheet("Execution Transcript")!;
+    const userRows = transcript.getRows(2, transcript.rowCount - 1)!.filter((row) => fieldCell(transcript, row.number, "role").text === "USER");
+    assert.deepEqual(userRows.map((row) => fieldCell(transcript, row.number, "message").text), [...expectedInputs, ...expectedInputs]);
+    for (const row of userRows) assert.equal(fieldCell(transcript, row.number, "evidenceStatus").text, "EVIDENCE_NOT_APPLICABLE");
+    assert.equal(discoverEvidenceInventory(workbook).records.length, 0);
+  });
+
+  test(`REST ${layout}-only rejects the absent category before authentication or conversation creation`, async (context) => {
+    const fx = await fixture(context, new MockLivePerson(), layout);
+    const args = ["--transport=rest", "--sheet", layout === "kb" ? "negative" : "kb"];
+    for (const mode of ["full", "retest"] as const) {
+      await assert.rejects(inspectPgnExecution(args, mode, fx.cfg), /absent.*Available test-case sheets/);
+      await assert.rejects(runPgnWorkbook(args, mode, fx.cfg), /absent.*Available test-case sheets/);
+    }
+    await assert.rejects(validateRest(fx.cfg, args), /absent.*Available test-case sheets/);
+    await assert.rejects(validateRetest(args, fx.cfg), /absent.*Available test-case sheets/);
+    assert.deepEqual(fx.api.calls, []);
+  });
+}
+
+for (const layout of ["kb", "negative", undefined] as const) {
+  test(`REST menu executes and retests the ${layout ?? "combined"} layout after mapping review`, async (context) => {
+    const fx = await fixture(context, new MockLivePerson(), layout);
+    const events = await runWorkbookMenu(fx.cfg, [
+      "run", "rest", "isolated", "full", true, "accept", "back",
+      "run", "rest", "isolated", "retest", "ready", true, "back", "exit",
+    ]);
+    assert(events.indexOf("Use this mapping?") < events.indexOf("PGN execution finished"));
+    assert(events.includes("Retest execution finished"));
+    const expected = layout === "kb" ? ["First", "Second A", "Second B"] : layout === "negative" ? ["Negative"] : ["First", "Second A", "Second B", "Negative"];
+    assert.deepEqual(fx.api.calls.filter((call) => call.route === "send").map((call) => call.body.body.event.message), [...expected, ...expected]);
+    const { workbook, parsed } = await loadPgnWorkbook(fx.cfg.pgnExecutedWorkbookPath);
+    assert(parsed.scenarios.every((scenario) => scenario.status === "Pending Evaluation"));
+    assert(workbook.getWorksheet("Retest History")!.rowCount > 1);
+  });
+}
 
 for (const mode of ["full", "retest"] as const) {
   for (const session of ["isolated", "continuous"] as const) {

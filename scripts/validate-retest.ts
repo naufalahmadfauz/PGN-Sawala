@@ -104,7 +104,7 @@ export async function validateRetest(
     ? config.pgnExecutedWorkbookPath
     : config.pgnSourceWorkbookPath;
   const loaded = await loadPgnWorkbook(workbookPath);
-  assertPgnWorkbookValid(loaded.parsed);
+  assertPgnWorkbookValid(loaded.parsed, options.sheet);
   const resumedRun = options.resumeRunId
     ? getRetestRunMetadata(loaded.workbook, options.resumeRunId)
     : undefined;
@@ -138,6 +138,11 @@ export async function validateRetest(
   ] as const) {
     console.log(title);
     console.log("-".repeat(title.length));
+    if (!loaded.parsed.availableSheets.includes(kind)) {
+      console.log("Not present (optional)");
+      console.log("");
+      continue;
+    }
     console.log(`Ready for Re-test: ${selection.readyBySheet[kind].length}`);
     const selected = selection.selected.filter(
       (scenario) => scenario.sheetKind === kind,

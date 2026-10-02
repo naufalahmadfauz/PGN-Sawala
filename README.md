@@ -279,6 +279,20 @@ The source is never overwritten. The first execution copies it to:
 
 Later runs resume from that executed copy. Existing Bot Response cells are skipped by default. Existing expected responses, semantic statuses, notes, references, styles, dimensions, merged cells, and completed evidence are preserved. The runner does not generate User Input or assign Passed or Failed.
 
+### Supported test-case layouts
+
+Full execution and retests support these layouts through both the menu and direct CLI, using WhatsApp or REST:
+
+| Layout | Test-case sheets present |
+| --- | --- |
+| Positive-only | `Test Case Knowledge Base` |
+| Negative-only | `Negative Case` |
+| Combined | Both sheets |
+
+At least one of these exact sheet names is required; unrelated supporting worksheets do not count. Every present test-case sheet must have valid required headers, even when you select only the other category. The executed copy retains the source's actual test-case sheets and adds the normal transcript/metadata sheets; an unused category does not need a placeholder sheet.
+
+A **missing sheet** and an **empty sheet** are different. A present sheet with valid headers and zero scenarios is accepted, including when explicitly selected. If no eligible scenarios are selected, execution reports that there is nothing to execute and opens no chatbot conversation. Validation reports absent categories as **Not present**, rather than as empty sheets.
+
 `Test Case Knowledge Base` reads and writes fields by their headers, not fixed Excel letters. A blank Test Case ID row with a populated Turn continues the preceding scenario.
 
 `Negative Case` independently resolves `User Input / Test Steps` and its result fields. Explicit `Turn 1:`, `Turn 2:`, and later markers inside one cell execute sequentially in the same scenario context. Their responses and timings are combined with turn labels.
@@ -303,7 +317,7 @@ npm run workbook:schema -- --review
 
 The current workbook format requires headers in row 1. Matching tolerates case, leading/trailing whitespace, repeated spaces, and newlines. Conservative aliases include `User Question`, `Test Input`, and `User Message` for User Input; `Actual Bot Response`, `Actual Response`, and `Bot Answer` for Bot Response. `Negative Case` also accepts `User Input` and `Test Steps` for its combined input field. There are no fuzzy matches or vague Input/Output/Result aliases.
 
-Test Case ID, User Input, Bot Response, and Status are required on each main sheet; the Knowledge Base sheet also requires Turn. Missing optional description/reporting fields produce warnings; absent Response Time, Test Date, or Notes are not written. Existing Evidence links, formulas, formatting, widths, filters, and table definitions are retained. Internally generated transcript/history/metadata sheets are resolved centrally without asking operators to map them; malformed internal schemas fail safely. Execution Metadata retains its two controlled groups, delimited by Evidence Key, to distinguish their duplicate Run ID headers. Evaluation Summary and other unrelated supporting sheets are not remapped or recreated.
+Test Case ID, User Input, Bot Response, and Status are required on each test-case sheet that is present; the Knowledge Base sheet also requires Turn. Mapping inspection and review use only present test-case sheets and cannot approve a workbook with neither recognized sheet. Missing optional description/reporting fields produce warnings; absent Response Time, Test Date, or Notes are not written. Existing Evidence links, formulas, formatting, widths, filters, and table definitions are retained. Internally generated transcript/history/metadata sheets are resolved centrally without asking operators to map them; malformed internal schemas fail safely. Execution Metadata retains its two controlled groups, delimited by Evidence Key, to distinguish their duplicate Run ID headers. Evaluation Summary and other unrelated supporting sheets are not remapped or recreated.
 
 For an ambiguous or unknown header, open `npm run pgn` -> **Workbook** -> **Review column mapping**. Setup also offers mapping review. Both canonical and alias candidates appearing together require a choice; identical duplicate headers must be renamed in Excel because a positional override would be unsafe. Accepted overrides are workbook-specific, never global aliases.
 
@@ -333,6 +347,8 @@ WhatsApp PGN execution waits for response settlement, scrolls the active convers
 When Drive evidence is enabled, the runner validates the parent and creates the run folder before opening WhatsApp. Each attempted turn is captured locally when possible, uploaded, linked in Excel, and atomically saved with its current result before the next turn or reset. A rerun clears stale result values and links that are not produced by the new attempt. Evidence upload status remains separate from `CAPTURED`, `TIMEOUT`, `SEND_ERROR`, and `CHAT_ERROR`, so a Drive failure does not invalidate a chatbot response.
 
 ## Filters And Resume
+
+Without `--sheet`, all-category selection uses the test-case sheets actually present, in the existing positive-then-negative scenario order. In the menu, use **Run remaining scenarios** (WhatsApp), **Full run** (REST), or **Run one sheet** to select a category. `--sheet kb` selects positive cases; `--sheet negative` selects negative cases. These flags also apply to retest commands. Explicitly requesting an absent category stops before testcase execution and lists the requested sheet and the available test-case sheets.
 
 ```bash
 npm run test:pgn -- --limit 5
@@ -419,6 +435,7 @@ Useful retest filters are:
 
 ```bash
 npm run test:pgn:retest -- --limit 3
+npm run test:pgn:retest -- --sheet negative
 npm run test:pgn:retest -- --test PGN-KB-075
 npm run test:pgn:retest -- --resume RETEST-20260902T053000Z
 ```

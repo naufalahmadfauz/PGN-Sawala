@@ -20,6 +20,7 @@ import { readWorkbookMappingStore, saveWorkbookMappingStore, workbookMappingKey,
 import { collectDiagnostics } from "../src/operator/diagnostics";
 import { runControlPanel, type OperatorActions } from "../src/operator/control-panel";
 import { runSetupWizard } from "../src/operator/setup";
+import { inspectPgnExecution } from "../src/operator/pgn-preflight";
 import type { OperatorUi } from "../src/operator/ui";
 import { ensureReviewedWorkbookMapping, formatWorkbookMappings, inspectWorkbookMappings, reviewWorkbookMapping } from "../src/operator/workbook-configuration";
 import { runPgnWorkbook } from "../src/pgn-runner";
@@ -28,6 +29,7 @@ import { reconcileRecoveryArtifacts, validateRecoveryRun } from "../src/recovery
 import { selectRetestScenarios } from "../src/retest/retest-selection";
 import { WhatsAppClient } from "../src/whatsapp/client";
 import { validatePgnWorkbook } from "./validate-pgn-workbook";
+import { validateRetest } from "./validate-retest";
 
 function fixtureWorkbook(): ExcelJS.Workbook {
   const workbook = new ExcelJS.Workbook();
@@ -97,6 +99,137 @@ test("current repository workbook resolves headers without changing its bytes", 
   assert.equal(getWorksheetSchema(loaded.workbook.getWorksheet(NEGATIVE_SHEET_NAME)!).fields.userInput?.columnLetter, "E");
   assert.equal(await hashFile(source), before);
 });
+
+for (const [present, absent, requested] of [
+  [KB_SHEET_NAME, NEGATIVE_SHEET_NAME, "negative"],
+  [NEGATIVE_SHEET_NAME, KB_SHEET_NAME, "kb"],
+] as const) {
+  test(`requesting absent ${requested} fails in full/retest preflight, validation, and execution with available sheets`, async (context) => {
+    const workbook = fixtureWorkbook();
+    workbook.removeWorksheet(absent);
+    const { config } = await project(context, workbook);
+    const args = ["--sheet", requested];
+    const missingCategory = (error: unknown) => {
+      assert(error instanceof Error);
+      assert.match(error.message, /absent/i);
+      assert(error.message.includes(requested));
+      assert(error.message.includes(absent));
+      assert(error.message.includes(`Available test-case sheets: "${present}"`));
+      return true;
+    };
+    for (const mode of ["full", "retest"] as const) {
+      await assert.rejects(inspectPgnExecution(args, mode, config), missingCategory);
+      await assert.rejects(runPgnWorkbook(args, mode, config), missingCategory);
+    }
+    await assert.rejects(validateRetest(args, config), missingCategory);
+  });
+}
+
+for (const present of [KB_SHEET_NAME, NEGATIVE_SHEET_NAME]) {
+  test(`mapping inspection and review accept only the present ${present} test-case sheet`, async (context) => {
+    const workbook = fixtureWorkbook();
+    workbook.removeWorksheet(present === KB_SHEET_NAME ? NEGATIVE_SHEET_NAME : KB_SHEET_NAME);
+    const { config, root } = await project(context, workbook);
+    const logs: string[] = [];
+    context.mock.method(console, "log", (...args: unknown[]) => { logs.push(args.join(" ")); });
+    const before = await hashFile(config.pgnSourceWorkbookPath);
+    const inspection = await inspectWorkbookMappings(config);
+    assert.equal(inspection.ready, true);
+    assert.deepEqual(inspection.documents[0].schemas.map((schema) => schema.sheetName), [present]);
+    const review = scriptedUi(["accept"]);
+    assert.equal(await ensureReviewedWorkbookMapping(review.ui, config), true);
+    assert.match(review.events.join("\n"), /Workbook-specific mapping saved/);
+    const store = await readWorkbookMappingStore(root);
+    for (const file of [config.pgnSourceWorkbookPath, config.pgnExecutedWorkbookPath]) {
+      assert.deepEqual(Object.keys(store.workbooks[workbookMappingKey(root, file)].sheets), [present]);
+    }
+    assert.equal(await validatePgnWorkbook(config), true);
+    const absent = present === KB_SHEET_NAME ? NEGATIVE_SHEET_NAME : KB_SHEET_NAME;
+    assert.match(logs.join("\n"), new RegExp(`${absent}\\n-+\\nNot present`));
+    logs.length = 0;
+    await validateRetest([], config);
+    assert.match(logs.join("\n"), new RegExp(`${absent}\\n-+\\nNot present`));
+    assert.equal(await hashFile(config.pgnSourceWorkbookPath), before);
+    await assert.rejects(access(config.pgnExecutedWorkbookPath));
+  });
+}
+
+test("an unrelated workbook is rejected by execution and cannot be approved as a ready mapping", async (context) => {
+  const workbook = new ExcelJS.Workbook();
+  workbook.addWorksheet("Supporting notes").addRow(KB_HEADERS);
+  const { config, root } = await project(context, workbook);
+  context.mock.method(console, "log", () => undefined);
+  const acceptedSheets = /At least one test-case sheet is required: "Test Case Knowledge Base" or "Negative Case"/;
+  for (const mode of ["full", "retest"] as const) {
+    await assert.rejects(inspectPgnExecution([], mode, config), acceptedSheets);
+    await assert.rejects(runPgnWorkbook([], mode, config), acceptedSheets);
+  }
+  const inspection = await inspectWorkbookMappings(config);
+  assert.equal(inspection.ready, false);
+  assert.match(formatWorkbookMappings(inspection), acceptedSheets);
+  const review = scriptedUi(["accept", "cancel"]);
+  assert.equal(await reviewWorkbookMapping(review.ui, config), false);
+  assert.equal(review.answers.length, 0, "An invalid mapping cannot be accepted");
+  assert.equal(await validatePgnWorkbook(config), false);
+  await assert.rejects(access(path.join(root, WORKBOOK_MAPPING_FILE)));
+  await assert.rejects(access(config.pgnExecutedWorkbookPath));
+});
+
+for (const malformed of ["kb", "negative"] as const) {
+  for (const combined of [false, true]) {
+    test(`${malformed} malformed headers fail even ${combined ? "when the other category is selected" : "in a single-category workbook"}`, async (context) => {
+      const workbook = fixtureWorkbook();
+      const name = malformed === "kb" ? KB_SHEET_NAME : NEGATIVE_SHEET_NAME;
+      const other = malformed === "kb" ? NEGATIVE_SHEET_NAME : KB_SHEET_NAME;
+      const sheet = workbook.getWorksheet(name)!;
+      sheet.spliceColumns(fieldColumn(sheet, "botResponse"), 1);
+      if (!combined) workbook.removeWorksheet(other);
+      const { config, root } = await project(context, workbook);
+      const args = ["--sheet", combined ? malformed === "kb" ? "negative" : "kb" : malformed];
+      const invalidHeader = (error: unknown) => {
+        assert(error instanceof Error);
+        assert(error.message.includes(name));
+        assert.match(error.message, /Bot Response/);
+        return true;
+      };
+      for (const mode of ["full", "retest"] as const) {
+        await assert.rejects(inspectPgnExecution(args, mode, config), invalidHeader);
+        await assert.rejects(runPgnWorkbook(args, mode, config), invalidHeader);
+      }
+      assert.equal((await inspectWorkbookMappings(config)).ready, false);
+      assert.equal(await reviewWorkbookMapping(scriptedUi(["accept", "cancel"]).ui, config), false);
+      await assert.rejects(access(path.join(root, WORKBOOK_MAPPING_FILE)));
+      await assert.rejects(access(config.pgnExecutedWorkbookPath));
+    });
+  }
+}
+
+for (const empty of ["kb", "negative"] as const) {
+  for (const combined of [false, true]) {
+    test(`empty ${empty} test-case sheet is valid and selecting it opens no conversation (${combined ? "combined" : "single-category"})`, async (context) => {
+      const workbook = fixtureWorkbook();
+      const name = empty === "kb" ? KB_SHEET_NAME : NEGATIVE_SHEET_NAME;
+      workbook.removeWorksheet(name);
+      workbook.addWorksheet(name).addRow(empty === "kb" ? KB_HEADERS : NEGATIVE_HEADERS);
+      if (!combined) workbook.removeWorksheet(empty === "kb" ? NEGATIVE_SHEET_NAME : KB_SHEET_NAME);
+      const { config } = await project(context, workbook);
+      const logs: string[] = [];
+      context.mock.method(console, "log", (...args: unknown[]) => { logs.push(args.join(" ")); });
+      assert.equal(await validatePgnWorkbook(config), true);
+      assert.equal((await inspectPgnExecution([], "full", config)).selectedCount, combined ? empty === "kb" ? 1 : 2 : 0);
+      for (const mode of ["full", "retest"] as const) {
+        assert.deepEqual(await inspectPgnExecution(["--sheet", empty], mode, config), { browserRequired: false, selectedCount: 0, finalCleanupOnly: false });
+        await runPgnWorkbook(["--sheet", empty], mode, config);
+        if (!combined) await runPgnWorkbook([], mode, config);
+      }
+      assert.match(logs.join("\n"), /No scenarios require execution/);
+      assert.match(logs.join("\n"), /Nothing to execute/);
+      const reloaded = await loadPgnWorkbook(config.pgnExecutedWorkbookPath);
+      assert(reloaded.workbook.getWorksheet(name));
+      assert.equal((await inspectWorkbookMappings(config)).ready, true);
+    });
+  }
+}
 
 for (const kind of ["insert", "swap", "reverse", "multiple"] as const) {
   test(`${kind} columns resolves independent input/output/status fields and preserves multi-turn grouping`, async (context) => {

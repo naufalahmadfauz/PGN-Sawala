@@ -71,6 +71,7 @@ export interface PgnSheetSummary {
 
 export interface ParsedPgnWorkbook {
   schemas?: ResolvedWorksheetSchema[];
+  availableSheets: PgnSheetKind[];
   scenarios: PgnTestScenario[];
   issues: PgnValidationIssue[];
   summaries: Record<PgnSheetKind, PgnSheetSummary>;

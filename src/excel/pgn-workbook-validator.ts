@@ -2,6 +2,7 @@ import {
   KB_SHEET_NAME,
   NEGATIVE_SHEET_NAME,
   type ParsedPgnWorkbook,
+  type PgnSheetKind,
   type PgnValidationIssue,
 } from "./pgn-types";
 import { formatWorksheetSchema } from "./workbook-schema";
@@ -25,7 +26,9 @@ export interface PgnSessionIsolationConfig {
 function formatSheetSummary(
   name: string,
   summary: ParsedPgnWorkbook["summaries"]["kb"],
+  present: boolean,
 ): string[] {
+  if (!present) return [name, "-".repeat(name.length), "Not present (optional)"];
   return [
     name,
     "-".repeat(name.length),
@@ -55,9 +58,9 @@ export function formatPgnValidation(
     "Workbook schema",
     ...(parsed.schemas ?? []).map(formatWorksheetSchema),
     "",
-    ...formatSheetSummary(KB_SHEET_NAME, parsed.summaries.kb),
+    ...formatSheetSummary(KB_SHEET_NAME, parsed.summaries.kb, parsed.availableSheets.includes("kb")),
     "",
-    ...formatSheetSummary(NEGATIVE_SHEET_NAME, parsed.summaries.negative),
+    ...formatSheetSummary(NEGATIVE_SHEET_NAME, parsed.summaries.negative, parsed.availableSheets.includes("negative")),
     "",
     `Duplicate Test Case IDs: ${parsed.duplicateTestCaseIds}`,
     `Invalid turn rows: ${parsed.invalidTurnRows}`,
@@ -99,11 +102,18 @@ export function formatPgnValidation(
   return lines.join("\n");
 }
 
-export function assertPgnWorkbookValid(parsed: ParsedPgnWorkbook): void {
+export function assertPgnWorkbookValid(parsed: ParsedPgnWorkbook, requestedSheet?: PgnSheetKind): void {
   const errors = parsed.issues.filter((issue) => issue.severity === "ERROR");
   if (errors.length > 0) {
     throw new Error(
       `PGN workbook validation failed with ${errors.length} error(s). ${errors.map((issue) => `${issue.sheetName}: ${issue.message}`).join(" ")} Run npm run test:pgn:validate or review column mapping in npm run pgn.`,
+    );
+  }
+  if (requestedSheet && !parsed.availableSheets.includes(requestedSheet)) {
+    const sheetName = requestedSheet === "kb" ? KB_SHEET_NAME : NEGATIVE_SHEET_NAME;
+    const available = parsed.availableSheets.map((kind) => `"${kind === "kb" ? KB_SHEET_NAME : NEGATIVE_SHEET_NAME}"`).join(", ");
+    throw new Error(
+      `Requested ${requestedSheet === "kb" ? "positive" : "negative"} category (--sheet ${requestedSheet}), worksheet "${sheetName}", is absent. Available test-case sheets: ${available}.`,
     );
   }
 }

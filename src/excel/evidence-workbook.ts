@@ -34,14 +34,19 @@ function ensureMetadataWorksheet(workbook: Workbook): Worksheet {
 }
 
 export function ensureEvidenceWorkbookSchema(workbook: Workbook): boolean {
-  const sheets = [KB_SHEET_NAME, NEGATIVE_SHEET_NAME, TRANSCRIPT_SHEET_NAME].map((name) => workbook.getWorksheet(name));
-  if (sheets.some((sheet) => !sheet)) throw new Error("PGN workbook evidence schema requires both result sheets and transcript");
-  sheets.forEach((sheet) => getWorksheetSchema(sheet!));
+  const resultSheets = [KB_SHEET_NAME, NEGATIVE_SHEET_NAME].flatMap((name) => {
+    const sheet = workbook.getWorksheet(name);
+    return sheet ? [sheet] : [];
+  });
+  const transcript = workbook.getWorksheet(TRANSCRIPT_SHEET_NAME);
+  if (!resultSheets.length || !transcript) throw new Error("PGN workbook evidence schema requires at least one test-case sheet and transcript");
+  const sheets = [...resultSheets, transcript];
+  sheets.forEach((sheet) => getWorksheetSchema(sheet));
   let changed = !workbook.getWorksheet(EXECUTION_METADATA_SHEET_NAME);
   ensureMetadataWorksheet(workbook);
   for (const worksheet of sheets) {
-    const names = worksheet!.name === TRANSCRIPT_SHEET_NAME ? ["evidenceUrl", "evidenceStatus"] as const : ["evidence"] as const;
-    for (const name of names) changed = ensureEvidenceField(worksheet!, name) || changed;
+    const names = worksheet.name === TRANSCRIPT_SHEET_NAME ? ["evidenceUrl", "evidenceStatus"] as const : ["evidence"] as const;
+    for (const name of names) changed = ensureEvidenceField(worksheet, name) || changed;
   }
   return changed;
 }

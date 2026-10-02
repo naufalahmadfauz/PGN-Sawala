@@ -23,10 +23,10 @@ export async function validateRest(
   try {
     assertRestConfig(config.livePersonRest);
     const source = await loadPgnWorkbook(config.pgnSourceWorkbookPath);
-    assertPgnWorkbookValid(source.parsed);
+    assertPgnWorkbookValid(source.parsed, options.sheet);
     const outputExists = await access(config.pgnExecutedWorkbookPath).then(() => true).catch(() => false);
     const executed = outputExists ? await loadPgnWorkbook(config.pgnExecutedWorkbookPath) : source;
-    assertPgnWorkbookValid(executed.parsed);
+    assertPgnWorkbookValid(executed.parsed, options.sheet);
     let directory = path.dirname(config.pgnExecutedWorkbookPath);
     while (!(await access(directory).then(() => true).catch(() => false))) {
       const parent = path.dirname(directory);

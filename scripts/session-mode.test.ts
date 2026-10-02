@@ -4,10 +4,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
 import ExcelJS from "exceljs";
+import JSZip from "jszip";
 import { chromium } from "playwright";
 import { loadConfig } from "../src/config";
 import { GoogleDriveEvidencePublisher } from "../src/evidence/google-drive";
-import { getEvidenceFileMetadata, getEvidenceRunMetadata } from "../src/excel/evidence-workbook";
+import { getEvidenceFileMetadata, getEvidenceRunMetadata, readEvidenceHyperlink } from "../src/excel/evidence-workbook";
 import { KB_HEADERS, NEGATIVE_HEADERS, loadPgnWorkbook } from "../src/excel/pgn-workbook-loader";
 import { getRunConfiguration } from "../src/excel/run-configuration";
 import { getRetestRunMetadata, upsertRetestRunMetadata } from "../src/excel/retest-workbook";
@@ -23,11 +24,12 @@ import type { MessageSnapshot, ResponseCapture, SentMessage, WhatsAppMessage } f
 import { WhatsAppClient } from "../src/whatsapp/client";
 import { parsePgnValidationArgs, validatePgnWorkbook } from "./validate-pgn-workbook";
 import { validateRetest } from "./validate-retest";
+import { runWorkbookMenu } from "./fixtures/workbook-menu";
 
 const inputs = ["Input one", "Input two A", "Input two B", "Input three", "Negative one", "Negative two"];
 const ids = ["SESSION-001", "SESSION-002", "SESSION-003", "SESSION-NEG-001"];
 
-async function fixture(context: TestContext, mode: "full" | "retest" = "full") {
+async function fixture(context: TestContext, mode: "full" | "retest" = "full", sheet?: "kb" | "negative" | "both") {
   const root = await mkdtemp(path.join(tmpdir(), "pgn-session-mode-"));
   const config = {
     ...loadConfig({ repositoryRoot: root, environment: {
@@ -54,6 +56,10 @@ async function fixture(context: TestContext, mode: "full" | "retest" = "full") {
   const negative = workbook.addWorksheet("Negative Case");
   negative.addRow(NEGATIVE_HEADERS);
   negative.addRow([1, "Fixture", ids[3], "Objective", `Turn 1: ${inputs[4]}\nTurn 2: ${inputs[5]}`, "Negative", "Expected", null, null, null, "Ready for Re-test"]);
+  if (sheet && sheet !== "both") workbook.removeWorksheet(sheet === "kb" ? negative.id : kb.id);
+  if (sheet) {
+    (workbook.getWorksheet(kb.name) ?? negative).addTable({ name: "CategoryReference", ref: "Q1", columns: [{ name: "Fixture reference" }], rows: [["Preserve reference table"]] });
+  }
   await workbook.xlsx.writeFile(config.pgnSourceWorkbookPath);
   const sourceHash = await hashFile(config.pgnSourceWorkbookPath);
   const sent: string[] = [];
@@ -62,7 +68,7 @@ async function fixture(context: TestContext, mode: "full" | "retest" = "full") {
   const folders: string[] = [];
   const logs: string[] = [];
   const messages: WhatsAppMessage[] = [];
-  const behavior = { failReset: false, failUpload: false, interruptAt: "", timeoutAt: "", signal: "SIGINT" as "SIGINT" | "SIGTERM" };
+  const behavior = { responsePrefix: "Synthetic response", failReset: false, failUpload: false, interruptAt: "", timeoutAt: "", signal: "SIGINT" as "SIGINT" | "SIGTERM" };
   const realBrowser = context.mock.method(chromium, "launchPersistentContext", async () => { throw new Error("Live browser forbidden"); });
   const realFetch = context.mock.method(globalThis, "fetch", async () => { throw new Error("Live HTTP forbidden"); });
   context.mock.method(console, "log", (...values: unknown[]) => { logs.push(values.join(" ")); });
@@ -88,7 +94,7 @@ async function fixture(context: TestContext, mode: "full" | "retest" = "full") {
       behavior.interruptAt = "";
       process.emit(behavior.signal);
     }
-    const response: WhatsAppMessage = { id: `response-${messages.length}`, text: `Synthetic response to ${message.renderedText}`, direction: "incoming", domIndex: messages.length, observedAt: new Date() };
+    const response: WhatsAppMessage = { id: `response-${messages.length}`, text: `${behavior.responsePrefix} to ${message.renderedText}`, direction: "incoming", domIndex: messages.length, observedAt: new Date() };
     messages.push(response);
     return { messages: [response], combinedResponse: response.text, sentAt: message.sentAt, completedAt: new Date(), timedOut: message.renderedText === behavior.timeoutAt, firstResponseMs: 1, totalResponseMs: 2 };
   });
@@ -130,6 +136,104 @@ async function fixture(context: TestContext, mode: "full" | "retest" = "full") {
     return recovered[0];
   };
   return { root, config, sent, screenshots, uploads, folders, logs, messages, behavior, latest, signalSettled };
+}
+
+for (const layout of ["kb", "negative", "both"] as const) {
+  for (const explicit of [false, true]) {
+    test(`${layout} workbook full execution and retest preserve results, evidence, history and tables (${explicit ? "explicit category" : "all categories"})`, async (context) => {
+      const fx = await fixture(context, "retest", layout);
+      const selectedCategory = explicit ? layout === "both" ? "negative" : layout : undefined;
+      const args = selectedCategory ? ["--sheet", selectedCategory] : [];
+      const selected = selectedCategory ?? layout;
+      const expectedIds = selected === "kb" ? ids.slice(0, 3) : selected === "negative" ? ids.slice(3) : ids;
+      const expectedInputs = selected === "kb" ? inputs.slice(0, 4) : selected === "negative" ? inputs.slice(4) : inputs;
+      const sourceZip = await JSZip.loadAsync(await readFile(fx.config.pgnSourceWorkbookPath));
+      const table = await sourceZip.file("xl/tables/table1.xml")!.async("string");
+      assert.equal((await inspectPgnExecution(args, "full", fx.config)).selectedCount, expectedIds.length);
+      await runPgnWorkbook(args, "full", fx.config);
+      assert.deepEqual(fx.sent.filter((message) => message !== "reset"), expectedInputs);
+      const fullRun = (await fx.latest()).state;
+      assert.equal(fullRun.status, "COMPLETED");
+      assert.deepEqual(fullRun.selectedScenarioIds, expectedIds);
+      const { workbook, parsed } = await loadPgnWorkbook(fx.config.pgnExecutedWorkbookPath);
+      const expectedSheets = layout === "kb" ? ["Test Case Knowledge Base"] : layout === "negative" ? ["Negative Case"] : ["Test Case Knowledge Base", "Negative Case"];
+      assert.deepEqual(workbook.worksheets.filter((sheet) => ["Test Case Knowledge Base", "Negative Case"].includes(sheet.name)).map((sheet) => sheet.name), expectedSheets);
+      const previous: Array<{ id: string; response: string; evidence?: string }> = [];
+      for (const scenario of parsed.scenarios) {
+        const sheet = workbook.getWorksheet(scenario.sheetName)!;
+        assert.equal(fieldCell(sheet, scenario.sourceRowNumber, "expectedResponse").text, "Expected");
+        assert.equal(scenario.status, "Ready for Re-test");
+        if (!expectedIds.includes(scenario.testCaseId)) {
+          assert.equal(fieldCell(sheet, scenario.sourceRowNumber, "botResponse").text, "");
+          continue;
+        }
+        if (scenario.sheetKind === "negative") {
+          assert.equal(fieldCell(sheet, scenario.sourceRowNumber, "botResponse").text, "Turn 1:\nSynthetic response to Negative one\n\nTurn 2:\nSynthetic response to Negative two");
+        }
+        for (const turn of scenario.turns) {
+          assert.equal(fieldCell(sheet, turn.rowNumber, "userInput").text, scenario.sheetKind === "kb" ? turn.userInput : "Turn 1: Negative one\nTurn 2: Negative two");
+          if (scenario.sheetKind === "kb") assert.equal(fieldCell(sheet, turn.rowNumber, "botResponse").text, `Synthetic response to ${turn.userInput}`);
+          assert.equal(getEvidenceFileMetadata(workbook, `${fullRun.runId}|${scenario.testCaseId}|${turn.turnNumber}`)?.status, "EVIDENCE_SYNCED");
+        }
+        for (const row of scenario.sheetKind === "kb" ? scenario.turns.map((turn) => turn.rowNumber) : [scenario.sourceRowNumber]) {
+          const evidence = readEvidenceHyperlink(fieldCell(sheet, row, "evidence"));
+          assert(evidence);
+          previous.push({ id: scenario.testCaseId, response: fieldCell(sheet, row, "botResponse").text, evidence });
+        }
+      }
+      const sentBefore = [...fx.sent];
+      await runPgnWorkbook(args, "full", fx.config);
+      assert.deepEqual(fx.sent, sentBefore, "Already captured scenarios retain ordinary skip eligibility");
+      assert.equal((await validateRetest(args, fx.config)).selectedCount, expectedIds.length);
+      fx.behavior.responsePrefix = "Retested response";
+      fx.sent.length = 0;
+      await runPgnWorkbook(args, "retest", fx.config);
+      assert.deepEqual(fx.sent.filter((message) => message !== "reset"), expectedInputs);
+      const retestRun = (await fx.latest()).state;
+      assert.equal(retestRun.status, "COMPLETED");
+      const reopened = await openExecutedPgnWorkbook(fx.config.pgnSourceWorkbookPath, fx.config.pgnExecutedWorkbookPath);
+      assert.equal(reopened.resumed, true);
+      assert.deepEqual(getRetestRunMetadata(reopened.workbook, retestRun.runId)?.finishedIds, expectedIds);
+      const history = reopened.workbook.getWorksheet("Retest History")!;
+      assert.equal(history.rowCount - 1, previous.length);
+      for (const [index, prior] of previous.entries()) {
+        assert.equal(fieldCell(history, index + 2, "testCaseId").text, prior.id);
+        assert.equal(fieldCell(history, index + 2, "previousBotResponse").text, prior.response);
+        assert.equal(fieldCell(history, index + 2, "previousStatus").text, "Ready for Re-test");
+        assert.equal(readEvidenceHyperlink(fieldCell(history, index + 2, "previousEvidenceUrl")), prior.evidence);
+        assert.equal(fieldCell(history, index + 2, "newBotResponse").text, prior.response.replaceAll("Synthetic response", "Retested response"));
+        assert(readEvidenceHyperlink(fieldCell(history, index + 2, "newEvidenceUrl")));
+      }
+      for (const scenario of reopened.parsed.scenarios.filter((scenario) => expectedIds.includes(scenario.testCaseId))) {
+        assert.equal(scenario.status, "Pending Evaluation");
+        for (const turn of scenario.turns) assert.equal(getEvidenceFileMetadata(reopened.workbook, `${retestRun.runId}|${scenario.testCaseId}|${turn.turnNumber}`)?.status, "EVIDENCE_SYNCED");
+      }
+      const transcript = reopened.workbook.getWorksheet("Execution Transcript")!;
+      for (const [runId, prefix] of [[fullRun.runId, "Synthetic response"], [retestRun.runId, "Retested response"]]) {
+        const botRows = transcript.getRows(2, transcript.rowCount - 1)!.filter((row) => fieldCell(transcript, row.number, "runId").text === runId && fieldCell(transcript, row.number, "role").text === "BOT");
+        assert.deepEqual(botRows.map((row) => fieldCell(transcript, row.number, "message").text), expectedInputs.map((input) => `${prefix} to ${input}`));
+      }
+      const outputZip = await JSZip.loadAsync(await readFile(fx.config.pgnExecutedWorkbookPath));
+      assert.equal(await outputZip.file("xl/tables/table1.xml")!.async("string"), table);
+    });
+  }
+}
+
+for (const layout of ["kb", "negative", "both"] as const) {
+  test(`WhatsApp menu executes and retests the ${layout} layout after mapping review`, async (context) => {
+    const fx = await fixture(context, "retest", layout);
+    const events = await runWorkbookMenu(fx.config, [
+      "run", ...(layout === "both" ? ["remaining"] : ["sheet", layout]), "isolated", true, "accept", "back",
+      "retest", "ready", "isolated", true, "back", "exit",
+    ]);
+    assert(events.indexOf("Use this mapping?") < events.indexOf("PGN execution finished"));
+    assert(events.includes("Retest execution finished"));
+    const expected = layout === "kb" ? inputs.slice(0, 4) : layout === "negative" ? inputs.slice(4) : inputs;
+    assert.deepEqual(fx.sent.filter((message) => message !== "reset"), [...expected, ...expected]);
+    const { workbook, parsed } = await loadPgnWorkbook(fx.config.pgnExecutedWorkbookPath);
+    assert(parsed.scenarios.every((scenario) => scenario.status === "Pending Evaluation"));
+    assert(workbook.getWorksheet("Retest History")!.rowCount > 1);
+  });
 }
 
 for (const [args, expected] of [

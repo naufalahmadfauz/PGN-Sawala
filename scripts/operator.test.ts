@@ -2480,7 +2480,7 @@ test("workbook validation CLI accepts only central session flags, including no-o
 test("workbook validation describes isolated defaults and continuous reset policy without live actions", () => {
   const summary = { scenarios: 0, runnableTurns: 0, missingUserInput: 0, multiTurnScenarios: 0, completedScenarios: 0 };
   const parsed: ParsedPgnWorkbook = {
-    scenarios: [], issues: [], summaries: { kb: summary, negative: summary },
+    availableSheets: ["kb", "negative"], scenarios: [], issues: [], summaries: { kb: summary, negative: summary },
     duplicateTestCaseIds: 0, invalidTurnRows: 0,
   };
   const isolation = {

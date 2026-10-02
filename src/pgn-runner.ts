@@ -251,12 +251,12 @@ async function runPgnWorkbookLocked(
   const transport = options.transport;
   const executionContext = { transport, sessionMode };
   const source = await loadPgnWorkbook(config.pgnSourceWorkbookPath);
-  assertPgnWorkbookValid(source.parsed);
+  assertPgnWorkbookValid(source.parsed, options.sheet);
   const executed = await openExecutedPgnWorkbook(
     config.pgnSourceWorkbookPath,
     config.pgnExecutedWorkbookPath,
   );
-  assertPgnWorkbookValid(executed.parsed);
+  assertPgnWorkbookValid(executed.parsed, options.sheet);
   for (const issue of executed.parsed.issues.filter((issue) => issue.severity === "WARNING")) {
     console.log(`[Workbook warning] ${issue.sheetName}: ${issue.message}`);
   }

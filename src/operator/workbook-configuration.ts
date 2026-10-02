@@ -1,5 +1,6 @@
 import { access } from "node:fs/promises";
 import path from "node:path";
+import type { Workbook } from "exceljs";
 import type { AppConfig } from "../config";
 import { loadPgnWorkbook } from "../excel/pgn-workbook-loader";
 import {
@@ -13,6 +14,13 @@ import {
 import { discoverRecoveryRun, hashFile } from "../recovery/run-state";
 import type { OperatorUi } from "./ui";
 
+function resolveTestCaseSchemas(workbook: Workbook, overrides: SavedWorkbookMapping["overrides"]) {
+  return [KB_SCHEMA, NEGATIVE_SCHEMA].flatMap((definition) => {
+    const worksheet = workbook.getWorksheet(definition.sheetName);
+    return worksheet ? [resolveWorksheetSchema(worksheet, definition, overrides)] : [];
+  });
+}
+
 export async function inspectWorkbookMappings(config: AppConfig, updateCache = false) {
   const store = await readWorkbookMappingStore(config.projectRoot);
   const paths = [config.pgnSourceWorkbookPath];
@@ -22,11 +30,7 @@ export async function inspectWorkbookMappings(config: AppConfig, updateCache = f
     const key = workbookMappingKey(config.projectRoot, filePath);
     const saved = store.workbooks[key];
     const overrides = structuredClone(saved?.overrides ?? []);
-    const schemas = [KB_SCHEMA, NEGATIVE_SCHEMA].map((definition) => {
-      const worksheet = loaded.workbook.getWorksheet(definition.sheetName);
-      if (!worksheet) throw new Error(`Required sheet "${definition.sheetName}" is missing`);
-      return resolveWorksheetSchema(worksheet, definition, overrides);
-    });
+    const schemas = resolveTestCaseSchemas(loaded.workbook, overrides);
     return { filePath, key, ...loaded, saved, overrides, schemas, hash: await hashFile(filePath) };
   }));
   const notices: string[] = [];
@@ -43,7 +47,7 @@ export async function inspectWorkbookMappings(config: AppConfig, updateCache = f
       if (previous?.fingerprint !== schema.fingerprint) changed = true;
     }
   }
-  const ready = documents.every((doc) => doc.schemas.every((schema) => schema.valid));
+  const ready = documents.every((doc) => doc.schemas.length > 0 && doc.schemas.every((schema) => schema.valid));
   if (updateCache && changed && ready) {
     for (const doc of documents) {
       if (doc.saved) store.workbooks[doc.key] = mappingSnapshot(doc.overrides, doc.schemas);
@@ -68,7 +72,10 @@ function mappingSnapshot(
 export function formatWorkbookMappings(inspection: Awaited<ReturnType<typeof inspectWorkbookMappings>>): string {
   return [
     "Workbook schema",
-    ...inspection.documents.flatMap((doc) => [path.basename(doc.filePath), ...doc.schemas.map(formatWorksheetSchema)]),
+    ...inspection.documents.flatMap((doc) => [
+      path.basename(doc.filePath), ...doc.schemas.map(formatWorksheetSchema),
+      ...doc.parsed.issues.filter((issue) => issue.code === "MISSING_SHEET").map((issue) => issue.message),
+    ]),
     ...(inspection.notices.length ? ["NOTICE: Workbook layout changed.", ...inspection.notices, inspection.ready ? "Mapping resolved safely from current headers." : "Mapping needs review."] : []),
     `Mapping overrides: ${inspection.documents.reduce((count, doc) => count + doc.overrides.length, 0)}`,
     `Result: ${inspection.ready ? "READY" : "NEEDS REVIEW"}`,
@@ -84,9 +91,9 @@ export async function reviewWorkbookMapping(ui: OperatorUi, config: AppConfig): 
   while (true) {
     for (const doc of inspection.documents) {
       setWorkbookSchemaOverrides(doc.workbook, doc.overrides);
-      doc.schemas = [KB_SCHEMA, NEGATIVE_SCHEMA].map((definition) => resolveWorksheetSchema(doc.workbook.getWorksheet(definition.sheetName)!, definition, doc.overrides));
+      doc.schemas = resolveTestCaseSchemas(doc.workbook, doc.overrides);
     }
-    inspection.ready = inspection.documents.every((doc) => doc.schemas.every((schema) => schema.valid));
+    inspection.ready = inspection.documents.every((doc) => doc.schemas.length > 0 && doc.schemas.every((schema) => schema.valid));
     ui.note(formatWorkbookMappings(inspection), "Workbook mapping");
     const choice = await ui.select({
       message: "Use this mapping?",

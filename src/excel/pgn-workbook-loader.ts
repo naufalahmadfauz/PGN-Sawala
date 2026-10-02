@@ -337,24 +337,18 @@ export function parsePgnWorkbook(workbook: ExcelJS.Workbook): ParsedPgnWorkbook 
     for (const issue of mapping.issues) issues.push({ code: "INVALID_HEADER", severity: issue.severity, sheetName: mapping.sheetName, rowNumber: mapping.headerRow, message: issue.message });
   }
 
-  if (!kbSheet) {
+  if (!kbSheet && !negativeSheet) {
     issues.push({
       code: "MISSING_SHEET",
       severity: "ERROR",
-      sheetName: KB_SHEET_NAME,
-      message: `Worksheet "${KB_SHEET_NAME}" was not found.`,
+      sheetName: "Workbook",
+      message: `At least one test-case sheet is required: "${KB_SHEET_NAME}" or "${NEGATIVE_SHEET_NAME}".`,
     });
-  } else if (resolveWorksheetSchema(kbSheet, KB_SCHEMA).valid) {
+  }
+  if (kbSheet && resolveWorksheetSchema(kbSheet, KB_SCHEMA).valid) {
     scenarios.push(...parseKnowledgeBaseSheet(kbSheet, issues, testIdRows));
   }
-  if (!negativeSheet) {
-    issues.push({
-      code: "MISSING_SHEET",
-      severity: "ERROR",
-      sheetName: NEGATIVE_SHEET_NAME,
-      message: `Worksheet "${NEGATIVE_SHEET_NAME}" was not found.`,
-    });
-  } else if (resolveWorksheetSchema(negativeSheet, NEGATIVE_SCHEMA).valid) {
+  if (negativeSheet && resolveWorksheetSchema(negativeSheet, NEGATIVE_SCHEMA).valid) {
     scenarios.push(...parseNegativeSheet(negativeSheet, issues, testIdRows));
   }
 
@@ -387,6 +381,10 @@ export function parsePgnWorkbook(workbook: ExcelJS.Workbook): ParsedPgnWorkbook 
 
   return {
     schemas,
+    availableSheets: [
+      ...(kbSheet ? ["kb" as const] : []),
+      ...(negativeSheet ? ["negative" as const] : []),
+    ],
     scenarios,
     issues,
     summaries,
