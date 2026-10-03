@@ -2,7 +2,7 @@ import { access } from "node:fs/promises";
 import type { AppConfig } from "../config";
 import { getRetestRunMetadata } from "../excel/retest-workbook";
 import { loadPgnWorkbook } from "../excel/pgn-workbook-loader";
-import { assertPgnWorkbookValid } from "../excel/pgn-workbook-validator";
+import { assertMatchingTestCaseSheets, assertPgnWorkbookValid } from "../excel/pgn-workbook-validator";
 import {
   assertResumeOptionsCompatible,
   parseCliOptions,
@@ -82,6 +82,10 @@ export async function inspectPgnExecution(
     ? config.pgnExecutedWorkbookPath
     : config.pgnSourceWorkbookPath;
   const loaded = await loadPgnWorkbook(workbookPath);
+  if (workbookPath === config.pgnExecutedWorkbookPath) {
+    const source = await loadPgnWorkbook(config.pgnSourceWorkbookPath);
+    assertMatchingTestCaseSheets(source.workbook, loaded.workbook);
+  }
   assertPgnWorkbookValid(loaded.parsed, options.sheet);
   if (options.transport === "rest") assertRestConfig(config.livePersonRest);
 

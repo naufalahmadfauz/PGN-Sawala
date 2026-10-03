@@ -61,7 +61,14 @@ async function fixture(context: TestContext, mode: "full" | "retest" = "full", s
     (workbook.getWorksheet(kb.name) ?? negative).addTable({ name: "CategoryReference", ref: "Q1", columns: [{ name: "Fixture reference" }], rows: [["Preserve reference table"]] });
   }
   await workbook.xlsx.writeFile(config.pgnSourceWorkbookPath);
-  const sourceHash = await hashFile(config.pgnSourceWorkbookPath);
+  let sourceHash = await hashFile(config.pgnSourceWorkbookPath);
+  const editSource = async (edit: (workbook: ExcelJS.Workbook) => void) => {
+    const source = new ExcelJS.Workbook();
+    await source.xlsx.readFile(config.pgnSourceWorkbookPath);
+    edit(source);
+    await source.xlsx.writeFile(config.pgnSourceWorkbookPath);
+    sourceHash = await hashFile(config.pgnSourceWorkbookPath);
+  };
   const sent: string[] = [];
   const screenshots: string[] = [];
   const uploads: Array<{ folderId: string; fileName: string }> = [];
@@ -135,7 +142,90 @@ async function fixture(context: TestContext, mode: "full" | "retest" = "full", s
     recovered.sort((a, b) => b.state.startedAt.localeCompare(a.state.startedAt));
     return recovered[0];
   };
-  return { root, config, sent, screenshots, uploads, folders, logs, messages, behavior, latest, signalSettled };
+  return { root, config, sent, screenshots, uploads, folders, logs, messages, behavior, latest, signalSettled, editSource };
+}
+
+for (const removed of ["Test Case Knowledge Base", "Negative Case"]) {
+  for (const empty of [false, true]) {
+    for (const mode of ["full", "retest"] as const) {
+      test(`removing ${empty ? "header-only" : "populated, table-bearing"} ${removed} rejects old results and allows ${mode} at a new executed-workbook path`, async (context) => {
+        const fx = await fixture(context, "retest", "both");
+        await fx.editSource((workbook) => {
+          workbook.getWorksheet("Negative Case")!.addTable({ name: "NegativeReference", ref: "Q1", columns: [{ name: "Fixture reference" }], rows: [["Keep old table"]] });
+          if (empty) {
+            workbook.removeWorksheet(workbook.getWorksheet(removed)!.id);
+            workbook.addWorksheet(removed).addRow(removed === "Negative Case" ? NEGATIVE_HEADERS : KB_HEADERS);
+          }
+        });
+        await runPgnWorkbook([], "full", fx.config);
+        const oldResults = await readFile(fx.config.pgnExecutedWorkbookPath);
+        const oldArchive = await JSZip.loadAsync(oldResults);
+        assert.equal(oldArchive.file(/^xl\/tables\/[^/]+\.xml$/).length, empty ? 1 : 2);
+        if (empty) {
+          const old = await loadPgnWorkbook(fx.config.pgnExecutedWorkbookPath);
+          assert.equal(old.workbook.getWorksheet(removed)!.rowCount, 1);
+        }
+        await fx.editSource((workbook) => { workbook.removeWorksheet(workbook.getWorksheet(removed)!.id); });
+        const changedSource = await readFile(fx.config.pgnSourceWorkbookPath);
+        const sourceArchive = await JSZip.loadAsync(changedSource);
+        assert.equal(sourceArchive.file(/^xl\/tables\/[^/]+\.xml$/).length, 1);
+        fx.sent.length = 0;
+        await assert.rejects(runPgnWorkbook([], mode, fx.config), (error: unknown) => {
+          assert(error instanceof Error);
+          assert.match(error.message, /test-case sheet.*differ/i);
+          assert(error.message.includes(`Only in executed workbook: "${removed}"`));
+          assert.match(error.message, /Use a new executed-workbook path.*PGN_EXECUTED_WORKBOOK/);
+          return true;
+        });
+        assert.deepEqual(fx.sent, []);
+        assert.deepEqual(await readFile(fx.config.pgnExecutedWorkbookPath), oldResults);
+        assert.deepEqual(await readFile(fx.config.pgnSourceWorkbookPath), changedSource);
+
+        const remaining = removed === "Negative Case" ? "kb" : "negative";
+        const nextConfig = { ...fx.config, pgnExecutedWorkbookPath: path.join(fx.root, "reports", `${remaining}-only.xlsx`) };
+        await runPgnWorkbook([], mode, nextConfig);
+        assert.deepEqual(fx.sent.filter((message) => message !== "reset"), remaining === "kb" ? inputs.slice(0, 4) : inputs.slice(4));
+        const reopened = await openExecutedPgnWorkbook(nextConfig.pgnSourceWorkbookPath, nextConfig.pgnExecutedWorkbookPath);
+        assert.equal(reopened.resumed, true);
+        assert.deepEqual(reopened.parsed.availableSheets, [remaining]);
+        assert.equal(reopened.workbook.getWorksheet(removed), undefined);
+        for (const scenario of reopened.parsed.scenarios) {
+          assert.equal(scenario.status, mode === "retest" ? "Pending Evaluation" : "Ready for Re-test");
+          const sheet = reopened.workbook.getWorksheet(scenario.sheetName)!;
+          if (remaining === "kb") {
+            for (const turn of scenario.turns) assert.equal(fieldCell(sheet, turn.rowNumber, "botResponse").text, `Synthetic response to ${turn.userInput}`);
+          } else {
+            assert.equal(fieldCell(sheet, scenario.sourceRowNumber, "botResponse").text, "Turn 1:\nSynthetic response to Negative one\n\nTurn 2:\nSynthetic response to Negative two");
+          }
+        }
+        const newArchive = await JSZip.loadAsync(await readFile(nextConfig.pgnExecutedWorkbookPath));
+        assert.equal(newArchive.file(/^xl\/tables\/[^/]+\.xml$/).length, 1);
+        assert.equal(await newArchive.file("xl/tables/table1.xml")!.async("string"), await sourceArchive.file("xl/tables/table1.xml")!.async("string"));
+        assert.deepEqual(await readFile(fx.config.pgnExecutedWorkbookPath), oldResults);
+        assert.deepEqual(await readFile(fx.config.pgnSourceWorkbookPath), changedSource);
+      });
+    }
+  }
+}
+
+for (const removed of ["Test Case Knowledge Base", "Negative Case"]) {
+  test(`full and retest menus explain removed ${removed} even when prior results have no eligible scenarios`, async (context) => {
+    const fx = await fixture(context, "retest", "both");
+    await runPgnWorkbook([], "retest", fx.config);
+    await fx.editSource((workbook) => { workbook.removeWorksheet(workbook.getWorksheet(removed)!.id); });
+    const sourceBefore = await readFile(fx.config.pgnSourceWorkbookPath);
+    const outputBefore = await readFile(fx.config.pgnExecutedWorkbookPath);
+    fx.sent.length = 0;
+    const mismatch = new RegExp(`Only in executed workbook: "${removed}".*Use a new executed-workbook path.*PGN_EXECUTED_WORKBOOK`);
+    const events = await runWorkbookMenu(fx.config, [
+      "run", "remaining", "isolated", true, "accept", "back",
+      "retest", "ready", "isolated", "back", "exit",
+    ], [mismatch, mismatch]);
+    assert.equal(events.filter((message) => mismatch.test(message)).length, 2);
+    assert.deepEqual(fx.sent, []);
+    assert.deepEqual(await readFile(fx.config.pgnSourceWorkbookPath), sourceBefore);
+    assert.deepEqual(await readFile(fx.config.pgnExecutedWorkbookPath), outputBefore);
+  });
 }
 
 for (const layout of ["kb", "negative", "both"] as const) {

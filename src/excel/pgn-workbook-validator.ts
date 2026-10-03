@@ -1,3 +1,4 @@
+import type { Workbook } from "exceljs";
 import {
   KB_SHEET_NAME,
   NEGATIVE_SHEET_NAME,
@@ -100,6 +101,18 @@ export function formatPgnValidation(
     lines.push("", "READY TO EXECUTE");
   }
   return lines.join("\n");
+}
+
+export function assertMatchingTestCaseSheets(source: Workbook, executed: Workbook): void {
+  const sheets = [KB_SHEET_NAME, NEGATIVE_SHEET_NAME];
+  const onlyInSource = sheets.filter((name) => source.getWorksheet(name) && !executed.getWorksheet(name));
+  const onlyInExecuted = sheets.filter((name) => executed.getWorksheet(name) && !source.getWorksheet(name));
+  if (onlyInSource.length || onlyInExecuted.length) {
+    const describe = (names: string[]) => names.map((name) => `"${name}"`).join(", ") || "(none)";
+    throw new Error(
+      `Source and executed workbook test-case sheet sets differ. Only in source: ${describe(onlyInSource)}. Only in executed workbook: ${describe(onlyInExecuted)}. Use a new executed-workbook path (PGN_EXECUTED_WORKBOOK) to retain the existing results.`,
+    );
+  }
 }
 
 export function assertPgnWorkbookValid(parsed: ParsedPgnWorkbook, requestedSheet?: PgnSheetKind): void {

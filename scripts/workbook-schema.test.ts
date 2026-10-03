@@ -122,8 +122,104 @@ for (const [present, absent, requested] of [
       await assert.rejects(runPgnWorkbook(args, mode, config), missingCategory);
     }
     await assert.rejects(validateRetest(args, config), missingCategory);
+    await assert.rejects(access(config.pgnExecutedWorkbookPath));
   });
 }
+
+test("execution preflight rejects different source/results test-case sheets even when old responses are complete", async (context) => {
+  const { config, workbook } = await project(context);
+  const opened = await openExecutedPgnWorkbook(config.pgnSourceWorkbookPath, config.pgnExecutedWorkbookPath);
+  for (const scenario of opened.parsed.scenarios) applyScenarioExecution(opened.workbook, "OLD-RUN", scenario, executions(scenario));
+  await saveExecutedPgnWorkbook(opened.workbook, config.pgnExecutedWorkbookPath);
+  workbook.removeWorksheet(workbook.getWorksheet(NEGATIVE_SHEET_NAME)!.id);
+  await workbook.xlsx.writeFile(config.pgnSourceWorkbookPath);
+  const sourceBefore = await readFile(config.pgnSourceWorkbookPath);
+  const outputBefore = await readFile(config.pgnExecutedWorkbookPath);
+  for (const mode of ["full", "retest"] as const) {
+    await assert.rejects(inspectPgnExecution([], mode, config), /Only in executed workbook: "Negative Case".*Use a new executed-workbook path/);
+  }
+  assert.deepEqual(await readFile(config.pgnSourceWorkbookPath), sourceBefore);
+  assert.deepEqual(await readFile(config.pgnExecutedWorkbookPath), outputBefore);
+});
+
+for (const [removed, requested] of [[KB_SHEET_NAME, "kb"], [NEGATIVE_SHEET_NAME, "negative"]] as const) {
+  test(`requesting removed ${requested} still explains the source/results mismatch before category selection`, async (context) => {
+    const { config, workbook } = await project(context);
+    await openExecutedPgnWorkbook(config.pgnSourceWorkbookPath, config.pgnExecutedWorkbookPath);
+    workbook.removeWorksheet(workbook.getWorksheet(removed)!.id);
+    await workbook.xlsx.writeFile(config.pgnSourceWorkbookPath);
+    const sourceBefore = await readFile(config.pgnSourceWorkbookPath);
+    const outputBefore = await readFile(config.pgnExecutedWorkbookPath);
+    const mismatch = new RegExp(`Only in executed workbook: "${removed}".*Use a new executed-workbook path`);
+    for (const mode of ["full", "retest"] as const) {
+      await assert.rejects(runPgnWorkbook(["--sheet", requested], mode, config), mismatch);
+      await assert.rejects(inspectPgnExecution(["--sheet", requested], mode, config), mismatch);
+    }
+    await assert.rejects(validateRetest(["--sheet", requested], config), mismatch);
+    assert.deepEqual(await readFile(config.pgnSourceWorkbookPath), sourceBefore);
+    assert.deepEqual(await readFile(config.pgnExecutedWorkbookPath), outputBefore);
+  });
+}
+
+for (const original of [KB_SHEET_NAME, NEGATIVE_SHEET_NAME]) {
+  for (const replacement of ["combined", "other-category"] as const) {
+    test(`adding ${replacement === "combined" ? "a category to" : "the other category instead of"} ${original} requires a new executed-workbook path`, async (context) => {
+      const workbook = fixtureWorkbook();
+      const other = original === KB_SHEET_NAME ? NEGATIVE_SHEET_NAME : KB_SHEET_NAME;
+      workbook.removeWorksheet(workbook.getWorksheet(other)!.id);
+      const { config } = await project(context, workbook);
+      const opened = await openExecutedPgnWorkbook(config.pgnSourceWorkbookPath, config.pgnExecutedWorkbookPath);
+      for (const scenario of opened.parsed.scenarios) applyScenarioExecution(opened.workbook, "OLD-RUN", scenario, executions(scenario));
+      await saveExecutedPgnWorkbook(opened.workbook, config.pgnExecutedWorkbookPath);
+      const updated = fixtureWorkbook();
+      if (replacement === "other-category") updated.removeWorksheet(updated.getWorksheet(original)!.id);
+      await updated.xlsx.writeFile(config.pgnSourceWorkbookPath);
+      const sourceBefore = await readFile(config.pgnSourceWorkbookPath);
+      const outputBefore = await readFile(config.pgnExecutedWorkbookPath);
+      await assert.rejects(openExecutedPgnWorkbook(config.pgnSourceWorkbookPath, config.pgnExecutedWorkbookPath), (error: unknown) => {
+        assert(error instanceof Error);
+        assert(error.message.includes(`Only in source: "${other}"`));
+        assert(error.message.includes(`Only in executed workbook: ${replacement === "combined" ? "(none)" : `"${original}"`}`));
+        assert.match(error.message, /Use a new executed-workbook path.*PGN_EXECUTED_WORKBOOK/);
+        return true;
+      });
+      assert.deepEqual(await readFile(config.pgnSourceWorkbookPath), sourceBefore);
+      assert.deepEqual(await readFile(config.pgnExecutedWorkbookPath), outputBefore);
+    });
+  }
+}
+
+test("matching test-case sheets preserve results and retain input and table compatibility checks", async (context) => {
+  const { config, workbook } = await project(context);
+  workbook.getWorksheet(KB_SHEET_NAME)!.addTable({ name: "FixtureTable", ref: "Q1", columns: [{ name: "Fixture reference" }], rows: [["Keep reference"]] });
+  workbook.addWorksheet("Supporting notes").addRow(["Original notes"]);
+  await workbook.xlsx.writeFile(config.pgnSourceWorkbookPath);
+  const opened = await openExecutedPgnWorkbook(config.pgnSourceWorkbookPath, config.pgnExecutedWorkbookPath);
+  for (const scenario of opened.parsed.scenarios) applyScenarioExecution(opened.workbook, "OLD-RUN", scenario, executions(scenario));
+  await saveExecutedPgnWorkbook(opened.workbook, config.pgnExecutedWorkbookPath);
+  const outputBefore = await readFile(config.pgnExecutedWorkbookPath);
+
+  workbook.removeWorksheet(workbook.getWorksheet("Supporting notes")!.id);
+  await workbook.xlsx.writeFile(config.pgnSourceWorkbookPath);
+  const matching = await openExecutedPgnWorkbook(config.pgnSourceWorkbookPath, config.pgnExecutedWorkbookPath);
+  assert.equal(matching.resumed, true);
+  assert.equal(fieldCell(matching.workbook.getWorksheet(KB_SHEET_NAME)!, 2, "botResponse").text, "Synthetic response 1");
+  assert.deepEqual(await readFile(config.pgnExecutedWorkbookPath), outputBefore);
+
+  const kb = workbook.getWorksheet(KB_SHEET_NAME)!;
+  fieldCell(kb, 2, "userInput").value = "Changed source-owned input";
+  await workbook.xlsx.writeFile(config.pgnSourceWorkbookPath);
+  await assert.rejects(openExecutedPgnWorkbook(config.pgnSourceWorkbookPath, config.pgnExecutedWorkbookPath), /inputs do not match the source workbook/);
+  assert.deepEqual(await readFile(config.pgnExecutedWorkbookPath), outputBefore);
+
+  fieldCell(kb, 2, "userInput").value = "Synthetic input";
+  kb.removeTable("FixtureTable");
+  await workbook.xlsx.writeFile(config.pgnSourceWorkbookPath);
+  const sourceBefore = await readFile(config.pgnSourceWorkbookPath);
+  await assert.rejects(openExecutedPgnWorkbook(config.pgnSourceWorkbookPath, config.pgnExecutedWorkbookPath), /table count \(1\) does not match source \(0\)/);
+  assert.deepEqual(await readFile(config.pgnSourceWorkbookPath), sourceBefore);
+  assert.deepEqual(await readFile(config.pgnExecutedWorkbookPath), outputBefore);
+});
 
 for (const present of [KB_SHEET_NAME, NEGATIVE_SHEET_NAME]) {
   test(`mapping inspection and review accept only the present ${present} test-case sheet`, async (context) => {

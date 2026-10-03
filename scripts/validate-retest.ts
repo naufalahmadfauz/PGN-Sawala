@@ -7,7 +7,7 @@ import {
 } from "../src/excel/evidence-workbook";
 import { loadPgnWorkbook } from "../src/excel/pgn-workbook-loader";
 import { fieldCell, optionalFieldCell } from "../src/excel/workbook-schema";
-import { assertPgnWorkbookValid } from "../src/excel/pgn-workbook-validator";
+import { assertMatchingTestCaseSheets, assertPgnWorkbookValid } from "../src/excel/pgn-workbook-validator";
 import { getRetestRunMetadata } from "../src/excel/retest-workbook";
 import type { PgnTestScenario } from "../src/excel/pgn-types";
 import { assertResumeOptionsCompatible, parseCliOptions } from "../src/pgn-cli";
@@ -104,6 +104,10 @@ export async function validateRetest(
     ? config.pgnExecutedWorkbookPath
     : config.pgnSourceWorkbookPath;
   const loaded = await loadPgnWorkbook(workbookPath);
+  if (workbookPath === config.pgnExecutedWorkbookPath) {
+    const source = await loadPgnWorkbook(config.pgnSourceWorkbookPath);
+    assertMatchingTestCaseSheets(source.workbook, loaded.workbook);
+  }
   assertPgnWorkbookValid(loaded.parsed, options.sheet);
   const resumedRun = options.resumeRunId
     ? getRetestRunMetadata(loaded.workbook, options.resumeRunId)

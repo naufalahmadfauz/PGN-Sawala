@@ -28,11 +28,12 @@ import {
 import {
   TRANSCRIPT_SHEET_NAME,
   type ExecutedTurn,
+  type PgnSheetKind,
   type PgnTestScenario,
   type PgnWorkbookDocument,
 } from "./pgn-types";
 import { attachWorkbookMappings } from "./workbook-mapping";
-import { assertPgnWorkbookValid } from "./pgn-workbook-validator";
+import { assertMatchingTestCaseSheets, assertPgnWorkbookValid } from "./pgn-workbook-validator";
 import {
   KB_SCHEMA, NEGATIVE_SCHEMA, TRANSCRIPT_SCHEMA, appendSchemaRow,
   fieldCell, fieldColumn, optionalFieldCell, getWorksheetSchema,
@@ -495,20 +496,21 @@ function applyNegativeExecution(
 export async function openExecutedPgnWorkbook(
   sourcePath: string,
   outputPath: string,
+  requestedSheet?: PgnSheetKind,
 ): Promise<PgnWorkbookDocument & { resumed: boolean }> {
   if (path.resolve(sourcePath) === path.resolve(outputPath)) {
     throw new Error("Executed workbook path must differ from the immutable source");
   }
-  assertPgnWorkbookValid((await loadPgnWorkbook(sourcePath)).parsed);
+  const source = await loadPgnWorkbook(sourcePath);
+  assertPgnWorkbookValid(source.parsed);
   await mkdir(path.dirname(outputPath), { recursive: true });
   const tableParts = await readTableParts(sourcePath);
   const resumed = await access(outputPath)
     .then(() => true)
     .catch(() => false);
   if (!resumed) {
+    assertPgnWorkbookValid(source.parsed, requestedSheet);
     await copyFile(sourcePath, outputPath, fsConstants.COPYFILE_EXCL);
-  } else {
-    assertCompatibleTableParts(tableParts, await readTableParts(outputPath));
   }
 
   const workbook = new ExcelJS.Workbook();
@@ -516,8 +518,12 @@ export async function openExecutedPgnWorkbook(
   await workbook.xlsx.load(
     outputContents as unknown as Parameters<typeof workbook.xlsx.load>[0],
   );
+  if (resumed) {
+    assertMatchingTestCaseSheets(source.workbook, workbook);
+    assertCompatibleTableParts(tableParts, await readTableParts(outputPath));
+  }
   await attachWorkbookMappings(workbook, outputPath, sourcePath);
-  assertPgnWorkbookValid(parsePgnWorkbook(workbook));
+  assertPgnWorkbookValid(parsePgnWorkbook(workbook), requestedSheet);
   expectedOutputHashes.set(workbook, bufferHash(outputContents));
   if (resumed) {
     await assertExecutedWorkbookMatchesSource(sourcePath, workbook);

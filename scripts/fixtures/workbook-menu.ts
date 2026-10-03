@@ -9,12 +9,17 @@ import { validateRetest } from "../validate-retest";
 
 // Exercise the menu's public action seam with real workbook handlers and an
 // isolated project configuration; transport boundaries are supplied by each test.
-export async function runWorkbookMenu(config: AppConfig, answers: unknown[]) {
+export async function runWorkbookMenu(config: AppConfig, answers: unknown[], expectedErrors: RegExp[] = []) {
   const events: string[] = [];
   const record = (message: string) => { events.push(message); };
   const ui: OperatorUi = {
     intro: record, outro: record, cancel: record, info: record,
-    success: record, warn: record, error: (message) => { throw new Error(message); },
+    success: record, warn: record, error: (message) => {
+      const expected = expectedErrors.shift();
+      assert(expected, message);
+      assert.match(message, expected);
+      record(message);
+    },
     note: record,
     select: async (prompt) => {
       record(prompt.message);
@@ -48,5 +53,6 @@ export async function runWorkbookMenu(config: AppConfig, answers: unknown[]) {
   };
   await runControlPanel(ui, actions);
   assert.equal(answers.length, 0, "All menu answers must be consumed");
+  assert.equal(expectedErrors.length, 0, "All expected menu errors must be reported");
   return events;
 }
